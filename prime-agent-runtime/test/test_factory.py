@@ -81,6 +81,7 @@ from rlm.factory import (
     _child_name,
     _guard_passes,
     _parse_json_output,
+    _resolve_machine_dir,
     _scan_machine_library,
     _spawn_label,
     canonicalize_factory_spec,
@@ -1015,6 +1016,74 @@ class CanonicalizeFactorySpecTest(unittest.TestCase):
         self.assertEqual(machine["transitions"][0]["when"]["output"], "o")
 
 
+class CanonicalizeMachineAssetsTest(unittest.TestCase):
+    """Asset inputs (``assets/<path>``) of a machine-directory run resolve
+    inside the machine directory, by the same rule as the Rust loader."""
+
+    def setUp(self) -> None:
+        temp = TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.machine_dir = self.root / "outline-draft"
+        (self.machine_dir / "assets").mkdir(parents=True)
+        (self.machine_dir / "assets" / "style.md").write_text("Be brief.\n", encoding="utf-8")
+
+    def machine(self, asset: str) -> dict[str, Any]:
+        return {
+            "states": [
+                state("plan", entry=True, outputs=[{"name": "outline", "type": "json"}]),
+                state(
+                    "draft",
+                    inputs=[
+                        {"name": "outline", "type": "json", "from": "plan.outline"},
+                        {"name": "style", "type": "text", "from": asset},
+                    ],
+                ),
+            ],
+            "transitions": [{"from": "plan", "to": "draft"}],
+        }
+
+    def test_a_machine_with_an_asset_input_canonicalizes(self) -> None:
+        canonical = canonicalize_factory_spec(self.machine("assets/style.md"), machine_dir=self.machine_dir)
+        self.assertEqual(
+            canonical["states"][1]["inputs"],
+            [
+                {"name": "outline", "type": "json", "from": "plan.outline"},
+                {"name": "style", "type": "text", "from": "assets/style.md"},
+            ],
+        )
+
+    def test_a_dot_dot_asset_path_is_rejected(self) -> None:
+        (self.root / "secret.md").write_text("secret", encoding="utf-8")
+        with self.assertRaises(ValueError) as caught:
+            canonicalize_factory_spec(self.machine("assets/../../secret.md"), machine_dir=self.machine_dir)
+        self.assertEqual(
+            str(caught.exception),
+            f"state draft input 'style': 'assets/../../secret.md' must be a relative path inside "
+            f"the machine directory {self.machine_dir}",
+        )
+
+    def test_a_symlink_that_leaves_the_directory_is_rejected(self) -> None:
+        secret = self.root / "secret.md"
+        secret.write_text("secret", encoding="utf-8")
+        (self.machine_dir / "assets" / "link.md").symlink_to(secret)
+        with self.assertRaises(ValueError) as caught:
+            canonicalize_factory_spec(self.machine("assets/link.md"), machine_dir=self.machine_dir)
+        self.assertEqual(
+            str(caught.exception),
+            f"state draft input 'style': 'assets/link.md' escapes the machine directory "
+            f"{self.machine_dir}: it resolves to {secret.resolve()}",
+        )
+
+    def test_a_missing_asset_names_its_path(self) -> None:
+        with self.assertRaisesRegex(ValueError, "'assets/missing.md' does not exist in the machine directory"):
+            canonicalize_factory_spec(self.machine("assets/missing.md"), machine_dir=self.machine_dir)
+
+    def test_an_asset_input_needs_a_machine_directory(self) -> None:
+        with self.assertRaisesRegex(ValueError, "only a run of a machine directory has assets"):
+            canonicalize_factory_spec(self.machine("assets/style.md"))
+
+
 # ---------------------------------------------------------------------------
 # Machine-form validation
 # ---------------------------------------------------------------------------
@@ -1240,6 +1309,9 @@ class ValidateFactoryMachineTest(unittest.TestCase):
             "declares both subagent and python": {"python": python, "subagent": "worker"},
             "python requires non-empty 'import' and 'callable' strings": {"python": {"import": "tools"}},
             "python state a cannot be resident": {"python": python, "lifecycle": "resident"},
+            "state a python path must be an absolute directory when provided": {
+                "python": {**python, "path": "nodes"}
+            },
             "python state a cannot use foreach": {
                 "python": python,
                 "inputs": [{"name": "xs", "type": "json", "from": "b.xs"}],
@@ -1256,6 +1328,34 @@ class ValidateFactoryMachineTest(unittest.TestCase):
             }
             errors = validate_factory_machine(machine)
             self.assertTrue(any(expected in error for error in errors), (expected, errors))
+
+    def test_params(self) -> None:
+        machine = {
+            "params": {"task": "ship it", "max_loc": 400},
+            "states": [state("a", entry=True)],
+            "transitions": [],
+        }
+        self.assertEqual(validate_factory_machine(machine), [])
+        self.assertEqual(canonicalize_factory_spec(machine)["params"], {"task": "ship it", "max_loc": 400})
+        self.assertNotIn("params", canonicalize_factory_spec({"states": [state("a", entry=True)]}))
+        for params in (["task"], {"Task": "x"}, {"1x": 1}):
+            self.assertEqual(
+                validate_factory_machine({**machine, "params": params}),
+                ["params must be an object keyed by lowercase identifiers"],
+                repr(params),
+            )
+        colliding = {
+            "params": {"items": []},
+            "states": [
+                state("a", entry=True, outputs=[{"name": "items", "type": "json"}]),
+                state("b", inputs=[{"name": "items", "type": "json", "from": "a.items"}]),
+            ],
+            "transitions": [{"from": "a", "to": "b"}],
+        }
+        self.assertEqual(
+            validate_factory_machine(colliding),
+            ["state b input 'items' is also a param; rename the input"],
+        )
 
     def test_subagent_required(self) -> None:
         missing = {"states": [{"id": "a", "entry": True}], "transitions": []}
@@ -2803,7 +2903,7 @@ class FakeHost:
     scripted per child id first (``child_outcomes``), then per node id
     (``outcomes``); a "running" outcome never settles. ``rate_limit_first``
     / ``rate_limit_forever`` make spawn admissions for a node fail with a
-    429-style RuntimeError. ``gate("rlm.collect"|"rlm.delete_subagent"|"rlm.run"|"factory.progress", n)``
+    429-style RuntimeError. ``gate("rlm.collect"|"rlm.delete_subagent"|"rlm.run"|"factory.progress"|"factory.check", n)``
     suspends the n-th call of that type on an asyncio.Event so tests can
     reproduce races between the control loop and stop()/resume().
     ``advance_per_run`` advances the injected clock on every admission (a
@@ -2825,6 +2925,14 @@ class FakeHost:
         self.gates: dict[tuple[str, int], asyncio.Event] = {}
         self.gate_entries: dict[tuple[str, int], asyncio.Event] = {}
         self._call_indices: dict[str, int] = {}
+        # factory.compile replies by machine directory path (the Rust
+        # loader's answer, scripted).
+        self.compiled: dict[str, dict[str, Any]] = {}
+        # Where spawned children's session dirs live (their emitted
+        # outputs files); None keeps the fixed /tmp names.
+        self.session_root: Path | None = None
+        # factory.check refusals by output name (the Rust check, scripted).
+        self.check_errors: dict[str, str] = {}
 
     def gate(self, request_type: str, call_number: int) -> asyncio.Event:
         """Suspend the call_number-th call of that type on a returned event."""
@@ -2887,7 +2995,7 @@ class FakeHost:
     async def __call__(self, request_type: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         payload = payload or {}
         gate = None
-        if request_type in ("rlm.collect", "rlm.delete_subagent", "rlm.run", "factory.progress"):
+        if request_type in ("rlm.collect", "rlm.delete_subagent", "rlm.run", "factory.progress", "factory.check"):
             index = self._call_indices.get(request_type, 0) + 1
             self._call_indices[request_type] = index
             gate = self.gates.pop((request_type, index), None)
@@ -2926,10 +3034,11 @@ class FakeHost:
             self.counter += 1
             child_id = f"child-{self.counter}"
             self.children[child_id] = {"name": name, "node": node_id}
+            root = self.session_root if self.session_root is not None else Path("/tmp")
             return {
                 "rlm_child_id": child_id,
                 "name": name,
-                "session_dir": f"/tmp/{child_id}",
+                "session_dir": str(root / child_id),
                 "model": "fake-model",
             }
         self.calls.append((request_type, payload))
@@ -2980,6 +3089,13 @@ class FakeHost:
             }
         if request_type == "factory.progress":
             self.notices.append(payload)
+            return {}
+        if request_type == "factory.compile":
+            return self.compiled[(payload or {})["path"]]
+        if request_type == "factory.check":
+            errors = [self.check_errors[name] for name in payload["outputs"] if name in self.check_errors]
+            if errors:
+                raise RuntimeError("; ".join(errors))
             return {}
         raise AssertionError(f"unexpected host request type {request_type!r}")
 
@@ -7220,6 +7336,383 @@ class FactoryPythonStateTest(_ExecutorTestCase):
 # ---------------------------------------------------------------------------
 
 
+class FactoryMachineDirectoryTest(_ExecutorTestCase):
+    """Machine directories (machine.toml) run through the factory.compile
+    host request: the Rust loader's spec, with params bound into prompts and
+    python inputs, and python states imported from the directory."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.library = user_machines_dir()
+        self.machine_dir = self.library / "review"
+        (self.machine_dir / "nodes").mkdir(parents=True)
+        (self.machine_dir / "machine.toml").write_text("format = 1\n", encoding="utf-8")
+        (self.machine_dir / "nodes" / "review_nodes.py").write_text(
+            "def plan(inputs):\n    return {'items': [inputs['task'], inputs['max_loc']]}\n",
+            encoding="utf-8",
+        )
+        self.host.compiled[str(self.machine_dir)] = {
+            "name": "review",
+            "version": 3,
+            "description": "Plan and review",
+            "author": None,
+            "spec": {
+                "run": {},
+                "params": {"task": "ship it", "max_loc": 400},
+                "states": [
+                    {
+                        "id": "plan",
+                        "entry": True,
+                        "python": {
+                            "import": "review_nodes",
+                            "callable": "plan",
+                            "path": str(self.machine_dir / "nodes"),
+                        },
+                        "outputs": [{"name": "items", "type": "json"}],
+                    },
+                    {
+                        "id": "work",
+                        "subagent": {"prompt": "Do {items} for {task}, at most {max_loc} lines."},
+                        "inputs": [{"name": "items", "type": "json", "from": "plan.items"}],
+                    },
+                ],
+                "transitions": [{"from": "plan", "to": "work"}],
+            },
+        }
+
+    @async_test
+    async def test_a_machine_directory_runs_with_its_params(self) -> None:
+        self.host.outcomes["work"] = {"status": "done", "answer": "done"}
+        result = await rlm_module.rlm.factory.run("review", params={"task": "ship it"})
+        await self.executor._runs[result["run_id"]].task
+        status = await rlm_module.rlm.factory.status(result["run_id"])
+
+        self.assertEqual(status["state"], "done")
+        self.assertEqual(result["machine_path"], str(self.machine_dir))
+        self.assertEqual(
+            self.host.calls_of("factory.compile"),
+            [{"path": str(self.machine_dir), "params": {"task": "ship it"}}],
+        )
+        # The python state imported from the directory and received the
+        # params; the prompt rendered both, and no unused param was
+        # appended as an input.
+        self.assertEqual(
+            [call["prompt"] for call in self.host.spawn_calls("work")],
+            ['Do ["ship it", 400] for ship it, at most 400 lines.'],
+        )
+
+    @async_test
+    async def test_params_need_a_machine_directory(self) -> None:
+        self.store_machine({"states": [state("a", entry=True)]})
+        with self.assertRaisesRegex(ValueError, "params apply to machine directories"):
+            await rlm_module.rlm.factory.run("sw", params={"task": "x"})
+
+    def test_directories_resolve_per_level_before_machine_files(self) -> None:
+        repo = self.library.parent / "repo"
+        user = self.library
+        bundled = repo_machines_dir() / "builder" / MACHINE_FILE_NAME
+        (repo / "builder").mkdir(parents=True)
+        shutil.copy(bundled, repo / "builder" / MACHINE_FILE_NAME)
+        (user / "builder").mkdir()
+        (user / "builder" / "machine.toml").write_text("format = 1\n", encoding="utf-8")
+        (repo / "both").mkdir()
+        (repo / "both" / MACHINE_FILE_NAME).write_text("broken", encoding="utf-8")
+        (repo / "both" / "machine.toml").write_text("format = 1\n", encoding="utf-8")
+        resolve = lambda name: _resolve_machine_dir(name, repo_dir=repo, user_dir=user)  # noqa: E731
+        # A valid MACHINE.md at an earlier level keeps its name.
+        self.assertIsNone(resolve("builder"))
+        self.assertEqual(resolve("review"), user / "review")
+        self.assertEqual(resolve("both"), repo / "both")
+        self.assertIsNone(resolve("absent"))
+
+
+class FactoryMachineDirectoryAssetsTest(_ExecutorTestCase):
+    """A machine-directory run binds an asset input from the directory's
+    assets/ tree and reads each asset one time in the run."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.machine_dir = user_machines_dir() / "outline-draft"
+        (self.machine_dir / "assets").mkdir(parents=True)
+        (self.machine_dir / "machine.toml").write_text("format = 1\n", encoding="utf-8")
+        (self.machine_dir / "assets" / "style.md").write_text("Be brief.", encoding="utf-8")
+
+    def compiled(self, asset: str) -> None:
+        self.host.compiled[str(self.machine_dir)] = {
+            "name": "outline-draft",
+            "version": 1,
+            "description": "Outline, then draft",
+            "author": None,
+            "spec": {
+                "run": {},
+                "states": [
+                    {"id": "draft", "entry": True, "subagent": {"prompt": "Draft. Style: {style}"},
+                     "inputs": [{"name": "style", "type": "text", "from": asset}]},
+                ],
+                "transitions": [],
+            },
+        }
+
+    @async_test
+    async def test_the_run_binds_the_asset_text_into_the_prompt(self) -> None:
+        self.compiled("assets/style.md")
+        self.host.outcomes["draft"] = {"status": "done", "answer": "done"}
+        result = await rlm_module.rlm.factory.run("outline-draft")
+        run = self.executor._runs[result["run_id"]]
+        await run.task
+
+        self.assertEqual((await rlm_module.rlm.factory.status(result["run_id"]))["state"], "done")
+        self.assertEqual([call["prompt"] for call in self.host.spawn_calls("draft")], ["Draft. Style: Be brief."])
+        self.assertEqual(run.assets, {"assets/style.md": "Be brief."})
+
+    @async_test
+    async def test_a_dot_dot_asset_fails_the_run_before_it_starts(self) -> None:
+        self.compiled("assets/../machine.toml")
+        with self.assertRaisesRegex(ValueError, "'assets/../machine.toml' must be a relative path inside"):
+            await rlm_module.rlm.factory.run("outline-draft")
+        self.assertEqual(self.executor._runs, {})
+
+
+class FactoryEmitTest(_ExecutorTestCase):
+    """States with an emit contract (machine directories): the child gets
+    the contract and its bound inputs at spawn, and its outputs come from
+    the outputs file its ``factory.emit`` calls wrote."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        temp = TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.host.session_root = Path(temp.name)
+
+    def emitted(self, child_id: str, outputs: dict[str, Any]) -> None:
+        child_dir = self.host.session_root / child_id
+        child_dir.mkdir(parents=True, exist_ok=True)
+        (child_dir / factory_module.FACTORY_OUTPUTS_FILE).write_text(json.dumps(outputs), encoding="utf-8")
+
+    def machine(self) -> dict[str, Any]:
+        return {
+            "params": {"task": "ship it"},
+            "states": [
+                state(
+                    "plan",
+                    entry=True,
+                    subagent={"prompt": "Plan {task}."},
+                    outputs=[{"name": "plan", "type": "json"}],
+                    emit={"outputs": [{"name": "plan", "type": "plan"}], "records": {"plan": [["steps", "int"]]}},
+                    retries=0,
+                ),
+                state(
+                    "build",
+                    subagent={"prompt": "Build {plan}."},
+                    inputs=[{"name": "plan", "type": "json", "from": "plan.plan"}],
+                    outputs=[{"name": "report", "type": "text"}],
+                    emit={"outputs": [{"name": "report", "type": "text"}], "records": {}},
+                    retries=0,
+                ),
+            ],
+            "transitions": [{"from": "plan", "to": "build"}],
+        }
+
+    async def run_to_end(self) -> dict[str, Any]:
+        result = await self.start()
+        await self.executor._runs[result["run_id"]].task
+        return await rlm_module.rlm.factory.status(result["run_id"])
+
+    async def settle(self, run_result: dict[str, Any]) -> dict[str, Any]:
+        """Yield to the control loop until the run leaves the running state."""
+        run_id = run_result["run_id"]
+        for _ in range(50_000):
+            run = self.executor._runs[run_id]
+            if run.state != "running":
+                return await rlm_module.rlm.factory.status(run_id)
+            await yield_loop_turn()
+        self.fail(f"run {run_id} never left the running state")
+
+    @async_test
+    async def test_the_child_gets_its_contract_with_the_bound_inputs(self) -> None:
+        self.emitted("child-1", {"plan": {"steps": 2}})
+        self.emitted("child-2", {"report": "built"})
+        self.store_machine(self.machine())
+        status = await self.run_to_end()
+
+        self.assertEqual(status["state"], "done")
+        build = self.host.spawn_calls("build")[0]
+        # The value the plan child emitted binds into the next prompt and
+        # into the next child's inputs, beside the params.
+        self.assertEqual(build["prompt"], 'Build {"steps": 2}.')
+        self.assertEqual(
+            build["kwargs"]["factoryContract"],
+            {
+                "outputs": [{"name": "report", "type": "text"}],
+                "records": {},
+                "inputs": {"task": "ship it", "plan": {"steps": 2}},
+            },
+        )
+
+    @async_test
+    async def test_an_optional_output_may_be_left_out(self) -> None:
+        machine = self.machine()
+        machine["states"][0]["outputs"].append({"name": "note", "type": "text"})
+        machine["states"][0]["emit"]["outputs"].append({"name": "note", "type": "text?"})
+        self.emitted("child-1", {"plan": {"steps": 2}})
+        self.emitted("child-2", {"report": "built"})
+        self.store_machine(machine)
+        status = await self.run_to_end()
+
+        self.assertEqual(status["state"], "done")
+
+    @async_test
+    async def test_a_required_output_never_emitted_fails_the_entry(self) -> None:
+        self.emitted("child-1", {})
+        self.store_machine(self.machine())
+        status = await self.run_to_end()
+
+        plan = next(entry for entry in status["nodes"] if entry["id"] == "plan")
+        self.assertEqual(plan["error"], "output 'plan' was never emitted (rlm.factory.emit)")
+        self.assertEqual(self.host.spawn_calls("build"), [])
+
+    @async_test
+    async def test_a_foreach_retries_the_instance_that_omitted_its_port(self) -> None:
+        # Macroscope finding: the last-settling instance took the retry
+        # even when an earlier instance omitted a required emit, so the
+        # retry never restored the missing port. The retry must re-run the
+        # instance that omitted it.
+        self.emitted("child-1", {"items": ["a", "b"]})
+        self.emitted("child-3", {"report": "b"})  # fan i1 emitted its port
+        self.emitted("child-4", {"report": "a"})  # fan i0 retry emits it
+        self.store_machine(
+            {
+                "params": {"task": "ship it"},
+                "states": [
+                    state(
+                        "plan",
+                        entry=True,
+                        subagent={"prompt": "Plan {task}."},
+                        outputs=[{"name": "items", "type": "json"}],
+                        emit={"outputs": [{"name": "items", "type": "json"}], "records": {}},
+                    ),
+                    state(
+                        "fan",
+                        subagent={"prompt": "Do {items}."},
+                        inputs=[{"name": "items", "type": "json", "from": "plan.items"}],
+                        outputs=[{"name": "report", "type": "text"}],
+                        emit={"outputs": [{"name": "report", "type": "text"}], "records": {}},
+                        foreach={"over": "items", "max": 2},
+                        retries=1,
+                    ),
+                ],
+                "transitions": [{"from": "plan", "to": "fan"}],
+            }
+        )
+        status = await self.run_to_end()
+
+        self.assertEqual(status["state"], "done")
+        names = [call["kwargs"]["name"] for call in self.host.spawn_calls("fan")]
+        self.assertEqual(len(names), 3)
+        self.assertIn("-i0-a2", names[-1])
+        self.assertNotIn("-i1-a2", " ".join(names))
+
+    @async_test
+    async def test_resume_readmits_every_foreach_instance_that_omitted_its_port(self) -> None:
+        # Cursor finding: with retries=0, the first omitted instance failed
+        # the entry and the other omitted instances stayed done, so resume
+        # re-admitted only the first and the entry failed again on the rest.
+        self.emitted("child-1", {"items": ["a", "b"]})
+        self.emitted("child-4", {"report": "a"})  # fan i0 resume emit
+        self.emitted("child-5", {"report": "b"})  # fan i1 resume emit
+        self.store_machine(
+            {
+                "params": {"task": "ship it"},
+                "states": [
+                    state(
+                        "plan",
+                        entry=True,
+                        subagent={"prompt": "Plan {task}."},
+                        outputs=[{"name": "items", "type": "json"}],
+                        emit={"outputs": [{"name": "items", "type": "json"}], "records": {}},
+                    ),
+                    state(
+                        "fan",
+                        subagent={"prompt": "Do {items}."},
+                        inputs=[{"name": "items", "type": "json", "from": "plan.items"}],
+                        outputs=[{"name": "report", "type": "text"}],
+                        emit={"outputs": [{"name": "report", "type": "text"}], "records": {}},
+                        foreach={"over": "items", "max": 2},
+                        retries=0,
+                    ),
+                ],
+                "transitions": [{"from": "plan", "to": "fan"}],
+            }
+        )
+        result = await self.start()
+        paused = await self.settle(result)
+
+        self.assertEqual(paused["state"], "paused")
+        fan = next(node for node in paused["nodes"] if node["id"] == "fan")
+        self.assertEqual([instance["status"] for instance in fan["instances"]], ["error", "error"])
+        resumed = await rlm_module.rlm.factory.resume(result["run_id"])
+        self.assertEqual(resumed["state"], "running")
+        final = await self.settle(result)
+
+        self.assertEqual(final["state"], "done")
+        names = [call["kwargs"]["name"] for call in self.host.spawn_calls("fan")]
+        self.assertEqual(len(names), 4)
+        self.assertEqual(sum("-i0-a2" in name for name in names), 1)
+        self.assertEqual(sum("-i1-a2" in name for name in names), 1)
+
+    @async_test
+    async def test_a_python_state_output_goes_through_the_contract_check(self) -> None:
+        nodes = Path(self.host.session_root) / "nodes"
+        nodes.mkdir()
+        (nodes / "plan_nodes.py").write_text("def plan(inputs):\n    return {'plan': {'steps': 'two'}}\n", encoding="utf-8")
+        machine = self.machine()
+        machine["states"][0] = {
+            **machine["states"][0],
+            "python": {"import": "plan_nodes", "callable": "plan", "path": str(nodes)},
+        }
+        del machine["states"][0]["subagent"]
+        self.host.check_errors["plan"] = "plan.steps: expected int, got text \"two\""
+        self.store_machine(machine)
+        status = await self.run_to_end()
+
+        plan = next(entry for entry in status["nodes"] if entry["id"] == "plan")
+        self.assertEqual(plan["error"], 'python state output: plan.steps: expected int, got text "two"')
+
+    @async_test
+    async def test_a_stop_during_the_python_output_check_keeps_the_entry_cancelled(self) -> None:
+        nodes = Path(self.host.session_root) / "nodes"
+        nodes.mkdir()
+        (nodes / "plan_nodes.py").write_text("def plan(inputs):\n    return {'plan': {'steps': 2}}\n", encoding="utf-8")
+        machine = self.machine()
+        machine["states"][0] = {
+            **machine["states"][0],
+            "python": {"import": "plan_nodes", "callable": "plan", "path": str(nodes)},
+        }
+        del machine["states"][0]["subagent"]
+        check_gate = self.host.gate("factory.check", 1)
+        self.store_machine(machine)
+        result = await self.start()
+        await self.host.gate_entered("factory.check", 1).wait()  # the python call exited; its check is in flight
+        await rlm_module.rlm.factory.stop(result["run_id"])
+        check_gate.set()
+        await self.executor._runs[result["run_id"]].task
+        status = await rlm_module.rlm.factory.status(result["run_id"])
+
+        plan = next(entry for entry in status["nodes"] if entry["id"] == "plan")
+        self.assertEqual(status["state"], "stopped")
+        self.assertEqual(plan["status"], "cancelled")
+        self.assertEqual(self.host.spawn_calls("build"), [])
+
+    @async_test
+    async def test_emit_raises_factory_emit_error_outside_a_factory_child(self) -> None:
+        async def refuse(request_type: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+            raise RuntimeError(f'host request type "{request_type}" is not available in this session')
+
+        with patch.object(rlm_module, "host_request", refuse):
+            with self.assertRaisesRegex(rlm_module.FactoryEmitError, "work only in a child spawned by"):
+                await rlm_module.rlm.factory.emit(plan={"steps": 2})
+
+
 class FactoryGraphWatchTest(_ExecutorTestCase):
     """The graph snapshot (structure fused with live state), the bounded
     watch, and the host bridge's out-of-band activity handler. The shared
@@ -8853,6 +9346,28 @@ class MachineCliDispatchTest(unittest.TestCase):
         })
         env.start()
         self.addCleanup(env.stop)
+
+    def test_read_answers_one_machine(self) -> None:
+        read = cli_dispatch({"op": "read", "path": str(self.source_path)})
+        self.assertEqual(
+            read,
+            {
+                "ok": True,
+                "name": "sweep",
+                "description": "A machine that sweeps.",
+                "version": read["version"],
+                "author": read["author"],
+                "spec": valid_dag(),
+            },
+        )
+        self.assertEqual(
+            cli_dispatch({"op": "read", "name": "absent"})["ok"],
+            False,
+        )
+        self.assertEqual(
+            cli_dispatch({"op": "read"}),
+            {"ok": False, "errors": ["factory read requires a `path` or `name` string"]},
+        )
 
     def test_import_dispatch_persists_into_the_user_library(self) -> None:
         result = cli_dispatch({"op": "import", "path": str(self.source_path)})

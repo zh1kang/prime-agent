@@ -83,6 +83,7 @@ STATE_MAX_ENTRIES_DEFAULT = 1
 SUBAGENT_NAME_MAX_LENGTH = 64
 
 _NODE_ID_PATTERN = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
+_PARAM_NAME_PATTERN = re.compile(r"[a-z_][a-z0-9_]*")
 
 
 def _is_int(value: Any) -> bool:
@@ -199,15 +200,51 @@ def _effective_output_types(state: dict[str, Any]) -> dict[str, str]:
 
 
 def _input_sources(node: dict[str, Any]) -> list[str]:
-    """Source node ids referenced by the node's inputs."""
+    """Source node ids referenced by the node's inputs (an asset input
+    names a file, not a node)."""
     sources: list[str] = []
     for inp in _port_list(node, "inputs"):
         if not isinstance(inp, dict):
             continue
         source = inp.get("from")
-        if isinstance(source, str) and "." in source:
+        if isinstance(source, str) and "." in source and not _is_asset_reference(source):
             sources.append(source.partition(".")[0])
     return sources
+
+
+ASSET_PREFIX = "assets/"
+
+
+def _is_asset_reference(source: Any) -> bool:
+    """True when an input's ``from`` names a machine asset
+    (``assets/<path>``). A state id cannot contain ``/``, so an asset
+    reference is never a ``<state>.<port>`` reference."""
+    return isinstance(source, str) and source.startswith(ASSET_PREFIX)
+
+
+def _resolve_asset(machine_dir: Path, reference: str) -> Path:
+    """The real path of the asset ``reference`` inside ``machine_dir``.
+
+    The Rust loader uses the same rule: the path is relative and has no
+    empty, ``.``, or ``..`` part; its real path (after each symlink) stays
+    under the real machine directory; and it is a file. Raises
+    ``ValueError`` that names the asset path and the machine directory
+    (and the target of a symlink that leaves the directory).
+    """
+    if reference.startswith("/") or any(part in ("", ".", "..") for part in reference.split("/")):
+        raise ValueError(f"{reference!r} must be a relative path inside the machine directory {machine_dir}")
+    try:
+        directory = machine_dir.resolve(strict=True)
+        target = (machine_dir / reference).resolve(strict=True)
+    except FileNotFoundError:
+        raise ValueError(f"{reference!r} does not exist in the machine directory {machine_dir}") from None
+    except OSError as error:
+        raise ValueError(f"cannot read {reference}: {error}") from None
+    if not target.is_relative_to(directory):
+        raise ValueError(f"{reference!r} escapes the machine directory {machine_dir}: it resolves to {target}")
+    if not target.is_file():
+        raise ValueError(f"cannot read {reference}: not a file")
+    return target
 
 
 def _is_machine_form(spec: Any) -> bool:
@@ -263,10 +300,13 @@ def _validate_state_fields(
     states_by_id: dict[str, dict[str, Any]],
     noun: str,
     errors: list[str],
+    machine_dir: Path | None = None,
 ) -> None:
     """Field rules shared by dag nodes (noun="node") and machine states
     (noun="state"): subagent forms, lifecycle, budgets, retries, failure
-    policies, port lists, foreach, and the resident exclusions."""
+    policies, port lists, foreach, and the resident exclusions. An asset
+    input must be a file in ``machine_dir``; with no machine directory, an
+    asset input is an error."""
     ref = state["id"]
     # Presence-based checks like the run block: an explicit JSON null on a
     # typed field is rejected with the field's own message instead of
@@ -296,6 +336,10 @@ def _validate_state_fields(
             and _is_nonempty_str(python.get("callable"))
         ):
             errors.append(f"{noun} {ref} python requires non-empty 'import' and 'callable' strings")
+        elif "path" in python and not (
+            _is_nonempty_str(python.get("path")) and os.path.isabs(python["path"])
+        ):
+            errors.append(f"{noun} {ref} python path must be an absolute directory when provided")
         if is_resident:
             errors.append(f"python {noun} {ref} cannot be resident")
         if "foreach" in state:
@@ -325,6 +369,12 @@ def _validate_state_fields(
             '{"python": {"import": "<module>", "callable": "<function>"}})'
         )
 
+    if "emit" in state:
+        # The output contract a machine directory's compiler writes; its
+        # types are checked in Rust (factory.emit / factory.check).
+        emit = state.get("emit")
+        if not (isinstance(emit, dict) and isinstance(emit.get("outputs"), list)):
+            errors.append(f"{noun} {ref} emit must be an object with an outputs list")
     if "budget_ms" in state:
         budget = state.get("budget_ms")
         if not _is_positive_int(budget):
@@ -395,6 +445,20 @@ def _validate_state_fields(
             seen_input_names.add(name)
         if port_type not in PORT_TYPES:
             errors.append(f"{noun} {ref} input {name!r} type must be 'text' or 'json'")
+        if _is_asset_reference(source):
+            if port_type != "text" or optional:
+                errors.append(f"{noun} {ref} input {name!r} reads an asset: an asset input is a required text input")
+            elif machine_dir is None:
+                errors.append(
+                    f"{noun} {ref} input {name!r} reads the asset {source!r}: "
+                    "only a run of a machine directory has assets"
+                )
+            else:
+                try:
+                    _resolve_asset(machine_dir, source)
+                except ValueError as error:
+                    errors.append(f"{noun} {ref} input {name!r}: {error}")
+            continue
         if not isinstance(source, str) or "." not in source:
             errors.append(
                 f"{noun} {ref} input {name!r} requires a 'from' reference of the form '<node_id>.<output_name>'"
@@ -503,7 +567,7 @@ def _validate_guard(
         )
 
 
-def validate_factory_machine(machine: Any) -> list[str]:
+def validate_factory_machine(machine: Any, *, machine_dir: Path | None = None) -> list[str]:
     """Dry-run validation for a machine-form factory spec.
 
     Returns a list of human-readable error sentences; an empty list means
@@ -527,6 +591,15 @@ def validate_factory_machine(machine: Any) -> list[str]:
         errors.append("run must be an object")
         run = None
     run_budget = _validate_run_fields(run, errors)
+    params = machine.get("params")
+    param_names: set[str] = set()
+    if params is not None:
+        if isinstance(params, dict) and all(
+            isinstance(key, str) and _PARAM_NAME_PATTERN.fullmatch(key) for key in params
+        ):
+            param_names = set(params)
+        else:
+            errors.append("params must be an object keyed by lowercase identifiers")
 
     states = machine.get("states")
     if not isinstance(states, list):
@@ -563,8 +636,16 @@ def validate_factory_machine(machine: Any) -> list[str]:
     seen_subagent_names: dict[str, str] = {}
     for state_id, state in states_by_id.items():
         _validate_state_fields(
-            state, run_budget=run_budget, states_by_id=states_by_id, noun="state", errors=errors
+            state,
+            run_budget=run_budget,
+            states_by_id=states_by_id,
+            noun="state",
+            errors=errors,
+            machine_dir=machine_dir,
         )
+        for inp in state.get("inputs") or []:
+            if isinstance(inp, dict) and inp.get("name") in param_names:
+                errors.append(f"state {state_id} input {inp['name']!r} is also a param; rename the input")
         subagent = state.get("subagent")
         if isinstance(subagent, dict) and _is_nonempty_str(subagent.get("name")):
             configured_name = subagent["name"].strip()
@@ -623,7 +704,9 @@ def validate_factory_machine(machine: Any) -> list[str]:
         # are rejected -- the self-input check is the machine-form mirror of
         # the dag compiler's "node b cannot depend on itself" rule.
         for inp in _port_list(state, "inputs"):
-            if not isinstance(inp, dict) or inp.get("optional"):
+            # An asset is always there to bind, so an entry state can
+            # require one.
+            if not isinstance(inp, dict) or inp.get("optional") or _is_asset_reference(inp.get("from")):
                 continue
             if state.get("entry") is True:
                 errors.append(
@@ -828,7 +911,7 @@ def compile_factory_dag(dag: Any) -> "tuple[dict[str, Any] | None, list[str]]":
 # ---------------------------------------------------------------------------
 
 
-def validate_factory_spec(spec: Any) -> list[str]:
+def validate_factory_spec(spec: Any, *, machine_dir: Path | None = None) -> list[str]:
     """Dry-run validation for a factory spec in either form.
 
     Detects the form first: a spec carrying "states" or "transitions" is
@@ -843,7 +926,7 @@ def validate_factory_spec(spec: Any) -> list[str]:
     if _is_machine_form(spec) and "nodes" in spec:
         return ["pass either dag or machine form, not both"]
     if _is_machine_form(spec):
-        return validate_factory_machine(spec)
+        return validate_factory_machine(spec, machine_dir=machine_dir)
     machine, errors = compile_factory_dag(spec)
     if errors:
         return errors
@@ -884,7 +967,7 @@ def _canonicalize_machine(machine: dict[str, Any]) -> dict[str, Any]:
             "retries": state.get("retries", NODE_RETRIES_DEFAULT),
             "failure_policy": state.get("failure_policy", run_policy),
         }
-        for key in ("subagent", "python", "budget_ms", "inputs", "outputs", "foreach"):
+        for key in ("subagent", "python", "budget_ms", "inputs", "outputs", "foreach", "emit"):
             if key in state:
                 state_out[key] = copy.deepcopy(state[key])
         states_out.append(state_out)
@@ -898,18 +981,25 @@ def _canonicalize_machine(machine: dict[str, Any]) -> dict[str, Any]:
         if "when" in transition:
             transition_out["when"] = copy.deepcopy(transition["when"])
         transitions_out.append(transition_out)
-    return {"run": run, "states": states_out, "transitions": transitions_out}
+    canonical: dict[str, Any] = {"run": run}
+    if "params" in machine:
+        canonical["params"] = copy.deepcopy(machine["params"])
+    canonical["states"] = states_out
+    canonical["transitions"] = transitions_out
+    return canonical
 
 
-def canonicalize_factory_spec(spec: Any) -> dict[str, Any]:
+def canonicalize_factory_spec(spec: Any, *, machine_dir: Path | None = None) -> dict[str, Any]:
     """Validate a spec in either form and return the canonical MACHINE form.
 
     Raises ``ValueError`` with the joined error list when the spec is
     invalid (including the both-forms rejection). Dag specs compile to
     machine form first, so the executor sees one shape:
-    ``{"run": ..., "states": [...], "transitions": [...]}``.
+    ``{"run": ..., "states": [...], "transitions": [...]}``. Asset inputs
+    resolve inside ``machine_dir``, the directory of a machine-directory
+    run; a missing or escaping asset is an error that names the asset.
     """
-    errors = validate_factory_spec(spec)
+    errors = validate_factory_spec(spec, machine_dir=machine_dir)
     if errors:
         raise ValueError("; ".join(errors))
     assert isinstance(spec, dict)  # validated above
@@ -999,6 +1089,7 @@ def topological_order(nodes: list[dict[str, Any]]) -> list[str]:
 __all__ = [
     "FACTORY_DISABLED_MESSAGE",
     "FACTORY_HELP",
+    "FactoryEmitError",
     "FactoryExecutor",
     "FactoryRun",
     "MachineFile",
@@ -1130,6 +1221,54 @@ _INFRA_ERROR_MARKERS = (
     "supervisor link",
 )
 
+FACTORY_OUTPUTS_FILE = "factory-outputs.json"
+"""A factory child's accepted outputs, beside its session file: the
+child's ``factory.emit`` host request writes it, the executor reads it."""
+
+
+class FactoryEmitError(ValueError):
+    """``rlm.factory.emit`` refused a value: the message names every wrong
+    field (``verdict.findings[0].severity: 'high' is not one of ...``)."""
+
+
+async def emit_factory_outputs(outputs: dict[str, Any]) -> dict[str, Any]:
+    """Hand this factory child's outputs to the factory (``rlm.factory.emit``).
+
+    Every value is checked against the state's declared types before
+    anything is kept; a wrong value raises ``FactoryEmitError`` with the
+    exact field, so fix it and call again. A ``file`` output takes a path
+    (``str`` or ``Path``) and the file is copied. Returns ``{"accepted":
+    [...], "missing": [...]}``, the required outputs still owed.
+    """
+    from . import host_request
+
+    values = {name: os.fspath(value) if isinstance(value, os.PathLike) else value for name, value in outputs.items()}
+    try:
+        return await host_request("factory.emit", {"outputs": values})
+    except RuntimeError as error:
+        raise FactoryEmitError(_emit_error_text(str(error))) from None
+
+
+async def factory_inputs() -> dict[str, Any]:
+    """This factory child's bound inputs and the machine's params, as values."""
+    from . import host_request
+
+    try:
+        reply = await host_request("factory.inputs", {})
+    except RuntimeError as error:
+        raise FactoryEmitError(_emit_error_text(str(error))) from None
+    return reply.get("inputs") or {}
+
+
+def _emit_error_text(error: str) -> str:
+    if "is not available in this session" in error:
+        return (
+            "rlm.factory.emit and rlm.factory.inputs work only in a child spawned by a "
+            "machine directory's state (machine.toml)"
+        )
+    return error
+
+
 PYTHON_STATE_TIMEOUT_MS_DEFAULT = 60_000
 """A python call's time limit when neither the state nor the run sets
 ``budget_ms``."""
@@ -1140,6 +1279,8 @@ PYTHON_STDERR_TAIL_CAP = 2000
 PYTHON_RUNNER = r"""
 import asyncio, importlib, inspect, json, os, sys
 sys.path.insert(0, os.getcwd())
+if len(sys.argv) > 3:
+    sys.path.insert(0, sys.argv[3])
 inputs = json.load(sys.stdin.buffer)
 result_stream = os.fdopen(os.dup(1), "w")
 os.dup2(2, 1)
@@ -1153,7 +1294,8 @@ result_stream.close()
 """The ``python -I -c`` program that runs one python state call: inputs
 arrive as JSON on stdin, everything the call prints (its own subprocesses
 included) goes to stderr, and the returned dict is the only thing written
-to stdout."""
+to stdout. A target's optional ``path`` (a machine directory's ``nodes/``)
+is searched before the working directory."""
 
 _FENCED_JSON_RE = re.compile(r"```json\s*(.*?)\s*```", re.DOTALL)
 TERMINAL_ENTRY_STATUSES = ("done", "error", "cancelled")
@@ -1379,23 +1521,27 @@ def _parse_json_output(
     return None, error
 
 
-def _render_prompt(template: str, values: dict[str, str]) -> str:
-    """Render bound input values into a prompt template.
+def _render_prompt(
+    template: str, values: dict[str, str], params: "dict[str, str] | None" = None
+) -> str:
+    """Render bound input values (and the run's params) into a prompt template.
 
-    Each ``{input_name}`` placeholder is replaced in a single pass (a value
-    that itself looks like a placeholder is never re-substituted). Inputs
-    without a placeholder are appended in a trailing ``## Inputs`` section,
-    so no bound value is dropped.
+    Each ``{input_name}`` or ``{param_name}`` placeholder is replaced in a
+    single pass (a value that itself looks like a placeholder is never
+    re-substituted). Inputs without a placeholder are appended in a
+    trailing ``## Inputs`` section, so no bound value is dropped; a param
+    without one is simply not used by this prompt.
     """
-    if not values:
+    combined = {**(params or {}), **values}
+    if not combined:
         return template
-    pattern = re.compile("|".join(re.escape("{" + name + "}") for name in values))
+    pattern = re.compile("|".join(re.escape("{" + name + "}") for name in combined))
     used: set[str] = set()
 
     def _substitute(match: "re.Match[str]") -> str:
         name = match.group(0)[1:-1]
         used.add(name)
-        return values[name]
+        return combined[name]
 
     rendered = pattern.sub(_substitute, template)
     unplaced = [(name, value) for name, value in values.items() if name not in used]
@@ -1508,6 +1654,7 @@ class _PythonProcess:
                 stdin.seek(0)
                 proc = await asyncio.create_subprocess_exec(
                     sys.executable, "-I", "-c", PYTHON_RUNNER, target["import"], target["callable"],
+                    *([target["path"]] if target.get("path") else []),
                     stdin=stdin, stdout=stdout, stderr=stderr,
                     cwd=os.getcwd(), env=env, start_new_session=True,
                 )
@@ -1601,6 +1748,7 @@ class _NodeInstance:
     # deferral (run()/resume(), allow_backoff=False) consumes an attempt
     # but never counts toward the backoff episode.
     child_id: str | None = None
+    session_dir: str | None = None  # the child's session dir: its emitted outputs live there
     spawned_at: float | None = None
     duration_ms: int | None = None
     answer: str | None = None  # the binding lane's captured answer (ANSWER_BINDING_CAP)
@@ -1609,7 +1757,7 @@ class _NodeInstance:
     # exit's last assistant text as delivered work (the M4 class).
     error: str | None = None
     tool_uses: int = 0
-    inputs: dict[str, Any] | None = None  # a python state's bound inputs; re-runs reuse them
+    inputs: dict[str, Any] | None = None  # bound inputs and params; re-runs reuse them
     process: "_PythonProcess | None" = None  # a python state's running call
     deadline: float | None = None  # a python call's time limit (seconds on the injected clock)
 
@@ -1703,6 +1851,11 @@ class FactoryRun:
     # status payload carries it with a one-line remedy (the M6 class), so
     # an operator reads WHAT failed from status() instead of archaeology.
     last_error: str | None = None
+    # The machine directory of a machine-directory run: asset inputs
+    # resolve inside it. The assets the run read, by asset path: each
+    # asset is read on its first use, and later entries bind the same text.
+    assets_dir: Path | None = None
+    assets: dict[str, str] = field(default_factory=dict)
     states: dict[str, _StateRun] = field(default_factory=dict)
     order: list[str] = field(default_factory=list)
     transitions_from: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
@@ -1808,7 +1961,12 @@ class FactoryExecutor:
         return await self._launch_run(run)
 
     async def run_machine(
-        self, machine: MachineFile, *, machine_path: Path | None = None, name: str | None = None
+        self,
+        machine: MachineFile,
+        *,
+        machine_path: Path | None = None,
+        assets_dir: Path | None = None,
+        name: str | None = None,
     ) -> dict[str, Any]:
         """Validate a library machine and start a run of it.
 
@@ -1818,13 +1976,16 @@ class FactoryExecutor:
         stored entry's (``canonicalize_factory_spec``), the run records the
         machine's name as its spec id, and the result reports the machine
         fields so a caller can trace the run back to the library file.
+        ``assets_dir`` is the directory of a machine-directory run; its
+        asset inputs resolve there.
         """
-        canonical = canonicalize_factory_spec(machine.spec)
+        canonical = canonicalize_factory_spec(machine.spec, machine_dir=assets_dir)
         harness = self._resolve_harness()
         resolved, reference_errors = self._resolve_subagents(harness, canonical)
         if reference_errors:
             raise ValueError("; ".join(reference_errors))
         run = self._create_run(machine.name, canonical, resolved, name=name)
+        run.assets_dir = assets_dir
         result = await self._launch_run(run)
         result["machine"] = machine.name
         if machine_path is not None:
@@ -2898,6 +3059,20 @@ class FactoryExecutor:
         items: list[Any] | None = None
         for inp in state.spec.get("inputs") or []:
             name, port_type, source = inp["name"], inp["type"], inp["from"]
+            if _is_asset_reference(source):
+                text = run.assets.get(source)
+                if text is None:
+                    # Validation resolved every asset input inside the
+                    # run's machine directory; the read re-checks the path,
+                    # because the file can change after the run started.
+                    assert run.assets_dir is not None
+                    try:
+                        text = _resolve_asset(run.assets_dir, source).read_text(encoding="utf-8")
+                    except (ValueError, OSError) as error:
+                        return None, f"input {name!r}: {error}"
+                    run.assets[source] = text
+                bound[name] = text
+                continue
             src_id, _, src_output = source.partition(".")
             source_state = run.states.get(src_id)
             latest = source_state.latest_settle() if source_state is not None else None
@@ -2975,10 +3150,17 @@ class FactoryExecutor:
                 items = value
                 continue
             bound[name] = value
+        params = run.machine.get("params") or {}
         if "python" in state.spec:
-            instance = _NodeInstance(index=state.instance_counter, prompt="", inputs=bound)
+            instance = _NodeInstance(
+                index=state.instance_counter, prompt="", inputs={**params, **bound}
+            )
             state.instance_counter += 1
             return [instance], None
+        rendered_params = {
+            name: value if isinstance(value, str) else json.dumps(value)
+            for name, value in params.items()
+        }
         # The prompt form of a bound value: json inputs as JSON text (a
         # missing optional one reads "null"), text inputs verbatim (a
         # missing optional one reads "None").
@@ -2989,7 +3171,11 @@ class FactoryExecutor:
         }
         if foreach is None:
             assert state.prompt_template is not None
-            instance = _NodeInstance(index=state.instance_counter, prompt=_render_prompt(state.prompt_template, values))
+            instance = _NodeInstance(
+                index=state.instance_counter,
+                prompt=_render_prompt(state.prompt_template, values, rendered_params),
+                inputs={**params, **bound},
+            )
             state.instance_counter += 1
             return [instance], None
         if items is None:
@@ -3000,7 +3186,12 @@ class FactoryExecutor:
             instances.append(
                 _NodeInstance(
                     index=state.instance_counter + len(instances),
-                    prompt=_render_prompt(state.prompt_template, {**values, foreach["over"]: instance_value}),
+                    prompt=_render_prompt(
+                        state.prompt_template,
+                        {**values, foreach["over"]: instance_value},
+                        rendered_params,
+                    ),
+                    inputs={**params, **bound, foreach["over"]: item},
                 )
             )
         state.instance_counter += len(instances)
@@ -3049,6 +3240,7 @@ class FactoryExecutor:
 
         instance.attempt += 1
         child_name = _spawn_label(state.name, run.run_id, state.state_id, instance.index, instance.attempt)
+        contract = state.spec.get("emit")
         try:
             handle = await _spawn(
                 instance.prompt,
@@ -3056,6 +3248,7 @@ class FactoryExecutor:
                 model=state.model,
                 thinking=state.thinking,
                 factory={"runId": run.run_id, "specId": run.spec_id, "stateId": state.state_id},
+                factory_contract=None if contract is None else {**contract, "inputs": instance.inputs or {}},
             )
         except RuntimeError as exc:
             last_error = str(exc)
@@ -3104,6 +3297,7 @@ class FactoryExecutor:
             await self._retract_admission(run, state, entry, instance)
             return "stopped"
         instance.child_id = handle.rlm_child_id
+        instance.session_dir = str(handle.session_dir)
         instance.spawned_at = self._now_fn()
         instance.status = "running"
         instance.rate_limit_streak = 0
@@ -3205,6 +3399,21 @@ class FactoryExecutor:
         if isinstance(outputs, str):
             await self._apply_instance_failure(run, state, entry, instance, outputs, retry=True)
             return
+        if "emit" in state.spec:
+            # The same Rust check a child's emit passes through.
+            from . import host_request
+
+            try:
+                await host_request("factory.check", {"contract": state.spec["emit"], "outputs": outputs})
+            except RuntimeError as error:
+                if entry.status != "running":
+                    return
+                await self._apply_instance_failure(
+                    run, state, entry, instance, f"python state output: {error}", retry=True
+                )
+                return
+            if entry.status != "running":
+                return
         instance.status = "done"
         instance.answer = json.dumps(outputs, separators=(",", ":"))[:ANSWER_BINDING_CAP]
         self._event(
@@ -3333,21 +3542,42 @@ class FactoryExecutor:
             )
         if entry.status == "running" and entry.instances and all(i.status == "done" for i in entry.instances):
             entry.answer = self._entry_answer(entry)
-            capture_failure = await self._capture_outputs(run, state, entry)
+            if "emit" in state.spec:
+                capture_failure, failed = self._emitted_outputs(run, state, entry)
+            else:
+                capture_failure = await self._capture_outputs(run, state, entry)
+                failed = [instance]
             if entry.status != "running":
                 return  # a stop()/fail_fast pass claimed the entry mid-capture
             if capture_failure is not None:
-                # A declared output that never bound after the capture
-                # retry is the producing entry's task failure, not a silent
+                # A declared output that never bound or was never emitted
+                # is the producing entry's task failure, not a silent
                 # valueless settle: no settle is queued (a dependent never
                 # enters on an unbound required input), retries then
                 # failure_policy apply, and the answer stays provisional
-                # for needs_verify if the entry fails permanently.
-                instance.provisional = True
-                instance.capture_failed = True
-                await self._apply_instance_failure(
-                    run, state, entry, instance, capture_failure, retry=True
-                )
+                # for needs_verify if the entry fails permanently. A
+                # foreach entry retries each instance that omitted a
+                # required port, not only the last one to settle.
+                for index, failed_instance in enumerate(failed):
+                    failed_instance.provisional = True
+                    failed_instance.capture_failed = True
+                    await self._apply_instance_failure(
+                        run, state, entry, failed_instance, capture_failure, retry=True
+                    )
+                    if entry.status == "error":
+                        # This instance spent its retries and failed the
+                        # entry. Mark the other omitted instances error
+                        # too, so resume() re-admits all of them, not
+                        # only the first.
+                        for other in failed[index + 1:]:
+                            other.provisional = True
+                            other.capture_failed = True
+                            await self._apply_instance_failure(
+                                run, state, entry, other, capture_failure, retry=True
+                            )
+                        return
+                    if entry.status != "running":
+                        return
                 return
             entry.status = "done"
             self._queue_settle(run, state, entry)
@@ -3484,6 +3714,58 @@ class FactoryExecutor:
                 errors[name] = error
         entry.outputs = outputs
         entry.output_errors = errors
+
+    def _emitted_outputs(
+        self, run: FactoryRun, state: _StateRun, entry: _StateEntry
+    ) -> tuple[str | None, list[_NodeInstance]]:
+        """Read what each child emitted into ``entry.outputs``.
+
+        The child's ``factory.emit`` already checked every value and wrote
+        the accepted ones to its outputs file in one step, so this reads
+        and gathers them: a foreach entry joins text ports with blank lines
+        and turns every other port into a list in item order. Returns the
+        joined failure reason and the instances that omitted a required
+        port; ``(None, [])`` when every port has a value.
+        """
+        declared = state.spec["emit"].get("outputs") or []
+        kinds = _declared_port_types(state.spec, "outputs")
+        per_instance: list[dict[str, Any]] = []
+        for instance in entry.instances:
+            emitted: dict[str, Any] = {}
+            if instance.session_dir is not None:
+                try:
+                    loaded = json.loads((Path(instance.session_dir) / FACTORY_OUTPUTS_FILE).read_text("utf-8"))
+                    emitted = loaded if isinstance(loaded, dict) else {}
+                except (OSError, ValueError):
+                    emitted = {}
+            per_instance.append(emitted)
+        if state.spec.get("foreach") is None:
+            entry.outputs = per_instance[0] if per_instance else {}
+        else:
+            entry.outputs = {}
+            for out in declared:
+                values = [emitted[out["name"]] for emitted in per_instance if out["name"] in emitted]
+                if values:
+                    entry.outputs[out["name"]] = (
+                        "\n\n".join(str(value) for value in values) if kinds.get(out["name"]) == "text" else values
+                    )
+        entry.output_errors = {}
+        missing: list[_NodeInstance] = []
+        for instance, emitted in zip(entry.instances, per_instance):
+            if any(
+                not out.get("type", "").endswith("?") and out["name"] not in emitted
+                for out in declared
+            ):
+                missing.append(instance)
+        failures = []
+        for out in declared:
+            name = out["name"]
+            if out.get("type", "").endswith("?") or all(name in emitted for emitted in per_instance):
+                continue
+            error = f"output {name!r} was never emitted (rlm.factory.emit)"
+            self._event(run, "output_capture_failed", node=state.state_id, entry=entry.index, port=name, error=error)
+            failures.append(error)
+        return ("; ".join(failures) or None), missing
 
     async def _capture_outputs(self, run: FactoryRun, state: _StateRun, entry: _StateEntry) -> str | None:
         """Capture the settle's outputs, retrying the capture once.
@@ -4209,19 +4491,52 @@ def default_factory_executor() -> FactoryExecutor:
     return _DEFAULT_EXECUTOR
 
 
-async def run_factory(spec_id: str, *, name: str | None = None) -> dict[str, Any]:
+async def run_factory(
+    spec_id: str, *, name: str | None = None, params: "dict[str, Any] | None" = None
+) -> dict[str, Any]:
     """Validate a factory spec and start a nonblocking run of it.
 
-    The argument names a stored factory entry (a runtime instance) first;
-    when no entry carries that id, it resolves a machine from the library
-    (repo directory first, user second) and runs the template directly:
-    ``await rlm.factory.run("review-sweep")`` starts the library machine
-    without creating a harness entry. Harness entries remain runtime
-    instances; machines are templates.
+    A path to a machine directory (``machine.toml``) runs that directory.
+    Otherwise the argument names a stored factory entry (a runtime
+    instance) first; when no entry carries that id, it resolves a machine
+    from the library (repo directory first, user second; within a level a
+    machine directory wins over a MACHINE.md of the same name) and runs the
+    template directly: ``await rlm.factory.run("review-sweep")`` starts the
+    library machine without creating a harness entry. Harness entries
+    remain runtime instances; machines are templates.
+
+    A machine directory is loaded, checked, and compiled by the session's
+    Rust loader (the ``factory.compile`` host request, the same one
+    ``prime-agent factory validate`` uses) with ``params`` bound; params
+    apply to machine directories only.
     """
     require_factory_enabled()
+    if params is not None and not isinstance(params, dict):
+        raise TypeError(f"params must be a dict, got {type(params).__name__}")
     executor = default_factory_executor()
     harness = executor._resolve_harness()
+    directory = _machine_dir_argument(spec_id)
+    if directory is None and harness.get("factory", spec_id) is None:
+        directory = _resolve_machine_dir(spec_id)
+    if directory is not None:
+        from . import host_request
+
+        compiled = await host_request(
+            "factory.compile", {"path": str(directory), "params": params or {}}
+        )
+        machine = MachineFile(
+            name=compiled["name"],
+            description=compiled["description"],
+            version=str(compiled["version"]),
+            author=compiled.get("author") or "",
+            spec=compiled["spec"],
+        )
+        return await executor.run_machine(machine, machine_path=directory, assets_dir=directory, name=name)
+    if params:
+        raise ValueError(
+            f"params apply to machine directories (machine.toml); {spec_id!r} is a stored "
+            "factory entry or a MACHINE.md machine, which take none"
+        )
     if harness.get("factory", spec_id) is None:
         try:
             machine, path = resolve_machine(spec_id)
@@ -4530,6 +4845,10 @@ def _cap_factory_frame(frame: dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 MACHINE_FILE_NAME = "MACHINE.md"
+MACHINE_DIR_FILE_NAME = "machine.toml"
+"""The file that makes a directory a machine directory (the format
+``prime-agent factory validate`` checks; loaded by the session's Rust
+loader through the ``factory.compile`` host request)."""
 MACHINE_SPEC_FENCE = "machine-spec"
 MACHINES_DIR_NAME = "machines"
 MACHINE_NAME_MAX_LENGTH = 64
@@ -4994,6 +5313,46 @@ def list_machines(
     return _scan_machine_library(repo_dir=repo_dir, user_dir=user_dir)[0]
 
 
+def _machine_dir_argument(spec_id: str) -> "Path | None":
+    """The machine directory an explicit path names (``~/machines/rsi``,
+    ``./rsi``, an absolute path), or ``None`` for a plain name."""
+    if not (spec_id.startswith(("~", ".", "/")) or os.sep in spec_id):
+        return None
+    directory = Path(spec_id).expanduser().resolve()
+    if not (directory / MACHINE_DIR_FILE_NAME).is_file():
+        raise ValueError(f"{spec_id!r} is not a machine directory (no {MACHINE_DIR_FILE_NAME} in it)")
+    return directory
+
+
+def _resolve_machine_dir(
+    name: str,
+    *,
+    repo_dir: "str | Path | None" = None,
+    user_dir: "str | Path | None" = None,
+) -> "Path | None":
+    """The library machine directory carrying ``name``, if one claims it.
+
+    Levels resolve in order (repo, then user). Within a level a
+    ``<name>/machine.toml`` directory wins over ``<name>/MACHINE.md``; a
+    valid MACHINE.md machine at an earlier level keeps the name, the order
+    ``prime-agent factory list`` shows. The directory's own checks run in
+    the Rust loader, so a broken directory reports its exact errors when
+    run instead of falling through to another level.
+    """
+    if machine_name_errors(name):
+        return None
+    for _source, directory in machine_library_dirs(repo_dir=repo_dir, user_dir=user_dir):
+        candidate = directory / name
+        if (candidate / MACHINE_DIR_FILE_NAME).is_file():
+            return candidate
+        v1 = candidate / MACHINE_FILE_NAME
+        if v1.is_file():
+            machine, error = _read_library_machine(v1)
+            if not error and machine is not None and machine.name == name:
+                return None
+    return None
+
+
 class MachineResolutionError(ValueError):
     """One library lookup failure, with its kind.
 
@@ -5257,8 +5616,10 @@ def cli_dispatch(payload: Any) -> "dict[str, Any]":
     ``{"ok": false, "errors": [...]}``. Every error surfaces as data, so
     the exact validator sentences reach the command's output verbatim.
     The payload carries only what the user typed (an op, a path, a name,
-    an out target); this process resolves every library directory itself,
-    so the kernel is the single resolution contract for list, import, and
+    an out target); ``read`` answers one MACHINE.md machine's fields and
+    spec for ``prime-agent factory convert``; this process resolves every
+    library directory itself, so the kernel is the single resolution
+    contract for list, import, and
     export alike — a fresh CLI process has no session state (stored
     entries, live runs), so export resolves the library only.
     """
@@ -5268,6 +5629,27 @@ def cli_dispatch(payload: Any) -> "dict[str, Any]":
     if op == "list":
         machines, warnings = _scan_machine_library()
         return {"ok": True, "machines": machines, "warnings": warnings}
+    if op == "read":
+        path, name = payload.get("path"), payload.get("name")
+        try:
+            if isinstance(path, str) and path:
+                machine, error = _read_library_machine(Path(path).expanduser())
+                if error or machine is None:
+                    raise ValueError(error)
+            elif isinstance(name, str) and name:
+                machine, _path = resolve_machine(name)
+            else:
+                return {"ok": False, "errors": ["factory read requires a `path` or `name` string"]}
+        except (ValueError, OSError) as error:
+            return {"ok": False, "errors": [str(error)]}
+        return {
+            "ok": True,
+            "name": machine.name,
+            "description": machine.description,
+            "version": machine.version,
+            "author": machine.author,
+            "spec": machine.spec,
+        }
     if op == "import":
         if not isinstance(payload.get("path"), str) or not payload["path"]:
             return {"ok": False, "errors": ["factory import requires a `path` string"]}
@@ -5288,7 +5670,9 @@ def cli_dispatch(payload: Any) -> "dict[str, Any]":
         return {"ok": True, **result}
     return {
         "ok": False,
-        "errors": [f"unknown factory cli op {op!r} (expected 'list', 'import' or 'export')"],
+        "errors": [
+            f"unknown factory cli op {op!r} (expected 'list', 'read', 'import' or 'export')"
+        ],
     }
 
 
@@ -5580,7 +5964,7 @@ data shaping — listing work items, filtering, reshaping one state's output
 for the next — where a child agent would only spend budget.
 
 - **Contract**: the executor calls `fn(inputs)` with a dict of the state's
-  declared inputs bound to raw values (a `text` input as a string, a `json`
+  declared inputs (plus the machine's params, when it has any) bound to raw values (a `text` input as a string, a `json`
   input as the parsed value, an optional input with no value as `None`;
   entry states with no declared inputs get `{}`). The function returns a
   dict whose keys are exactly the declared output names (a `text` output must be a string);
@@ -5708,6 +6092,76 @@ watched = await rlm.factory.watch(result["run_id"], 30)
   (`runId`, `specId`, `timeoutMs`); the kernel API here
   (`rlm.factory.*`) is snake_case.
 
+## Machine directories
+
+A machine can also be a directory: `machine.toml` for the graph, Markdown
+prompts, TOML rubrics, and `nodes/*.py` for python states. Nothing in it is
+generated, so it shares as-is. `prime-agent factory validate <dir>` checks
+it (types, ports, routes, joins, reachability, prompt placeholders) with
+the same Rust loader a session uses; `prime-agent factory convert <name>
+--out <dir>` turns a MACHINE.md machine into one.
+
+```toml
+format = 1
+name = "review-loop"
+version = 1
+description = "Plan, judge, and route"
+
+[params]
+task = { type = "text" }          # given at start: run(..., params={"task": ...})
+
+[roles]
+judge = { model = "<provider>/<model>", thinking = "max" }
+
+[types.verdict]
+decision = "enum(approve, rework)"
+findings = "list[text]"
+
+[states.plan]
+entry = true
+agent = { prompt = "prompts/plan.md" }      # the prompt inserts {{task}}
+inputs = { verdict = "review.verdict?" }    # ? = optional
+outputs = { plan = "text" }
+max_entries = 3
+next = "review"
+
+[states.review]
+agent = { role = "judge", prompt = "prompts/review.md", rubric = "rubrics/quality.toml" }
+inputs = { plan = "plan.plan" }
+outputs = { verdict = "verdict" }
+route = { on = "verdict.decision", approve = "ship", rework = "plan" }
+```
+
+- Prompts insert params and inputs with `{{name}}`; `prompts/_context.md`
+  is prepended to every agent state. The loader appends a generated
+  Outputs section that spells out each port's type.
+- A child of a directory machine hands back its outputs with
+  `await rlm.factory.emit(<port>=<value>, ...)`. The call checks every
+  value against the declared types and keeps nothing when one is wrong:
+  it raises `FactoryEmitError` with the exact field
+  (`verdict.decision: "ship" is not one of approve, rework`), and the
+  child fixes the value and calls again. A `file` output takes a path, and
+  the file is copied beside the child's session. A `file` must be a
+  top-level output: the loader refuses one inside a list or a record
+  field. Each call sets the ports
+  it names. A child that ends without a required port fails its entry.
+  `await rlm.factory.inputs()` gives the child its bound inputs and the
+  params as values. A python state's returned dict goes through the same
+  check. A python state cannot return a `file` output: only an agent
+  child's emit copies a file, so the loader refuses it.
+- Routing is `next` (a state, or a list to fan out) or `route`, a switch
+  on one enum or bool output where every value needs a target. A state
+  with `join = [...]` waits for every member, and each member names it in
+  `next`. Any other condition is a python state that returns an enum.
+- A python state is `kind = "python"` with `run = "nodes/<file>.py:<fn>"`;
+  the function receives the declared inputs plus the params.
+- An input `name = "assets/<path>"` reads a file of the directory's
+  `assets/` tree as text. The path stays inside the directory (no `..`,
+  no symlink that leaves it); a missing asset fails before the run starts.
+  The run reads each asset one time, on its first use.
+- `await rlm.factory.run("<name or path>", params={...})` runs one; a
+  required param with no default must be given.
+
 ## Discovering machines
 
 - The machine library: machines are `MACHINE.md` files (frontmatter plus
@@ -5741,7 +6195,8 @@ watched = await rlm.factory.watch(result["run_id"], 30)
   `max_entries`, `max_transitions`, and `run.max_children` (total
   admissions); the default `escalate` policy pauses
   instead of failing, so read `status` (or the notice) before resuming.
-- Outputs bind from the child's full final answer (the collect envelope
+- In a stored spec (no emit contract), outputs bind from the child's full
+  final answer (the collect envelope
   carries it; the executor caps its own capture at 65,536 characters,
   the same bound the daemon puts on the envelope's answer text): a
   fenced json output block binds whole as long as it fits that cap (a
