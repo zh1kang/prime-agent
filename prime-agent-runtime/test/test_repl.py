@@ -122,6 +122,14 @@ def reply_ok(repl: ReplProcess, request: dict) -> None:
     repl.send({"type": "host_reply", "id": request["id"], "data": {"status": "ok", "result": {}}})
 
 
+def wait_for_host_request_of_type(repl: ReplProcess, kind: str) -> dict:
+    """Read protocol events until the next host_request whose data.type is `kind`."""
+    while True:
+        event = repl.read_event()
+        if event.get("event") == "host_request" and event.get("data", {}).get("type") == kind:
+            return event
+
+
 class ReplTest(unittest.TestCase):
     def setUp(self) -> None:
         self.repl = ReplProcess()
@@ -756,7 +764,10 @@ class ReplTest(unittest.TestCase):
             ("from-import", "from subprocess import run\nrun(['ls'])"),
             ("os-system", "import os\nos.system('ls')"),
             ("os-popen", "os.popen('ls')"),
+            ("os-getoutput", "import os\nos.getoutput('ls')"),
+            ("os-getstatusoutput", "os.getstatusoutput('ls')"),
             ("from-os", "from os import system\nsystem('ls')"),
+            ("from-os-getoutput", "from os import getoutput\ngetoutput('ls')"),
             ("pty", "import pty\npty.spawn('/bin/sh')"),
         ):
             events = self.repl.execute(rid, code)
@@ -2267,6 +2278,7 @@ class ReplTest(unittest.TestCase):
                 "pid": pid,
                 "command": "sleep 0.05; printf detached",
                 "exitCode": 0,
+                "output": "detached",
             },
         )
         reply_ok(self.repl, request)
@@ -2297,6 +2309,7 @@ class ReplTest(unittest.TestCase):
                 "pid": pid,
                 "command": "sleep 1.5; printf degraded",
                 "exitCode": 0,
+                "output": "degraded",
             },
         )
         reply_ok(self.repl, request)
@@ -4357,6 +4370,391 @@ class OwnerExitWaitTest(unittest.TestCase):
         ):
             self.repl_module._wait_owner_posix(self.owner.pid, os.getppid())
         sleep.assert_called_once()
+
+
+class CellSpanGuardTest(unittest.TestCase):
+    """The in-cell span guard runs on the host's own cell limit: a cell still
+    running at that limit is interrupted through the SIGINT path and settles
+    as a teaching error (CellSpanGuard). Short cells run untouched, the kernel
+    stays usable, and a request with no limit keeps the guard disarmed even
+    where the host wires completion notices."""
+
+    def guarded_repl(self) -> ReplProcess:
+        repl = ReplProcess()
+        self.addCleanup(repl.close)
+        repl.ready()
+        # The guard arms only in sessions whose host wires completion
+        # notices (the bootstrap flips the flag from the host-handler
+        # registry); the test host simulates the daemon's registration.
+        repl.execute(
+            "wire",
+            "from rlm.bash import _set_completion_notices_wired\n"
+            "_set_completion_notices_wired(True)",
+        )
+        return repl
+
+    def execute_limited(self, repl: ReplProcess, rid: str, code: str, timeout_ms: int) -> list[dict]:
+        """One execute frame carrying the host's cell limit, the way the
+        manager sends it (`ExecuteOptions::cell_timeout_ms`)."""
+        repl.send({"type": "execute", "id": rid, "code": code, "timeout_ms": timeout_ms})
+        return repl.until_done(rid)
+
+    def test_an_unwired_host_keeps_long_cells_untouched(self):
+        # A host without completion notices has no [bash-done] wake, so the
+        # guard's teaching promise cannot hold there: it stays disarmed and
+        # a cell past the limit runs unbounded as on main (the wired twin
+        # interrupts the same shape at the limit).
+        repl = ReplProcess()
+        self.addCleanup(repl.close)
+        repl.ready()
+        events = self.execute_limited(
+            repl, "slow", "import time\ntime.sleep(1.5)\ndone = True", 400
+        )
+        self.assertIsNone(one(events, "error"), f"events: {events}")
+        self.assertEqual(one(events, "done")["status"], "ok")
+        events = repl.execute("check", "done")
+        self.assertEqual(one(events, "result")["text"], "True")
+
+    def test_long_compute_cell_is_interrupted_with_the_teaching_error(self):
+        # Pure compute: no banned shape, invisible to the discipline screen,
+        # and blocking — exactly the single-giant-cell shape the boundary
+        # notices cannot reach.
+        repl = self.guarded_repl()
+        repl.send(
+            {"type": "execute", "id": "long", "code": "n = 0\nwhile True:\n    n += 1", "timeout_ms": 500}
+        )
+        events = repl.until_done("long")
+        error = one(events, "error")
+        self.assertIsNotNone(error)
+        self.assertEqual(error["ename"], "CellSpanGuard")
+        self.assertIn("0.5s cell limit", error["evalue"])
+        self.assertIn("[cell-span]", "\n".join(error["traceback"]))
+        self.assertIn("bash()", "\n".join(error["traceback"]))
+        self.assertEqual(one(events, "done")["status"], "error")
+        # The kernel stays usable and the interrupted cell's prior state
+        # persists in the namespace.
+        events = repl.execute("after", "n > 0")
+        self.assertEqual(one(events, "result")["text"], "True")
+        self.assertEqual(one(events, "done")["status"], "ok")
+
+    def test_a_bounded_cell_past_the_limit_settles_at_the_guard_not_at_its_end(self):
+        # The request's limit, not the cell, decides: 1.5s of work under a
+        # 400ms limit settles with the teaching error long before the cell
+        # would have ended.
+        repl = self.guarded_repl()
+        started = time.monotonic()
+        events = self.execute_limited(repl, "bounded", "import time\ntime.sleep(1.5)", 400)
+        elapsed = time.monotonic() - started
+        error = one(events, "error")
+        self.assertIsNotNone(error, f"events: {events}")
+        self.assertEqual(error["ename"], "CellSpanGuard")
+        self.assertLess(elapsed, 1.0, "the guard fires at the request limit, not at the cell's end")
+
+    def test_await_suspended_cell_is_interrupted_at_the_limit(self):
+        repl = self.guarded_repl()
+        repl.send(
+            {
+                "type": "execute",
+                "id": "parked",
+                "code": "import asyncio\nawait asyncio.get_running_loop().create_future()",
+                "timeout_ms": 500,
+            }
+        )
+        events = repl.until_done("parked")
+        error = one(events, "error")
+        self.assertIsNotNone(error)
+        self.assertEqual(error["ename"], "CellSpanGuard")
+        self.assertEqual(one(events, "done")["status"], "error")
+
+    def test_short_cells_run_untouched(self):
+        repl = self.guarded_repl()
+        events = self.execute_limited(repl, "quick", "40 + 2", 1000)
+        self.assertEqual(one(events, "result")["text"], "42")
+        self.assertEqual(one(events, "done")["status"], "ok")
+
+    def test_the_guard_stays_armed_through_result_rendering(self):
+        # The cell body returns at once, but its __repr__ outlives the limit:
+        # rendering is still this cell's span, so the teaching error replaces
+        # the value instead of a bare KeyboardInterrupt or an ok outcome.
+        repl = self.guarded_repl()
+        events = self.execute_limited(
+            repl,
+            "slow-repr",
+            "import time\n"
+            "class Slow:\n"
+            "    def __repr__(self):\n"
+            "        time.sleep(1.5)\n"
+            "        return 'slow'\n"
+            "Slow()",
+            400,
+        )
+        error = one(events, "error")
+        self.assertIsNotNone(error, f"events: {events}")
+        self.assertEqual(error["ename"], "CellSpanGuard")
+        self.assertIn("0.4s cell limit", error["evalue"])
+        self.assertIsNone(one(events, "result"))
+        self.assertEqual(one(events, "done")["status"], "error")
+
+    def test_an_interrupt_during_the_close_reports_the_span_teaching(self):
+        # The guard can fire while the request closes its interrupt window.
+        # The close sits inside the guarded region, so that interrupt still
+        # becomes the teaching, and the retry finishes the half-run close
+        # instead of letting the request escape to the bare-error backstop.
+        repl = self.guarded_repl()
+        repl.execute(
+            "arm-close",
+            "import rlm.repl as repl_module\n"
+            "repl_module._span_guard_fired['close'] = 0.4\n"
+            "real_finish = repl_module._finish_request\n"
+            "raised = []\n"
+            "def finish(rid):\n"
+            "    if rid == 'close' and not raised:\n"
+            "        raised.append(True)\n"
+            "        raise KeyboardInterrupt\n"
+            "    return real_finish(rid)\n"
+            "repl_module._finish_request = finish",
+        )
+        events = repl.execute("close", "1 + 1")
+        error = one(events, "error")
+        self.assertIsNotNone(error, f"events: {events}")
+        self.assertEqual(error["ename"], "CellSpanGuard")
+        self.assertIn("0.4s cell limit", error["evalue"])
+        self.assertIsNone(one(events, "result"))
+        self.assertEqual(one(events, "done")["status"], "error")
+        events = repl.execute("after", "6 * 7")
+        self.assertEqual(one(events, "result")["text"], "42")
+        self.assertEqual(one(events, "done")["status"], "ok")
+
+    def test_no_announced_limit_keeps_the_guard_disarmed(self):
+        # An absent field and an explicit 0 both mean the session runs with
+        # no cell limit (the setting is off): the guard must not invent one.
+        repl = self.guarded_repl()
+        repl.send({"type": "execute", "id": "absent", "code": "import time\ntime.sleep(1.5)\nseen = True"})
+        events = repl.until_done("absent")
+        self.assertIsNone(one(events, "error"), f"events: {events}")
+        self.assertEqual(one(events, "done")["status"], "ok")
+        events = self.execute_limited(repl, "zero", "import time\ntime.sleep(1.5)\nseen = True", 0)
+        self.assertIsNone(one(events, "error"), f"events: {events}")
+        self.assertEqual(one(events, "done")["status"], "ok")
+        events = repl.execute("check", "seen")
+        self.assertEqual(one(events, "result")["text"], "True")
+
+    def test_guard_fires_even_when_the_host_blocked_sigint(self):
+        # A host that blocks SIGINT on the spawning thread (tokio-style signal
+        # handling) leaks that mask through fork+exec; the kernel must own its
+        # mask and unblock SIGINT at startup, or no interrupt -- user abort or
+        # the span guard -- can ever land in a stuck cell.
+        if not hasattr(signal, "pthread_sigmask"):
+            self.skipTest("POSIX signal masks required")
+        signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
+        try:
+            repl = self.guarded_repl()
+        finally:
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT})
+        events = self.execute_limited(repl, "stuck", "n = 0\nwhile True:\n    n += 1", 500)
+        error = one(events, "error")
+        self.assertIsNotNone(error, f"events: {events}")
+        self.assertEqual(error["ename"], "CellSpanGuard")
+        self.assertEqual(one(events, "done")["status"], "error")
+
+
+
+class SpanGuardBudgetTest(unittest.TestCase):
+    """The guard's clock arithmetic: the host's limit is the budget, the
+    timer sits a lead inside it (the watchdog's clock starts earlier, so a
+    guard at the bare limit loses the race), and no limit disarms it."""
+
+    def setUp(self):
+        sys.path.insert(0, SRC)
+        self.addCleanup(sys.path.remove, SRC)
+        import rlm.repl as repl_module
+
+        self.repl_module = repl_module
+
+    def test_the_budget_is_the_host_limit_in_seconds(self):
+        self.assertEqual(self.repl_module._span_guard_budget(60_000), 60.0)
+        self.assertEqual(self.repl_module._span_guard_budget(400), 0.4)
+        self.assertEqual(self.repl_module._span_guard_budget(180_000), 180.0)
+
+    def test_no_limit_disarms_the_guard(self):
+        for raw in (None, 0, -1, "500", True):
+            with self.subTest(raw=raw):
+                self.assertEqual(self.repl_module._span_guard_budget(raw), 0.0)
+
+    def test_the_timer_fires_inside_the_limit(self):
+        for budget in (0.4, 60.0, 180.0):
+            with self.subTest(budget=budget):
+                delay = self.repl_module._span_guard_delay(budget)
+                self.assertLess(delay, budget, "the guard must beat the watchdog's clock")
+                self.assertGreater(delay, 0.0)
+
+    def test_the_lead_is_a_quarter_second_bounded_by_a_quarter_of_the_limit(self):
+        self.assertAlmostEqual(self.repl_module._span_guard_delay(60.0), 59.75)
+        self.assertAlmostEqual(self.repl_module._span_guard_delay(180.0), 179.75)
+        self.assertAlmostEqual(self.repl_module._span_guard_delay(0.4), 0.3)
+
+
+class ProtocolFrameAtomicityTest(unittest.TestCase):
+    """An interrupt raised by the handler must not tear a protocol frame: the
+    write blocks SIGINT on the main thread, so the signal lands after the last
+    byte instead of splitting the frame the host is parsing."""
+
+    def test_interrupt_during_a_display_write_keeps_the_frame_whole(self):
+        repl = ReplProcess()
+        self.addCleanup(repl.close)
+        repl.ready()
+        cell = "\n".join(
+            [
+                "import os",
+                "import rlm.repl as repl_module",
+                "real_write = repl_module.os.write",
+                "armed = []",
+                "def write(fd, data):",
+                "    if fd == repl_module._protocol_fd and len(data) > 4096 and not armed:",
+                "        armed.append(True)",
+                "        sent = real_write(fd, bytes(data[:4096]))",
+                # The span guard's own path: mark the rid, then SIGINT the
+                # main thread while the frame is only partly on the wire.
+                "        repl_module._request_interrupt(repl_module._active['rid'])",
+                "        return sent",
+                "    return real_write(fd, data)",
+                "repl_module.os.write = write",
+                "try:",
+                "    repl_module.emit({'text/plain': 'x' * 200000})",
+                "finally:",
+                "    repl_module.os.write = real_write",
+            ]
+        )
+        repl.send({"type": "execute", "id": "tear", "code": cell})
+        events = repl.until_done("tear")
+        display = one(events, "display")
+        self.assertIsNotNone(display, f"events: {events}")
+        self.assertEqual(len(display["data"]["text/plain"]), 200000)
+        error = one(events, "error")
+        self.assertIsNotNone(error)
+        self.assertEqual(error["ename"], "KeyboardInterrupt")
+        events = repl.execute("after", "6 * 7")
+        self.assertEqual(one(events, "result")["text"], "42")
+
+
+class WaitingKeepaliveTest(unittest.TestCase):
+    """The waiting keepalive: a parked session with live background commands
+    paces [waiting] host requests so idle clocks never close it mid-wait;
+    a session with no live work stays quiet, and the env knob disables."""
+
+    def kept_repl(self, seconds: str) -> ReplProcess:
+        repl = ReplProcess(env={"PRIME_AGENT_BASH_WAITING_KEEPALIVE_SECONDS": seconds})
+        self.addCleanup(repl.close)
+        repl.ready()
+        return repl
+
+    def test_parked_session_paces_waiting_notices_while_background_work_runs(self):
+        repl = self.kept_repl("0.5")
+        repl.execute(
+            "launch",
+            "from rlm import bash\nh = bash('sleep 3; echo done')\nprint('launched', h.pid)",
+        )
+        waiting = wait_for_host_request_of_type(repl, "bash.waiting")
+        data = waiting["data"]
+        self.assertEqual(len(data["pids"]), 1)
+        self.assertGreaterEqual(data["count"], 1)
+        self.assertIn("sleep 3", data["commands"][0])
+        reply_ok(repl, waiting)
+        # The keepalive paces: another one arrives while the command still runs.
+        second = wait_for_host_request_of_type(repl, "bash.waiting")
+        reply_ok(repl, second)
+        # The completion notice still fires for the finished command.
+        done = wait_for_host_request_of_type(repl, "bash.completed")
+        reply_ok(repl, done)
+
+    def test_the_first_notice_waits_one_window_of_parked_work(self):
+        # The window is seeded at the loop's own start, never at the
+        # monotonic clock's origin (typically boot): a long-uptime host must
+        # not fire the first notice on its first tick, and a young host must
+        # not wait for host uptime to cross the window.
+        repl = self.kept_repl("0.5")
+        started = time.monotonic()
+        repl.execute(
+            "launch",
+            "from rlm import bash\nh = bash('sleep 3; echo done')\nprint('launched', h.pid)",
+        )
+        waiting = wait_for_host_request_of_type(repl, "bash.waiting")
+        elapsed = time.monotonic() - started
+        self.assertGreaterEqual(
+            elapsed,
+            0.4,
+            f"the first notice fired {elapsed:.3f}s after the launch, before one 0.5s window of parked work",
+        )
+        reply_ok(repl, waiting)
+
+    def test_an_error_reply_disables_the_keepalive(self):
+        # A host without the handler (an older daemon, the TS daemon) answers
+        # with an error reply instead: the keepalive disables itself rather
+        # than re-asking every window.
+        repl = self.kept_repl("0.5")
+        repl.execute(
+            "launch",
+            "from rlm import bash\nh = bash('sleep 10; echo done')\nprint('launched', h.pid)",
+        )
+        first = wait_for_host_request_of_type(repl, "bash.waiting")
+        repl.send(
+            {
+                "type": "host_reply",
+                "id": first["id"],
+                "data": {"status": "error", "error": "not available in this session"},
+            }
+        )
+        # The window is 0.5s with 0.125s ticks: a re-asking loop would fire
+        # within a second; the disabled one stays quiet through 2s.
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            try:
+                event = repl.read_event(timeout=max(0.1, deadline - time.monotonic()))
+            except TimeoutError:
+                break
+            self.assertNotEqual(
+                (event.get("data") or {}).get("type"),
+                "bash.waiting",
+                f"the keepalive re-asked a refusing host: {event}",
+            )
+
+    def test_no_waiting_notice_without_live_background_work(self):
+        repl = self.kept_repl("0.5")
+        repl.execute("quick", "print('idle session')")
+        try:
+            event = repl.read_event(timeout=2.0)
+        except TimeoutError:
+            return
+        self.assertNotEqual(event.get("event"), "host_request", "nothing should request the host")
+
+    def test_zero_disables_the_keepalive(self):
+        repl = self.kept_repl("0")
+        repl.execute(
+            "launch",
+            "from rlm import bash\nh = bash('sleep 2; echo done')\nprint('launched', h.pid)",
+        )
+        # Only the completion notice may request the host — never a waiting row.
+        done = wait_for_host_request_of_type(repl, "bash.completed")
+        reply_ok(repl, done)
+
+class CompletionNoticeOutputTest(unittest.TestCase):
+    """The bash.completed host request carries the command's output tail: a
+    wake that delivers the result instead of a pointer the model must
+    retrieve."""
+
+    def test_completion_notice_carries_the_output_tail(self):
+        repl = ReplProcess()
+        self.addCleanup(repl.close)
+        repl.ready()
+        repl.execute(
+            "launch",
+            "from rlm import bash\nh = bash('sleep 0.2; echo RESULT-LINE')\nprint('launched', h.pid)",
+        )
+        done = wait_for_host_request_of_type(repl, "bash.completed")
+        data = done["data"]
+        self.assertIn("RESULT-LINE", data["output"], f"payload: {data}")
+        self.assertEqual(data["exitCode"], 0)
+        reply_ok(repl, done)
 
 
 if __name__ == "__main__":
