@@ -35,10 +35,16 @@ use crate::{Line, Span};
 
 mod blocks;
 mod diagram;
+mod library;
 #[cfg(test)]
 mod mermaid;
 #[cfg(test)]
 mod tests;
+
+pub use library::{
+    library_reply_lists_machines, parse_library_machines, LibraryMachine, LibraryView,
+    LibraryViewAction, MALFORMED_LIBRARY_REPLY_ERROR,
+};
 
 use diagram::{
     edge_marker, node_glyph, run_state_color, FactoryEdge, FactoryNodeState, FactoryState,

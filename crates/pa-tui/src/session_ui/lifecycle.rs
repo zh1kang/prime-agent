@@ -154,6 +154,10 @@ impl SessionUi {
             factory_refresh_queued: false,
             factory_list_epoch: 0,
             factory_updates: activity_updates.factory,
+            library_updates: activity_updates.library,
+            library_list_epoch: 0,
+            library_view_session: None,
+            library_detail_epoch: 0,
             factory_selected_run: None,
             subagents_focused: false,
             activity_group: crate::chrome::ActivityGroup::Subagents,
@@ -632,8 +636,32 @@ impl SessionUi {
             // the new session's own `goal_update` lands it would keep
             // owning the frame over the rebind with stale content.
             view.close_overlay_if(|overlay| matches!(overlay, Overlay::Goal(_) | Overlay::Info(_)));
+            // Preserve the browser across same-session reattach, like the factory page.
+            if self
+                .library_view_session
+                .as_deref()
+                .is_some_and(|session| session != self.session_id)
+            {
+                view.close_overlay_if(|overlay| matches!(overlay, Overlay::Library(_)));
+                self.library_view_session = None;
+                self.library_detail_epoch = self.library_detail_epoch.wrapping_add(1);
+                self.library_list_epoch = self.library_list_epoch.wrapping_add(1);
+            }
             self.speed_stats = None;
             view.chrome.speed_text = None;
+        }
+        if let Some(Overlay::Library(library)) = view.overlay.as_ref() {
+            // Retry after recovery and fence replies from the previous attachment.
+            let open_machine = library.open_machine_name();
+            self.library_list_epoch = self.library_list_epoch.wrapping_add(1);
+            self.spawn_library_list_refresh();
+            // An open drill-in rides the same retry: its request carried the
+            // previous wire id, so re-issue it rather than leaving the page on
+            // the loader until the user backs out and drills in again.
+            if let Some(name) = open_machine {
+                self.library_detail_epoch = self.library_detail_epoch.wrapping_add(1);
+                self.spawn_library_graph_fetch(name);
+            }
         }
         // Retry countdowns belong to the previous event stream. The fresh
         // snapshot's activity flags own this attachment; only a new retry
@@ -839,25 +867,46 @@ mod backfill_tests {
     async fn mock_session(
         socket: &std::path::Path,
         backfill_tx: mpsc::UnboundedSender<TranscriptPageNote>,
-    ) -> (SessionUi, tokio::task::JoinHandle<()>) {
+    ) -> (
+        SessionUi,
+        tokio::task::JoinHandle<()>,
+        mpsc::UnboundedReceiver<Value>,
+    ) {
+        let (requests_tx, requests_rx) = mpsc::unbounded_channel();
         let listener = tokio::net::UnixListener::bind(socket).unwrap();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let (read, mut write) = stream.into_split();
-            write.write_all(b"{\"type\":\"daemon_hello\",\"protocol\":{\"name\":\"prime-agent.daemon\",\"version\":7},\"serverCapabilities\":[],\"clientId\":\"mock\"}\n").await.unwrap();
+            write.write_all(b"{\"type\":\"daemon_hello\",\"protocol\":{\"name\":\"prime-agent.daemon\",\"version\":7},\"serverCapabilities\":[\"factory_activity\"],\"clientId\":\"mock\"}\n").await.unwrap();
             let mut lines = BufReader::new(read).lines();
+            let mut attach_count = 0;
+            let mut graph_replies = Vec::new();
             while let Some(line) = lines.next_line().await.unwrap() {
                 let request: Value = serde_json::from_str(&line).unwrap();
                 let kind = request["command"]["type"].as_str().unwrap();
+                if kind == "factory_activity" && request["command"]["action"] == "library" {
+                    requests_tx.send(request["command"].clone()).unwrap();
+                }
                 let data = match kind {
-                    "attach" => json!({
-                        "activeSessionId": "s1", "snapshot": {
-                            "activeSessionId": "s1", "summary": {"id": "s1", "cwd": "/tmp"},
-                            "state": {"sessionId": "s1", "cwd": "/tmp", "isStreaming": false},
-                            "messages": [], "historyBefore": 1, "lastEventSequence": 0,
-                        }, "replay": {"status": "complete", "toSequence": 0},
-                        "lastEventSequence": 0,
-                    }),
+                    "factory_activity" if request["command"]["specId"].is_string() => {
+                        json!({"specId": request["command"]["specId"], "machine": {}})
+                    }
+                    "factory_activity" => json!({"machines": [
+                        {"name": "first", "description": "first machine", "source": "repo"},
+                        {"name": "second", "description": "second machine", "source": "repo"},
+                    ]}),
+                    "attach" => {
+                        attach_count += 1;
+                        let active_id = format!("active-{attach_count}");
+                        json!({
+                            "activeSessionId": active_id, "snapshot": {
+                                "activeSessionId": active_id, "summary": {"id": "s1", "cwd": "/tmp"},
+                                "state": {"sessionId": "s1", "cwd": "/tmp", "isStreaming": false},
+                                "messages": [], "historyBefore": 1, "lastEventSequence": 0,
+                            }, "replay": {"status": "complete", "toSequence": 0},
+                            "lastEventSequence": 0,
+                        })
+                    }
                     "get_messages" => {
                         json!({"messages": [{"role": "user", "content": "rebuilt transcript", "timestamp": 1}]})
                     }
@@ -869,7 +918,17 @@ mod backfill_tests {
                 }))
                 .unwrap();
                 reply.push(b'\n');
+                if kind == "factory_activity" && request["command"]["specId"].is_string() {
+                    // Hold graph replies until a reattach, without holding other requests.
+                    graph_replies.push(reply);
+                    continue;
+                }
                 write.write_all(&reply).await.unwrap();
+                if kind == "attach" {
+                    for graph_reply in graph_replies.drain(..) {
+                        write.write_all(&graph_reply).await.unwrap();
+                    }
+                }
             }
         });
         let mut options =
@@ -893,6 +952,7 @@ mod backfill_tests {
                 heartbeats: mpsc::unbounded_channel().0,
                 bash: mpsc::unbounded_channel().0,
                 factory: mpsc::unbounded_channel().0,
+                library: mpsc::unbounded_channel().0,
                 commands: mpsc::unbounded_channel().0,
                 captain: mpsc::unbounded_channel().0,
             },
@@ -900,7 +960,951 @@ mod backfill_tests {
         )
         .await
         .unwrap();
-        (session, server)
+        (session, server, requests_rx)
+    }
+
+    fn library_view(view: &AgentView) -> Option<&crate::factory_view::LibraryView> {
+        match view.overlay.as_ref() {
+            Some(Overlay::Library(library)) => Some(library),
+            _ => None,
+        }
+    }
+
+    fn library_view_mut(view: &mut AgentView) -> Option<&mut crate::factory_view::LibraryView> {
+        match view.overlay.as_mut() {
+            Some(Overlay::Library(library)) => Some(library),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn library_rebind_preserves_only_the_same_durable_session() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut session, server, mut requests) = mock_session(
+                &dir.path().join("library-rebind.sock"),
+                mpsc::unbounded_channel().0,
+            )
+            .await;
+            let mut view = AgentView::new(crate::theme::Theme::builtin(
+                "prime",
+                crate::theme::ColorMode::TrueColor,
+            ));
+            session.open_library_page(&mut view);
+            assert_eq!(requests.recv().await.unwrap()["action"], "library");
+            library_view_mut(&mut view).unwrap().apply_machines(
+                crate::factory_view::parse_library_machines(&json!({"machines": [
+                    {"name": "first", "description": "", "source": "repo"},
+                    {"name": "second", "description": "", "source": "repo"},
+                ]})),
+            );
+            let down = crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Down,
+                crossterm::event::KeyModifiers::NONE,
+            );
+            session
+                .handle_key(down, &mut view, &mut true)
+                .await
+                .unwrap();
+            session.attach_session("s1", DockFold::Held).await.unwrap();
+            session.rebuild_view(&mut view, &RebuildKind::Rebind);
+            assert_eq!(
+                requests.recv().await.unwrap()["action"],
+                "library",
+                "reattach retargets the list fetch"
+            );
+            assert_eq!(
+                library_view(&view)
+                    .unwrap()
+                    .selected_machine()
+                    .unwrap()
+                    .name,
+                "second"
+            );
+            session.session_id = "different-session".to_string();
+            session.rebuild_view(&mut view, &RebuildKind::Rebind);
+            assert!(library_view(&view).is_none());
+            assert!(session.library_view_session.is_none());
+            drop(session);
+            server.abort();
+        })
+        .await
+        .expect("library session path completes within ten seconds");
+    }
+
+    /// One Ctrl+C press dispatched at the library page counts once for the
+    /// force-quit guard: the session loop already reports every dispatched
+    /// key, so the page must not report the same press again. A second
+    /// count would disarm the watchdog while a queued press is unhandled.
+    #[tokio::test]
+    async fn one_library_ctrl_c_press_reports_one_handled_key() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut session, server, _requests) = mock_session(
+                &dir.path().join("library-ctrl-c.sock"),
+                mpsc::unbounded_channel().0,
+            )
+            .await;
+            let mut view = AgentView::new(crate::theme::Theme::builtin(
+                "prime",
+                crate::theme::ColorMode::TrueColor,
+            ));
+            view.overlay = Some(Overlay::Library(crate::factory_view::LibraryView::new(
+                Vec::new(),
+                20,
+            )));
+            session
+                .handle_key(
+                    crossterm::event::KeyEvent::new(
+                        crossterm::event::KeyCode::Char('c'),
+                        crossterm::event::KeyModifiers::CONTROL,
+                    ),
+                    &mut view,
+                    &mut true,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                session.exit_guard.handled_ctrl_c(),
+                1,
+                "one dispatched Ctrl+C is one handled press, whichever surface consumes it"
+            );
+            assert!(library_view(&view).is_none(), "the library page closes");
+            drop(session);
+            server.abort();
+        })
+        .await
+        .expect("library Ctrl+C dispatch completes within ten seconds");
+    }
+
+    #[tokio::test]
+    async fn library_graph_reply_survives_same_session_rebind() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut session, server, mut requests) = mock_session(
+                &dir.path().join("library-rebind-graph.sock"),
+                mpsc::unbounded_channel().0,
+            )
+            .await;
+            let mut view = AgentView::new(crate::theme::Theme::builtin(
+                "prime",
+                crate::theme::ColorMode::TrueColor,
+            ));
+            let (updates_tx, mut updates_rx) = mpsc::unbounded_channel();
+            session.library_updates = updates_tx;
+            session.open_library_page(&mut view);
+            assert_eq!(requests.recv().await.unwrap()["action"], "library");
+            session.apply_library_update(updates_rx.recv().await.unwrap(), &mut view);
+            session
+                .handle_key(
+                    crossterm::event::KeyEvent::new(
+                        crossterm::event::KeyCode::Enter,
+                        crossterm::event::KeyModifiers::NONE,
+                    ),
+                    &mut view,
+                    &mut true,
+                )
+                .await
+                .unwrap();
+            let graph_request = requests.recv().await.unwrap();
+            assert_eq!(graph_request["specId"], "first");
+            assert_eq!(graph_request["activeSessionId"], session.active_session_id);
+            let previous_active_id = session.active_session_id.clone();
+            let durable_id = session.session_id.clone();
+            session
+                .attach_session(&durable_id, DockFold::Held)
+                .await
+                .unwrap();
+            assert_ne!(session.active_session_id, previous_active_id);
+            assert_eq!(session.session_id, durable_id);
+            session.rebuild_view(&mut view, &RebuildKind::Rebind);
+            let (graph_session, graph_epoch) = loop {
+                let update = updates_rx.recv().await.unwrap();
+                let graph_identity = match &update {
+                    crate::session_ui::LibraryUpdate::Graph { session, epoch, .. } => {
+                        Some((session.clone(), *epoch))
+                    }
+                    crate::session_ui::LibraryUpdate::Machines { .. }
+                    | crate::session_ui::LibraryUpdate::Error { .. } => None,
+                };
+                session.apply_library_update(update, &mut view);
+                if let Some(identity) = graph_identity {
+                    break identity;
+                }
+            };
+            let frame = view.render_frame(100, 30);
+            let text = frame
+                .iter()
+                .flatten()
+                .map(|span| span.content.as_str())
+                .collect::<String>();
+            assert!(
+                text.contains("machine: first"),
+                "the old attachment's pending graph opens after same-session rebind: {text}"
+            );
+            session.apply_library_update(
+                crate::session_ui::LibraryUpdate::Graph {
+                    session: graph_session.clone(),
+                    epoch: graph_epoch,
+                    name: "first".to_string(),
+                    result: Err("graph request failed before reattach".to_string()),
+                },
+                &mut view,
+            );
+            let frame = view.render_frame(100, 30);
+            let text = frame
+                .iter()
+                .flatten()
+                .map(|span| span.content.as_str())
+                .collect::<String>();
+            assert!(
+                text.contains("graph request failed before reattach"),
+                "{text}"
+            );
+            session.session_id = "different-session".to_string();
+            session.rebuild_view(&mut view, &RebuildKind::Rebind);
+            session.open_library_page(&mut view);
+            session.dirty = false;
+            session.apply_library_update(
+                crate::session_ui::LibraryUpdate::Graph {
+                    session: graph_session,
+                    epoch: session.library_detail_epoch,
+                    name: "first".to_string(),
+                    result: Ok(json!({"specId": "first", "machine": {}})),
+                },
+                &mut view,
+            );
+            assert!(
+                !session.dirty,
+                "a different durable session rejects the graph"
+            );
+            drop(session);
+            server.abort();
+        })
+        .await
+        .expect("library graph survives reattachment within ten seconds");
+    }
+
+    #[tokio::test]
+    async fn library_resync_retries_the_list_and_rejects_previous_replies() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut session, server, mut requests) = mock_session(
+                &dir.path().join("library-resync.sock"),
+                mpsc::unbounded_channel().0,
+            )
+            .await;
+            let mut view = AgentView::new(crate::theme::Theme::builtin(
+                "prime",
+                crate::theme::ColorMode::TrueColor,
+            ));
+            let (updates_tx, mut updates_rx) = mpsc::unbounded_channel();
+            session.library_updates = updates_tx;
+            session.open_library_page(&mut view);
+            assert_eq!(requests.recv().await.unwrap()["action"], "library");
+            let previous_epoch = session.library_list_epoch;
+            let previous_reply = updates_rx.recv().await.unwrap();
+            session.apply_library_update(
+                crate::session_ui::LibraryUpdate::Error {
+                    session: session.active_session_id.clone(),
+                    epoch: previous_epoch,
+                    message: "disconnected list request".to_string(),
+                },
+                &mut view,
+            );
+            session.attach_session("s1", DockFold::Held).await.unwrap();
+            session.rebuild_view(&mut view, &RebuildKind::Resync);
+            assert_eq!(requests.recv().await.unwrap()["action"], "library");
+            session.apply_library_update(previous_reply, &mut view);
+            assert!(
+                library_view(&view).unwrap().selected_machine().is_none(),
+                "the previous attachment's list cannot populate the page"
+            );
+            let fresh_reply = updates_rx.recv().await.unwrap();
+            session.apply_library_update(fresh_reply, &mut view);
+            assert_eq!(
+                library_view(&view)
+                    .unwrap()
+                    .selected_machine()
+                    .unwrap()
+                    .name,
+                "first"
+            );
+            session.apply_library_update(
+                crate::session_ui::LibraryUpdate::Error {
+                    session: session.active_session_id.clone(),
+                    epoch: previous_epoch,
+                    message: "late disconnected error".to_string(),
+                },
+                &mut view,
+            );
+            let frame = view.render_frame(100, 30);
+            let text = frame
+                .iter()
+                .flatten()
+                .map(|span| span.content.as_str())
+                .collect::<String>();
+            assert!(!text.contains("disconnected"), "{text}");
+            drop(session);
+            server.abort();
+        })
+        .await
+        .expect("library recovery retries the list within ten seconds");
+    }
+
+    #[tokio::test]
+    async fn library_graph_survives_harmless_keys_but_not_selection_changes() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut session, server, mut requests) = mock_session(
+                &dir.path().join("library-harmless-keys.sock"),
+                mpsc::unbounded_channel().0,
+            )
+            .await;
+            let mut view = AgentView::new(crate::theme::Theme::builtin(
+                "prime",
+                crate::theme::ColorMode::TrueColor,
+            ));
+            let machines = crate::factory_view::parse_library_machines(&json!({"machines": [
+                {"name": "first", "description": "", "source": "repo"},
+            ]}));
+            for key in [KeyCode::Char('x'), KeyCode::Up, KeyCode::Down] {
+                for result in [
+                    Ok(json!({"specId": "first", "machine": {}})),
+                    Err("graph request failed".to_string()),
+                ] {
+                    view.overlay = Some(Overlay::Library(crate::factory_view::LibraryView::new(
+                        machines.clone(),
+                        20,
+                    )));
+                    session
+                        .handle_library_view_key(
+                            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                            &mut view,
+                        )
+                        .unwrap();
+                    assert_eq!(requests.recv().await.unwrap()["specId"], "first");
+                    let epoch = session.library_detail_epoch;
+                    session
+                        .handle_key(KeyEvent::new(key, KeyModifiers::NONE), &mut view, &mut true)
+                        .await
+                        .unwrap();
+                    let expected = if result.is_ok() {
+                        "machine: first"
+                    } else {
+                        "graph request failed"
+                    };
+                    session.apply_library_update(
+                        crate::session_ui::LibraryUpdate::Graph {
+                            session: session.session_id.clone(),
+                            epoch,
+                            name: "first".to_string(),
+                            result,
+                        },
+                        &mut view,
+                    );
+                    let frame = view.render_frame(100, 30);
+                    let text = frame
+                        .iter()
+                        .flatten()
+                        .map(|span| span.content.as_str())
+                        .collect::<String>();
+                    assert!(
+                        text.contains(expected),
+                        "{key:?} must preserve the pending reply: {text}"
+                    );
+                }
+            }
+            view.overlay = Some(Overlay::Library(crate::factory_view::LibraryView::new(
+                crate::factory_view::parse_library_machines(&json!({"machines": [
+                    {"name": "first", "description": "", "source": "repo"},
+                    {"name": "second", "description": "", "source": "repo"},
+                ]})),
+                20,
+            )));
+            session
+                .handle_library_view_key(
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    &mut view,
+                )
+                .unwrap();
+            assert_eq!(requests.recv().await.unwrap()["specId"], "first");
+            let epoch = session.library_detail_epoch;
+            session
+                .handle_key(
+                    KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                    &mut view,
+                    &mut true,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                library_view(&view)
+                    .unwrap()
+                    .selected_machine()
+                    .unwrap()
+                    .name,
+                "second"
+            );
+            for result in [
+                Ok(json!({"specId": "first", "machine": {}})),
+                Err("stale graph failure".to_string()),
+            ] {
+                session.dirty = false;
+                session.apply_library_update(
+                    crate::session_ui::LibraryUpdate::Graph {
+                        session: session.session_id.clone(),
+                        epoch,
+                        name: "first".to_string(),
+                        result,
+                    },
+                    &mut view,
+                );
+                assert!(
+                    !session.dirty,
+                    "changed selection rejects the previous graph result or error"
+                );
+            }
+            let frame = view.render_frame(100, 30);
+            let text = frame
+                .iter()
+                .flatten()
+                .map(|span| span.content.as_str())
+                .collect::<String>();
+            assert!(!text.contains("machine: first"), "{text}");
+            assert!(!text.contains("stale graph failure"), "{text}");
+            drop(session);
+            server.abort();
+        })
+        .await
+        .expect("library graph keys complete within ten seconds");
+    }
+
+    #[tokio::test]
+    async fn library_list_refresh_retires_graph_only_when_selected_machine_changes() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut session, server, mut requests) = mock_session(
+                &dir.path().join("library-refresh-selection.sock"),
+                mpsc::unbounded_channel().0,
+            )
+            .await;
+            let mut view = AgentView::new(crate::theme::Theme::builtin(
+                "prime",
+                crate::theme::ColorMode::TrueColor,
+            ));
+            let first = json!({"name": "first", "description": "", "source": "repo"});
+            let second = json!({"name": "second", "description": "", "source": "repo"});
+            for remove_selected in [true, false] {
+                for result in [
+                    Ok(json!({"specId": "first", "machine": {}})),
+                    Err("graph request failed".to_string()),
+                ] {
+                    view.overlay = Some(Overlay::Library(crate::factory_view::LibraryView::new(
+                        crate::factory_view::parse_library_machines(&json!({
+                            "machines": [first.clone(), second.clone()]
+                        })),
+                        20,
+                    )));
+                    session
+                        .handle_library_view_key(
+                            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                            &mut view,
+                        )
+                        .unwrap();
+                    assert_eq!(requests.recv().await.unwrap()["specId"], "first");
+                    let epoch = session.library_detail_epoch;
+                    let refreshed = if remove_selected {
+                        vec![second.clone()]
+                    } else {
+                        vec![second.clone(), first.clone()]
+                    };
+                    session.apply_library_update(
+                        crate::session_ui::LibraryUpdate::Machines {
+                            session: session.active_session_id.clone(),
+                            epoch: session.library_list_epoch,
+                            data: json!({"machines": refreshed}),
+                        },
+                        &mut view,
+                    );
+                    assert_eq!(
+                        library_view(&view)
+                            .unwrap()
+                            .selected_machine()
+                            .unwrap()
+                            .name,
+                        if remove_selected { "second" } else { "first" }
+                    );
+                    let reply_text = if result.is_ok() {
+                        "machine: first"
+                    } else {
+                        "graph request failed"
+                    };
+                    session.apply_library_update(
+                        crate::session_ui::LibraryUpdate::Graph {
+                            session: session.session_id.clone(),
+                            epoch,
+                            name: "first".to_string(),
+                            result,
+                        },
+                        &mut view,
+                    );
+                    let frame = view.render_frame(100, 30);
+                    let text = frame
+                        .iter()
+                        .flatten()
+                        .map(|span| span.content.as_str())
+                        .collect::<String>();
+                    assert_eq!(
+                        text.contains(reply_text),
+                        !remove_selected,
+                        "list refresh must retire replies only when selection changes: {text}"
+                    );
+                }
+            }
+            drop(session);
+            server.abort();
+        })
+        .await
+        .expect("library list selection refresh completes within ten seconds");
+    }
+
+    #[tokio::test]
+    async fn library_list_success_does_not_clear_a_graph_failure() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut session, server, _requests) = mock_session(
+                &dir.path().join("library-error-order.sock"),
+                mpsc::unbounded_channel().0,
+            )
+            .await;
+            let mut view = AgentView::new(crate::theme::Theme::builtin(
+                "prime",
+                crate::theme::ColorMode::TrueColor,
+            ));
+            let machines = json!({"machines": [
+                {"name": "first", "description": "", "source": "repo"}
+            ]});
+            view.overlay = Some(Overlay::Library(crate::factory_view::LibraryView::new(
+                crate::factory_view::parse_library_machines(&machines),
+                20,
+            )));
+            for graph_failed in [false, true] {
+                session.apply_library_update(
+                    crate::session_ui::LibraryUpdate::Error {
+                        session: session.active_session_id.clone(),
+                        epoch: session.library_list_epoch,
+                        message: "list request failed".to_string(),
+                    },
+                    &mut view,
+                );
+                if graph_failed {
+                    session.apply_library_update(
+                        crate::session_ui::LibraryUpdate::Graph {
+                            session: session.session_id.clone(),
+                            epoch: session.library_detail_epoch,
+                            name: "first".to_string(),
+                            result: Err("graph request failed".to_string()),
+                        },
+                        &mut view,
+                    );
+                }
+                session.apply_library_update(
+                    crate::session_ui::LibraryUpdate::Machines {
+                        session: session.active_session_id.clone(),
+                        epoch: session.library_list_epoch,
+                        data: machines.clone(),
+                    },
+                    &mut view,
+                );
+                let frame = view.render_frame(100, 30);
+                let text = frame
+                    .iter()
+                    .flatten()
+                    .map(|span| span.content.as_str())
+                    .collect::<String>();
+                assert!(!text.contains("list request failed"), "{text}");
+                assert_eq!(
+                    text.contains("graph request failed"),
+                    graph_failed,
+                    "{text}"
+                );
+            }
+            session.apply_library_update(
+                crate::session_ui::LibraryUpdate::Graph {
+                    session: session.session_id.clone(),
+                    epoch: session.library_detail_epoch,
+                    name: "first".to_string(),
+                    result: Ok(json!({"specId": "first", "machine": {}})),
+                },
+                &mut view,
+            );
+            let frame = view.render_frame(100, 30);
+            let text = frame
+                .iter()
+                .flatten()
+                .map(|span| span.content.as_str())
+                .collect::<String>();
+            assert!(text.contains("machine: first"), "{text}");
+            assert!(!text.contains("graph request failed"), "{text}");
+            for replace_list in [false, true] {
+                let two_machines = json!({"machines": [
+                    {"name": "first", "description": "", "source": "repo"},
+                    {"name": "second", "description": "", "source": "repo"}
+                ]});
+                view.overlay = Some(Overlay::Library(crate::factory_view::LibraryView::new(
+                    crate::factory_view::parse_library_machines(&two_machines),
+                    20,
+                )));
+                session.apply_library_update(
+                    crate::session_ui::LibraryUpdate::Graph {
+                        session: session.session_id.clone(),
+                        epoch: session.library_detail_epoch,
+                        name: "first".to_string(),
+                        result: Err("graph request failed".to_string()),
+                    },
+                    &mut view,
+                );
+                if replace_list {
+                    session.apply_library_update(
+                        crate::session_ui::LibraryUpdate::Machines {
+                            session: session.active_session_id.clone(),
+                            epoch: session.library_list_epoch,
+                            data: json!({"machines": [two_machines["machines"][1].clone()]}),
+                        },
+                        &mut view,
+                    );
+                } else {
+                    session
+                        .handle_library_view_key(
+                            crossterm::event::KeyEvent::new(
+                                crossterm::event::KeyCode::Down,
+                                crossterm::event::KeyModifiers::NONE,
+                            ),
+                            &mut view,
+                        )
+                        .unwrap();
+                }
+                assert_eq!(
+                    library_view(&view)
+                        .unwrap()
+                        .selected_machine()
+                        .unwrap()
+                        .name,
+                    "second"
+                );
+                let frame = view.render_frame(100, 30);
+                let text = frame
+                    .iter()
+                    .flatten()
+                    .map(|span| span.content.as_str())
+                    .collect::<String>();
+                assert!(!text.contains("graph request failed"), "{text}");
+            }
+            drop(session);
+            server.abort();
+        })
+        .await
+        .expect("library error ordering completes within ten seconds");
+    }
+
+    #[tokio::test]
+    async fn library_navigation_dirties_selection_and_detail_back() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut session, server, _requests) = mock_session(
+                &dir.path().join("library-keys.sock"),
+                mpsc::unbounded_channel().0,
+            )
+            .await;
+            let mut view = AgentView::new(crate::theme::Theme::builtin(
+                "prime",
+                crate::theme::ColorMode::TrueColor,
+            ));
+            session.open_library_page(&mut view);
+            library_view_mut(&mut view).unwrap().apply_machines(
+                crate::factory_view::parse_library_machines(&json!({"machines": [
+                    {"name": "first", "description": "", "source": "repo"},
+                    {"name": "second", "description": "", "source": "repo"},
+                ]})),
+            );
+            session.dirty = false;
+            session
+                .handle_key(
+                    crossterm::event::KeyEvent::new(
+                        crossterm::event::KeyCode::Down,
+                        crossterm::event::KeyModifiers::NONE,
+                    ),
+                    &mut view,
+                    &mut true,
+                )
+                .await
+                .unwrap();
+            assert!(
+                session.dirty,
+                "selection navigation repaints without another event"
+            );
+            assert_eq!(
+                library_view(&view)
+                    .unwrap()
+                    .selected_machine()
+                    .unwrap()
+                    .name,
+                "second"
+            );
+            library_view_mut(&mut view)
+                .unwrap()
+                .apply_detail("second", &json!({"specId": "second", "machine": {}}));
+            session.dirty = false;
+            session
+                .handle_key(
+                    crossterm::event::KeyEvent::new(
+                        crossterm::event::KeyCode::Esc,
+                        crossterm::event::KeyModifiers::NONE,
+                    ),
+                    &mut view,
+                    &mut true,
+                )
+                .await
+                .unwrap();
+            assert!(session.dirty, "back from detail repaints the list");
+            let frame = view.render_frame(100, 30);
+            let text = frame
+                .iter()
+                .flatten()
+                .map(|span| span.content.as_str())
+                .collect::<String>();
+            assert!(text.contains("machine library"), "{text}");
+            assert!(!text.contains("machine: second"), "{text}");
+            drop(session);
+            server.abort();
+        })
+        .await
+        .expect("library session path completes within ten seconds");
+    }
+
+    #[tokio::test]
+    async fn library_back_fences_the_pending_drill_in() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut session, server, _requests) = mock_session(
+                &dir.path().join("library-back.sock"),
+                mpsc::unbounded_channel().0,
+            )
+            .await;
+            let mut view = AgentView::new(crate::theme::Theme::builtin(
+                "prime",
+                crate::theme::ColorMode::TrueColor,
+            ));
+            session.open_library_page(&mut view);
+            library_view_mut(&mut view).unwrap().apply_machines(
+                crate::factory_view::parse_library_machines(&json!({"machines": [
+                    {"name": "first", "description": "", "source": "repo"},
+                ]})),
+            );
+            library_view_mut(&mut view)
+                .unwrap()
+                .apply_detail("first", &json!({"specId": "first", "machine": {}}));
+            let epoch_before_back = session.library_detail_epoch;
+            let issued_at = session.library_detail_epoch;
+            session
+                .handle_key(
+                    crossterm::event::KeyEvent::new(
+                        crossterm::event::KeyCode::Esc,
+                        crossterm::event::KeyModifiers::NONE,
+                    ),
+                    &mut view,
+                    &mut true,
+                )
+                .await
+                .unwrap();
+            assert!(
+                session.library_detail_epoch > epoch_before_back,
+                "back from the drill-in bumps the detail epoch"
+            );
+            // A reply issued before the back is stale and must not restore
+            // the detail or its error.
+            session.dirty = false;
+            session.apply_library_update(
+                crate::session_ui::LibraryUpdate::Graph {
+                    session: session.session_id.clone(),
+                    epoch: issued_at,
+                    name: "first".to_string(),
+                    result: Ok(json!({"specId": "first", "machine": {}})),
+                },
+                &mut view,
+            );
+            assert!(!session.dirty, "a reply from before the back is dropped");
+            let frame = view.render_frame(100, 30);
+            let text = frame
+                .iter()
+                .flatten()
+                .map(|span| span.content.as_str())
+                .collect::<String>();
+            assert!(!text.contains("machine: first"), "{text}");
+            drop(session);
+            server.abort();
+        })
+        .await
+        .expect("the back fence completes within ten seconds");
+    }
+
+    #[tokio::test]
+    async fn library_graph_never_blocks_keys_or_reopens_a_replaced_page() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut session, server, mut requests) = mock_session(
+                &dir.path().join("library-graph.sock"),
+                mpsc::unbounded_channel().0,
+            )
+            .await;
+            let mut view = AgentView::new(crate::theme::Theme::builtin(
+                "prime",
+                crate::theme::ColorMode::TrueColor,
+            ));
+            let (updates_tx, mut updates_rx) = mpsc::unbounded_channel();
+            session.library_updates = updates_tx;
+            session.open_library_page(&mut view);
+            let frame = view.render_frame(100, 30);
+            let text = frame
+                .iter()
+                .flatten()
+                .map(|span| span.content.as_str())
+                .collect::<String>();
+            assert!(
+                text.contains("Loading machines"),
+                "the open path mounts a loader: {text}"
+            );
+            let update = updates_rx.recv().await.unwrap();
+            session.apply_library_update(update, &mut view);
+            assert_eq!(requests.recv().await.unwrap()["action"], "library");
+            let enter = crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            );
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                session.handle_key(enter, &mut view, &mut true),
+            )
+            .await
+            .expect("a hanging graph request cannot hold the input path")
+            .unwrap();
+            assert_eq!(requests.recv().await.unwrap()["specId"], "first");
+            let epoch = session.library_detail_epoch;
+            let stale = |session_id: String| crate::session_ui::LibraryUpdate::Graph {
+                session: session_id,
+                epoch,
+                name: "first".to_string(),
+                result: Ok(json!({"specId": "first", "machine": {}})),
+            };
+            session
+                .handle_key(
+                    crossterm::event::KeyEvent::new(
+                        crossterm::event::KeyCode::Down,
+                        crossterm::event::KeyModifiers::NONE,
+                    ),
+                    &mut view,
+                    &mut true,
+                )
+                .await
+                .unwrap();
+            session.dirty = false;
+            session.apply_library_update(stale(session.session_id.clone()), &mut view);
+            assert!(
+                !session.dirty,
+                "selection navigation retires the previous drill-in"
+            );
+            session
+                .handle_key(
+                    crossterm::event::KeyEvent::new(
+                        crossterm::event::KeyCode::Esc,
+                        crossterm::event::KeyModifiers::NONE,
+                    ),
+                    &mut view,
+                    &mut true,
+                )
+                .await
+                .unwrap();
+            assert!(
+                library_view(&view).is_none(),
+                "Esc closes while the sink still hangs"
+            );
+            session.open_library_page(&mut view);
+            session.dirty = false;
+            session.apply_library_update(stale(session.session_id.clone()), &mut view);
+            assert!(!session.dirty, "a previous mount cannot reopen its detail");
+            session.apply_library_update(
+                crate::session_ui::LibraryUpdate::Graph {
+                    session: "old-active-session".to_string(),
+                    epoch: session.library_detail_epoch,
+                    name: "first".to_string(),
+                    result: Ok(json!({"specId": "first", "machine": {}})),
+                },
+                &mut view,
+            );
+            assert!(
+                !session.dirty,
+                "a foreign active session cannot deliver a graph"
+            );
+            session.apply_library_update(
+                crate::session_ui::LibraryUpdate::Graph {
+                    session: session.session_id.clone(),
+                    epoch: session.library_detail_epoch,
+                    name: "first".to_string(),
+                    result: Ok(json!({"specId": "first", "machine": {}})),
+                },
+                &mut view,
+            );
+            let frame = view.render_frame(100, 30);
+            let text = frame
+                .iter()
+                .flatten()
+                .map(|span| span.content.as_str())
+                .collect::<String>();
+            assert!(
+                text.contains("machine: first"),
+                "a current reply mounts detail: {text}"
+            );
+            drop(session);
+            server.abort();
+        })
+        .await
+        .expect("library session path completes within ten seconds");
+    }
+
+    #[tokio::test]
+    async fn dock_library_and_factory_replace_each_other_and_consume_paste() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut session, server, _requests) = mock_session(
+                &dir.path().join("library-pages.sock"),
+                mpsc::unbounded_channel().0,
+            )
+            .await;
+            let mut view = AgentView::new(crate::theme::Theme::builtin(
+                "prime",
+                crate::theme::ColorMode::TrueColor,
+            ));
+            session.open_dock_group_from_click(crate::chrome::ActivityGroup::Factory, &mut view);
+            assert!(matches!(view.overlay, Some(Overlay::Factory(_))));
+            session.panel_returns_to_agents_view = true;
+            session.open_dock_group_from_click(crate::chrome::ActivityGroup::Library, &mut view);
+            assert!(matches!(view.overlay, Some(Overlay::Library(_))));
+            assert!(!session.panel_returns_to_agents_view);
+            view.editor.set_text("draft");
+            assert!(view.route_paste("unwanted hidden input"));
+            assert_eq!(view.editor.get_lines().join("\n"), "draft");
+            session.open_dock_group_from_click(crate::chrome::ActivityGroup::Factory, &mut view);
+            assert!(matches!(view.overlay, Some(Overlay::Factory(_))));
+            drop(session);
+            server.abort();
+        })
+        .await
+        .expect("library session path completes within ten seconds");
     }
 
     /// A rebind that tears down an agents-view panel drops its return: a later dock-opened shells
@@ -910,7 +1914,8 @@ mod backfill_tests {
         tokio::time::timeout(Duration::from_secs(10), async {
             let dir = tempfile::tempdir().unwrap();
             let socket = dir.path().join("panel.sock");
-            let (mut session, server) = mock_session(&socket, mpsc::unbounded_channel().0).await;
+            let (mut session, server, _requests) =
+                mock_session(&socket, mpsc::unbounded_channel().0).await;
             let mut view = AgentView::new(crate::theme::Theme::builtin(
                 "prime",
                 crate::theme::ColorMode::TrueColor,
@@ -953,7 +1958,8 @@ mod backfill_tests {
         tokio::time::timeout(Duration::from_secs(10), async {
             let dir = tempfile::tempdir().unwrap();
             let socket = dir.path().join("shell.sock");
-            let (mut session, server) = mock_session(&socket, mpsc::unbounded_channel().0).await;
+            let (mut session, server, _requests) =
+                mock_session(&socket, mpsc::unbounded_channel().0).await;
             let shells = json!({"activities": [
                 {"id": "a", "command": "cargo build", "status": "running"},
                 {"id": "s2", "command": "sleep 600", "status": "running"},
@@ -1016,7 +2022,8 @@ mod backfill_tests {
         tokio::time::timeout(Duration::from_secs(10), async {
             let dir = tempfile::tempdir().unwrap();
             let socket = dir.path().join("reload.sock");
-            let (mut session, server) = mock_session(&socket, mpsc::unbounded_channel().0).await;
+            let (mut session, server, _requests) =
+                mock_session(&socket, mpsc::unbounded_channel().0).await;
             let mut view = AgentView::new(crate::theme::Theme::builtin(
                 "prime",
                 crate::theme::ColorMode::TrueColor,
@@ -1040,7 +2047,8 @@ mod backfill_tests {
         tokio::time::timeout(Duration::from_secs(10), async {
             let dir = tempfile::tempdir().unwrap();
             let socket = dir.path().join("reconnect.sock");
-            let (mut session, server) = mock_session(&socket, mpsc::unbounded_channel().0).await;
+            let (mut session, server, _requests) =
+                mock_session(&socket, mpsc::unbounded_channel().0).await;
             session.connection = crate::interactive::reconnect::Connection::SessionPlaneFailed(
                 "the session worker is gone".to_string(),
             );
@@ -1116,6 +2124,7 @@ mod backfill_tests {
                 heartbeats: mpsc::unbounded_channel().0,
                 bash: mpsc::unbounded_channel().0,
                 factory: mpsc::unbounded_channel().0,
+                library: mpsc::unbounded_channel().0,
                 commands: mpsc::unbounded_channel().0,
                 captain: mpsc::unbounded_channel().0,
             },

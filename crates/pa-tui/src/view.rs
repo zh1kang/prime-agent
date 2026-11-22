@@ -62,6 +62,8 @@ pub(crate) enum Overlay {
     Mcp(crate::mcp_view::McpView),
     /// The factory page: the activity dock's factory group's destination.
     Factory(crate::factory_view::FactoryView),
+    /// The machine library page: the activity dock's machine-library group's destination.
+    Library(crate::factory_view::LibraryView),
     /// The Captain panel (F6, `/captain`).
     Captain(crate::captain_view::CaptainView),
     /// History, the machine editor, or git review.
@@ -283,6 +285,7 @@ impl AgentView {
             Some(
                 Overlay::Onboarding(_)
                 | Overlay::Factory(_)
+                | Overlay::Library(_)
                 | Overlay::Captain(_)
                 | Overlay::CrewPicker(_)
                 | Overlay::Heartbeats(_)

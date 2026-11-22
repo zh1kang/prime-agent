@@ -231,6 +231,10 @@ async fn run_interactive_surface(
     // into the session — the open page's panels and the dock's count.
     let (factory_tx, mut factory_rx) =
         mpsc::unbounded_channel::<crate::session_ui::FactoryUpdate>();
+    // The machine-library page's open-path list fetch reports here; the
+    // loop folds the reply into the open page.
+    let (library_tx, mut library_rx) =
+        mpsc::unbounded_channel::<crate::session_ui::LibraryUpdate>();
     // Background slash-command-catalog refreshes (`get_commands`) report
     // here; the loop folds the session's skill commands into the
     // autocomplete provider.
@@ -346,6 +350,7 @@ async fn run_interactive_surface(
         let heartbeats_tx = heartbeats_tx.clone();
         let bash_tx = bash_tx.clone();
         let factory_tx = factory_tx.clone();
+        let library_tx = library_tx.clone();
         let commands_tx = commands_tx.clone();
         let page_tx = page_tx.clone();
         let waits_through_update_restart = !matches!(route, SessionOpenRoute::Cli);
@@ -374,6 +379,7 @@ async fn run_interactive_surface(
                     let heartbeats_tx = heartbeats_tx.clone();
                     let bash_tx = bash_tx.clone();
                     let factory_tx = factory_tx.clone();
+                    let library_tx = library_tx.clone();
                     let commands_tx = commands_tx.clone();
                     let page_tx = page_tx.clone();
                     let captain_tx = captain_tx.clone();
@@ -402,6 +408,7 @@ async fn run_interactive_surface(
                                 heartbeats: heartbeats_tx,
                                 bash: bash_tx,
                                 factory: factory_tx,
+                                library: library_tx,
                                 commands: commands_tx,
                                 captain: captain_tx,
                             },
@@ -1573,6 +1580,11 @@ async fn run_interactive_surface(
                     if let Some((path, draft, factory)) = session.pending_captain_open.take() {
                         session.open_captain_session(&mut view, path, draft, factory).await?;
                     }
+                }
+            }
+            maybe_library = library_rx.recv() => {
+                if let Some(update) = maybe_library {
+                    session.apply_library_update(update, &mut view);
                 }
             }
             maybe_commands = commands_rx.recv() => {

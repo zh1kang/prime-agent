@@ -1194,6 +1194,9 @@ FACTORY_FRAME_CAP = 262_144
 full 1024-state machine cap fits; a snapshot that cannot shrink under the
 cap fails loudly instead of being silently truncated."""
 
+LIBRARY_METADATA_MAX_LENGTH = 1024
+"""Maximum author or version label length in a library activity reply."""
+
 ACTIVITY_ACTIONS = (
     "graph",
     "status",
@@ -1208,9 +1211,9 @@ ACTIVITY_ACTIONS = (
 """The host bridge's actions over the factory surface, the
 ``factory_activity`` frame's action vocabulary: one run's
 ``graph``/``status``/``watch``/``stop``/``resume``, a ``run`` by spec id,
-the machine library's list/graph reads, and ``peek`` — the unscoped graph
-minus the rehydration re-arm, the read another session's display polls
-through (the kernel namespace is the same surface plus
+the machine library's list/graph reads, ``node`` inspection, and ``peek`` —
+the unscoped graph minus the rehydration re-arm, the read another session's
+display polls through (the kernel namespace is the same surface plus
 ``graph``/``watch`` for agents)."""
 
 NODE_PROMPT_CAP = 65_536
@@ -4039,8 +4042,8 @@ class FactoryExecutor:
     async def activity(self, request: dict[str, Any]) -> Any:
         """Handle one out-of-band ``factory_activity`` request frame (the
         host bridge's lane): route the action to ``graph``/``status``/
-        ``watch``/``run``/``stop``/``resume``/``library``/``peek`` and
-        return the reply's result payload. Raises ``ValueError`` for malformed
+        ``watch``/``run``/``stop``/``resume``/``library``/``peek``/``node``
+        and return the reply's result payload. Raises ``ValueError`` for malformed
         requests and unknown runs/specs (the reply carries it as the error
         reason). ``library`` serves the machine library: the list with no
         target, or one machine's graph payload when ``specId`` names it.
@@ -4086,9 +4089,10 @@ class FactoryExecutor:
             # machine's graph payload (``specId`` names it) — the same
             # snapshot shape a stored spec's ``graph`` answers, plus the
             # machine file's fields and the mermaid rendering. The machine
-            # resolves through the library's own contract (repo first,
-            # user second; broken machines name their errors), so the
-            # lane, run, and export never disagree about a name.
+            # resolves through the library's own contract (exact folder
+            # before declared name, repo before user at each step; broken
+            # machines name their errors), so the lane, run, and export
+            # never disagree about a name.
             if spec_id is None:
                 machines, warnings = await library_listing()
                 return _wire_payload(
@@ -4110,8 +4114,13 @@ class FactoryExecutor:
             snapshot = self._spec_snapshot(graph["name"], canonical, compact=True)
             snapshot["mermaid"] = graph["mermaid"]
             snapshot["description"] = graph["description"]
-            snapshot["version"] = graph["version"]
-            snapshot["author"] = graph["author"]
+            for field in ("version", "author"):
+                value = graph[field]
+                snapshot[field] = (
+                    value
+                    if len(value) <= LIBRARY_METADATA_MAX_LENGTH
+                    else value[: LIBRARY_METADATA_MAX_LENGTH - 1] + "…"
+                )
             snapshot["params"] = graph.get("params") or []
             snapshot["files"] = graph.get("files") or []
             snapshot["state_files"] = graph.get("state_files") or []
@@ -7319,7 +7328,9 @@ def _cap_factory_frame(frame: dict[str, Any]) -> None:
     takes the oldest DROPPABLE row (a live row never silently drops: the
     dock's count, the page's panels, and the ``/factory off`` guard read
     this list, and every live run reports). A frame that still cannot fit
-    fails loudly (a graph must never truncate silently)."""
+    fails loudly (a graph must never truncate silently). Oversized
+    library lists shed descriptions, never machine names or sources;
+    library detail sheds optional Mermaid text, never the structured graph."""
     while len(json.dumps(frame)) > FACTORY_FRAME_CAP:
         result = frame.get("result")
         events = result.get("events") if isinstance(result, dict) else None
@@ -7328,6 +7339,15 @@ def _cap_factory_frame(frame: dict[str, Any]) -> None:
             continue
         runs = result.get("runs") if isinstance(result, dict) else None
         if isinstance(runs, list) and _shed_runs_frame(runs):
+            continue
+        machines = result.get("machines") if isinstance(result, dict) else None
+        if isinstance(machines, list) and any(row.get("description") for row in machines if isinstance(row, dict)):
+            for row in machines:
+                if isinstance(row, dict):
+                    row["description"] = ""
+            continue
+        if isinstance(result, dict) and "mermaid" in result:
+            del result["mermaid"]
             continue
         frame.pop("result", None)
         frame["status"] = "error"
@@ -8038,8 +8058,9 @@ def _scan_machine_library(
     warnings (``<path>: <errors>``).
 
     The shared scan behind ``list_machines`` and the CLI's ``factory list``:
-    both levels resolve identically, repo wins on name conflicts, and the
-    gates are ``_read_library_machine`` — the same verdict
+    exact-name folders win before declared-name aliases, with repo before
+    user at each step, matching ``resolve_machine``. The gates are
+    ``_read_library_machine`` — the same verdict
     ``resolve_machine`` applies, so a machine the listing shows always
     parses and validates for resolve/run/import, while the files it skips
     surface as warnings here and never claim their name on the resolve
@@ -8047,6 +8068,7 @@ def _scan_machine_library(
     machine carries the name).
     """
     machines: dict[str, dict[str, Any]] = {}
+    exact_names: set[str] = set()
     warnings: list[str] = []
     for source, directory in machine_library_dirs(repo_dir=repo_dir, user_dir=user_dir):
         if not directory.is_dir():
@@ -8076,8 +8098,11 @@ def _scan_machine_library(
             if error:
                 warnings.append(error)
                 continue
-            if machine.name in machines:
-                continue  # repo first: the earlier level keeps the name
+            exact = path.parent.name == machine.name
+            if machine.name in machines and (machine.name in exact_names or not exact):
+                continue
+            if exact:
+                exact_names.add(machine.name)
             machines[machine.name] = {
                 "name": machine.name,
                 "description": machine.description,
@@ -8092,7 +8117,7 @@ def _scan_machine_library(
 def list_machines(
     *, repo_dir: "str | Path | None" = None, user_dir: "str | Path | None" = None
 ) -> "list[dict[str, Any]]":
-    """Library contents with descriptions, resolution-deduped (repo wins).
+    """Library contents with descriptions, deduped like ``resolve_machine``.
 
     Broken files are skipped silently here (the agent-facing list);
     ``cli_dispatch``'s ``list`` op surfaces them as warnings so the CLI's
@@ -8243,8 +8268,8 @@ def library_graph(
     """One library machine's graph payload.
 
     Resolves the machine exactly like a run does (``resolve_machine``:
-    repo directory first, user second) and returns the machine file's own
-    fields with the spec rendered as diagram text:
+    exact folder before declared name, repo before user at each step)
+    and returns the machine file's fields with the spec rendered as text:
     ``{"name", "description", "version", "author", "spec", "mermaid"}``.
     The spec is the file's payload as written (machine form, or dag sugar
     — the same object ``parse_machine_file`` read); ``mermaid`` is its
@@ -8401,8 +8426,6 @@ async def library_graph_any(
         "state_files": described.get("state_files") or [],
         "mermaid": spec_to_mermaid(described["spec"]),
     }
-
-
 def import_machine(path: "str | Path", *, target_dir: "str | Path | None" = None) -> "dict[str, Any]":
     """The library gate: parse a MACHINE.md, validate its spec, persist it.
 

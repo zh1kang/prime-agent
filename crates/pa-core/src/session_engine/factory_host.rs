@@ -1,6 +1,7 @@
 //! The factory host bridge: the session seam that exposes the kernel's
-//! factory surface (`factory.graph/status/watch/run/stop/resume`) to the
-//! daemon and TUI, the `/factory` view's lane.
+//! factory surface (`factory.graph/status/watch/run/stop/resume` plus the
+//! machine library's list/graph reads) to the daemon and TUI, the
+//! `/factory` view's lane.
 //!
 //! The factory itself lives in the kernel (`rlm/factory.py`, the Rust port's
 //! Python kernel architecture — the executor owns the run registry in kernel
@@ -453,7 +454,10 @@ impl FactoryActivityRequest {
         {
             return Err(anyhow!("factory activity peek takes no runId or specId"));
         }
-        if !matches!(action, "graph" | "run" | "peek")
+        // `library` is the target-free action pair: the list with no
+        // target, or one machine's graph payload when `specId` names it
+        // (`runId` names a run, which the library never reads).
+        if !matches!(action, "graph" | "run" | "library" | "peek")
             && run_id.is_none_or(|id| id.trim().is_empty())
         {
             return Err(anyhow!("factory activity {action} requires runId"));

@@ -402,6 +402,7 @@ impl SessionUi {
             }
             Some(Overlay::Mcp(_)) => return self.handle_mcp_view_key(key, view),
             Some(Overlay::Factory(_)) => return self.handle_factory_view_key(key, view).await,
+            Some(Overlay::Library(_)) => return self.handle_library_view_key(key, view),
             Some(Overlay::Captain(_)) => {
                 self.handle_captain_view_key(key, view);
                 return Ok(());

@@ -78,6 +78,16 @@ impl AgentView {
                 dock.extend(factory_view.render(&self.theme, width, kb));
                 Some(dock)
             }
+            Some(Overlay::Library(library_view)) => {
+                // Front cropping may remove the prompt context, but must leave the library
+                // window intact above the speed footer.
+                let library_rows = height
+                    .saturating_sub(FULLSCREEN_MIN_TRANSCRIPT_ROWS)
+                    .saturating_sub(usize::from(self.chrome.speed_text.is_some()))
+                    .min(info_viewport_rows);
+                dock.extend(library_view.render(&self.theme, width, kb, library_rows));
+                Some(dock)
+            }
             Some(Overlay::Captain(panel)) => {
                 // The panel takes the pane above the prompt context, like a full-screen page.
                 panel.set_viewport_rows(
