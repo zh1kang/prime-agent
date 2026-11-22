@@ -339,7 +339,7 @@ fn listing_row(machine: &MachineListing, name_width: usize) -> String {
 
 /// Resolve the kernel Python (bootstrapping the venv on first use), the
 /// same interpreter the factory gate lives in.
-fn resolve_kernel_python() -> Result<PathBuf, String> {
+pub(crate) fn resolve_kernel_python() -> Result<PathBuf, String> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

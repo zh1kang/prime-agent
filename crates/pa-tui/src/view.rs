@@ -62,6 +62,12 @@ pub(crate) enum Overlay {
     Mcp(crate::mcp_view::McpView),
     /// The factory page: the activity dock's factory group's destination.
     Factory(crate::factory_view::FactoryView),
+    /// The Captain panel (F6, `/captain`).
+    Captain(crate::captain_view::CaptainView),
+    /// History, the machine editor, or git review.
+    Workspace(crate::workspace_view::WorkspaceView),
+    /// The chat switcher of a Captain project (F7, `/crew`).
+    CrewPicker(crate::captain_view::CrewPicker),
     /// The `/heartbeats` inline management view (TS `HeartbeatManagerComponent`).
     Heartbeats(crate::heartbeats_picker::HeartbeatsPicker),
     Goal(crate::goal_surface::GoalPanel),
@@ -117,6 +123,8 @@ pub struct AgentView {
     /// it, so two panels can never be open at once, and keys, render, paste, mouse and cursor all
     /// dispatch on the same value.
     pub(crate) overlay: Option<Overlay>,
+    /// One dim line above the prompt: a Captain text step's label or the Captain breadcrumb.
+    pub editor_header: Option<String>,
     pub side_pane: Option<crate::side_question::SideQuestionPane>,
     /// The `terminal.showImages` setting (default true): image blocks
     /// render metadata rows when set, `[Image: ...]` placeholders otherwise.
@@ -261,6 +269,10 @@ impl AgentView {
                 menu.paste(text);
                 true
             }
+            Some(Overlay::Workspace(page)) => {
+                page.paste(text);
+                true
+            }
             // The auth panel's mounted input takes it: never the hidden editor, where a later
             // Enter could submit the secret as a prompt.
             Some(Overlay::AuthPanel(panel)) => {
@@ -271,6 +283,8 @@ impl AgentView {
             Some(
                 Overlay::Onboarding(_)
                 | Overlay::Factory(_)
+                | Overlay::Captain(_)
+                | Overlay::CrewPicker(_)
                 | Overlay::Heartbeats(_)
                 | Overlay::Bash(_)
                 | Overlay::Goal(_)
@@ -312,6 +326,7 @@ impl AgentView {
             working_since: None,
             retry: None,
             overlay: None,
+            editor_header: None,
             side_pane: None,
             show_images: true,
             show_hardware_cursor: false,

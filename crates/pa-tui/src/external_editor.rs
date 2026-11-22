@@ -17,6 +17,31 @@ pub(crate) fn editor_command() -> Option<String> {
     configured("VISUAL").or_else(|| configured("EDITOR"))
 }
 
+/// Run `command` on an existing file the user chose to edit in place (the machine editor's
+/// "edit file in $EDITOR" action). The command splits like [`edit`]'s.
+pub(crate) async fn edit_file(command: &str, path: &std::path::Path) -> Result<()> {
+    #[cfg(not(windows))]
+    let mut editor = {
+        let mut tokens = command.split(' ');
+        let mut editor = tokio::process::Command::new(tokens.next().unwrap_or_default());
+        editor.args(tokens);
+        editor
+    };
+    #[cfg(windows)]
+    let mut editor = {
+        let mut editor = tokio::process::Command::new("cmd");
+        editor.arg("/C").arg(command);
+        editor
+    };
+    let status = editor
+        .arg(path)
+        .status()
+        .await
+        .with_context(|| format!("run the external editor `{command}`"))?;
+    anyhow::ensure!(status.success(), "The editor exited with {status}");
+    Ok(())
+}
+
 /// Run `command` on a temp file seeded with `text` and return the saved
 /// text (TS: the editor writes the file, the parent re-reads it).
 /// `Ok(None)` is a non-zero editor exit — TS keeps the editor text and

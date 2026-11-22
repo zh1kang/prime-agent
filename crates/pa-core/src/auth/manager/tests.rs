@@ -30,6 +30,10 @@ impl EnvCredentialSource for ScriptedEnv {
     fn ambient_identity_material(&self, provider: &str) -> String {
         format!("{provider}:scripted-ambient")
     }
+
+    fn local_cli_available(&self, provider: &str) -> bool {
+        self.0.contains_key(&format!("local-cli:{provider}"))
+    }
 }
 
 fn storage_with(data: &serde_json::Value) -> AuthStorage {

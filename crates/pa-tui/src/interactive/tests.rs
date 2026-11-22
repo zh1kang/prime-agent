@@ -203,6 +203,25 @@ fn create_config_binds_a_new_child_to_its_parent() {
 }
 
 #[test]
+fn captain_resume_selection_carries_draft_and_factory_panel() {
+    let selection = SessionSelection::ResumeWith {
+        path: "/tmp/project/session.jsonl".into(),
+        draft: Some("Continue the migration".into()),
+        panel: Some(crate::interactive::SessionPanel::FactoryRuns { row: None }),
+    };
+    let SessionSelection::ResumeWith {
+        path,
+        draft,
+        panel: Some(crate::interactive::SessionPanel::FactoryRuns { row: None }),
+    } = selection
+    else {
+        panic!("Captain handoff lost resume metadata");
+    };
+    assert_eq!(path, std::path::PathBuf::from("/tmp/project/session.jsonl"));
+    assert_eq!(draft.as_deref(), Some("Continue the migration"));
+}
+
+#[test]
 fn resume_hint_names_a_flushed_session() {
     let dir = std::env::temp_dir().join("pa-tui-resume-hint-test");
     std::fs::create_dir_all(&dir).unwrap();

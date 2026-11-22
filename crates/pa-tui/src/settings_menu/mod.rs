@@ -3,7 +3,7 @@
 //! on Tab/number keys only), Enter opens submenus, type-to-search per tab. The caller owns the row
 //! data and change actions; this module navigation and rendering.
 
-mod tabs;
+pub(crate) mod tabs;
 
 use crate::keybindings::{format_key_text, KeybindingsManager};
 use crate::search_input::SearchInput;
@@ -70,6 +70,7 @@ pub struct SettingsMenuRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SettingsMenuAction {
     None,
+    Open(&'static str),
     /// Esc from the top level.
     Cancel,
     /// Enter/Space changed a row (or a submenu selected a value).
@@ -145,7 +146,7 @@ pub fn settings_menu_rows(current: &SettingsCurrentValues) -> Vec<SettingsMenuRo
         thresholds.push(percent);
         thresholds.sort_by(f64::total_cmp);
     }
-    vec![
+    let mut rows = vec![
         SettingsMenuRow {
             id: "autocompact-threshold",
             label: "Auto-compact threshold (%)",
@@ -358,13 +359,87 @@ pub fn settings_menu_rows(current: &SettingsCurrentValues) -> Vec<SettingsMenuRo
                 themes: current.available_themes.clone(),
             }),
         },
-    ]
+    ];
+    for (command, label, description) in [
+        (
+            "/fsm",
+            "Live factory runs",
+            "Inspect running machines and their states",
+        ),
+        (
+            "/captain",
+            "Project Captain",
+            "Coordinate projects, crew threads, and factory work",
+        ),
+        (
+            "/fsm edit",
+            "Edit factory machines",
+            "Edit models, prompts, and transitions",
+        ),
+        (
+            "/factory toggle",
+            "Factory enabled",
+            "Change the factory gate; restart to apply",
+        ),
+        (
+            "/review",
+            "Review changes",
+            "Review and stage worktree changes",
+        ),
+        (
+            "/resume",
+            "Resume conversation",
+            "Search local conversations across providers",
+        ),
+        (
+            "/subthread",
+            "Branch conversation",
+            "Open a child of this conversation",
+        ),
+        (
+            "/login",
+            "Prime provider connections",
+            "Configure Prime model provider authentication",
+        ),
+        ("/connect codex", "Connect Codex", "Open Codex login"),
+        ("/connect claude", "Connect Claude", "Open Claude login"),
+        (
+            "/connect antigravity",
+            "Connect Antigravity",
+            "Open Antigravity login",
+        ),
+        (
+            "/threads",
+            "Manage durable threads",
+            "Resume or import a conversation, switch provider, or move worktrees",
+        ),
+    ] {
+        rows.push(SettingsMenuRow {
+            id: command,
+            label,
+            description,
+            current: if command == "/factory toggle" {
+                if current.factory_enabled {
+                    "on"
+                } else {
+                    "off"
+                }
+            } else {
+                "open"
+            }
+            .into(),
+            values: None,
+            submenu: None,
+        });
+    }
+    rows
 }
 
 /// The row values the menu opens with: the daemon state plus the settings
 /// seam reads.
 #[derive(Debug, Clone, Default)]
 pub struct SettingsCurrentValues {
+    pub factory_enabled: bool,
     pub autocompact: bool,
     pub compaction_threshold_percent: f64,
     pub show_images: bool,
@@ -554,6 +629,9 @@ impl SettingsMenu {
             return SettingsMenuAction::None;
         };
         let row = &mut self.rows[row_index];
+        if row.id.starts_with('/') {
+            return SettingsMenuAction::Open(row.id);
+        }
         if let Some(kind) = row.submenu.clone() {
             // The tier submenu preselects the row's current tier.
             let selected = match &kind {

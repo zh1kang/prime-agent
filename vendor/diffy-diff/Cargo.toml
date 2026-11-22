@@ -1,0 +1,20 @@
+[package]
+name = "diffy-diff"
+description = "Diff model for Diffy: unified patch parsing, line and word diffs, and display projections."
+version = "0.3.7"
+edition = "2024"
+rust-version = "1.92"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# No UI, text shaping, or syntax dependencies: the diff view in diffy-ui
+# adapts this model into elements.
+[dependencies]
+unicode-segmentation = "1.12"
+
+[dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }
+
+[lints.rust]
+# `cfg(kani)` gates the bounded model checking harnesses.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }

@@ -1,8 +1,10 @@
 //! Streaming provider implementations ported from `packages/ai/src/providers`.
 
 pub mod anthropic;
+pub mod antigravity;
 pub mod azure_openai_responses;
 pub mod bedrock;
+pub mod claude_cli;
 pub mod faux;
 pub mod google;
 pub mod google_shared;

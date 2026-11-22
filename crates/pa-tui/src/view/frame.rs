@@ -78,6 +78,25 @@ impl AgentView {
                 dock.extend(factory_view.render(&self.theme, width, kb));
                 Some(dock)
             }
+            Some(Overlay::Captain(panel)) => {
+                // The panel takes the pane above the prompt context, like a full-screen page.
+                panel.set_viewport_rows(
+                    height.saturating_sub(FULLSCREEN_MIN_TRANSCRIPT_ROWS + 1 + pane_row),
+                );
+                dock.extend(panel.render(&self.theme, width, kb));
+                Some(dock)
+            }
+            Some(Overlay::Workspace(page)) => {
+                page.set_viewport_rows(
+                    height.saturating_sub(FULLSCREEN_MIN_TRANSCRIPT_ROWS + 1 + pane_row),
+                );
+                dock.extend(page.render(&self.theme, width, kb));
+                Some(dock)
+            }
+            Some(Overlay::CrewPicker(picker)) => {
+                dock.extend(picker.render(&self.theme, width, kb));
+                Some(dock)
+            }
             Some(Overlay::Heartbeats(picker)) => {
                 dock.extend(picker.render(&self.theme, width, kb));
                 Some(dock)

@@ -447,18 +447,66 @@ async fn print_mode_main(
             .await
             .map_err(|error| format!("{error:#}"))?;
     }
-    let exit = run_prompts_and_emit(
-        &engine,
-        &headless.model,
-        headless.api_key.clone(),
-        options,
-        &root_node,
-    )
-    .await;
+    let exit = match FACTORY_HOST_CELL.get() {
+        Some(cell) => run_factory_host_cell(&engine, cell).await,
+        None => {
+            run_prompts_and_emit(
+                &engine,
+                &headless.model,
+                headless.api_key.clone(),
+                options,
+                &root_node,
+            )
+            .await
+        }
+    };
     // No inline descendant outlives the print process: kernels get their
     // final snapshot, drivers join, runs abort (every exit path).
     crate::print_rlm::dispose_inline_subagents(&root_node).await;
     exit
+}
+
+/// The Captain's headless factory host cell. `pa thread factory-host` sets it
+/// once in-process; print mode then runs this cell in the session kernel
+/// instead of model prompts, so a factory run needs no chat or model turn.
+static FACTORY_HOST_CELL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Run `args` as print mode whose only work is `cell` in the session kernel.
+pub(crate) fn run_factory_host(args: &[String], cell: String) -> i32 {
+    if FACTORY_HOST_CELL.set(cell).is_err() {
+        eprintln!("Error: the factory host cell is already set");
+        return 1;
+    }
+    crate::main_with_runtime(args, &PrintRuntime)
+}
+
+/// Execute the host cell without a cell time limit. The cell owns the run's
+/// lifetime: it returns when the run reaches a terminal state.
+async fn run_factory_host_cell(
+    engine: &std::sync::Arc<pa_core::session_engine::engine::SessionEngine>,
+    cell: &str,
+) -> Result<i32, String> {
+    let provisioner = engine
+        .kernel_provisioner_weak()
+        .upgrade()
+        .ok_or("The session kernel is unavailable")?;
+    let manager = provisioner
+        .ensure(None, None)
+        .await
+        .map_err(|error| format!("{error:#}"))?;
+    let result = manager
+        .execute(cell, pa_core::kernel::shared::ExecuteOptions::default())
+        .await
+        .map_err(|error| format!("{error:#}"))?;
+    print!("{}", result.stdout);
+    eprint!("{}", result.stderr);
+    if result.status == pa_core::kernel::shared::ExecuteStatus::Ok {
+        return Ok(0);
+    }
+    if let Some(error) = result.error {
+        eprintln!("{error:?}");
+    }
+    Ok(1)
 }
 
 /// One engine build for every headless embedding: the scripted
@@ -1171,7 +1219,7 @@ async fn select_model(
     // bounded catalog-readiness wait; a miss falls through on the record.
     if let Some((provider, model_id)) = session
         .filter(|context| !context.messages.is_empty())
-        .and_then(|context| context.model.as_ref())
+        .and_then(|context| context.restorable_model())
     {
         if let Some(model) = pa_core::models::find_session_model_with_readiness_wait(
             registry,
@@ -1216,8 +1264,7 @@ async fn select_model(
             flag_provider.is_none_or(|provider| model.provider.eq_ignore_ascii_case(provider))
         })
         .collect();
-    pa_core::models::find_preferred_default_model(&candidates)
-        .or_else(|| candidates.first())
+    pa_core::models::find_automatic_default_model(&candidates)
         .cloned()
         .ok_or_else(|| match flag_provider {
             Some(provider) => format!("No available models for provider \"{provider}\". Check models.json and provider authentication."),

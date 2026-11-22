@@ -317,6 +317,29 @@ pub const APP_KEYBINDINGS: &[(&str, KeybindingDefinition)] = &[
         "app.tools.expand",
         def!(&["ctrl+o"], "Cycle conversation detail", scope "editor"),
     ),
+    (
+        "app.factory.toggle",
+        def!(&["f6"], "Open or close the Captain"),
+    ),
+    (
+        "app.captain.crew",
+        def!(&["f7"], "Switch between a Captain and its crew chats"),
+    ),
+    (
+        "app.captain.parent",
+        def!(&["shift+f7"], "Open the Captain chat of this crew chat"),
+    ),
+    (
+        "app.captain.next",
+        def!(&["f8"], "Open the next chat of this Captain project"),
+    ),
+    (
+        "app.captain.previous",
+        def!(
+            &["shift+f8"],
+            "Open the previous chat of this Captain project"
+        ),
+    ),
     ("app.subagents.focus", def!(&["alt+a"], "Focus activity")),
     (
         "app.editor.external",

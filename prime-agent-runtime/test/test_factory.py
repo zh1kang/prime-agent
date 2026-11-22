@@ -3757,6 +3757,31 @@ class FactoryExecutorTest(_ExecutorTestCase):
         self.assertEqual([call["prompt"] for call in self.host.spawn_calls("b")], ["Process 7."])
 
     @async_test
+    async def test_preamble_prefixes_every_agent_prompt(self) -> None:
+        self.host.outcomes["a"] = {"status": "done", "answer": '{"result": 7}'}
+        self.store_factory(
+            {
+                "nodes": [
+                    {"id": "a", "subagent": {"prompt": "Start."}, "outputs": [{"name": "result", "type": "json"}]},
+                    {
+                        "id": "b",
+                        "subagent": {"prompt": "Process {data}."},
+                        "depends_on": ["a"],
+                        "inputs": [{"name": "data", "type": "json", "from": "a.result"}],
+                    },
+                ],
+            }
+        )
+        result = await rlm_module.rlm.factory.run("sw", preamble="Crew rules: use tabs.")
+        status = await self.settle(result)
+        self.assertEqual(status["state"], "done")
+        self.assertEqual(self.host.spawn_calls("a")[0]["prompt"], "Crew rules: use tabs.\n\nStart.")
+        self.assertEqual(
+            [call["prompt"] for call in self.host.spawn_calls("b")],
+            ["Crew rules: use tabs.\n\nProcess 7."],
+        )
+
+    @async_test
     async def test_unparseable_output_fails_the_producer_and_never_spawns_the_dependent(self) -> None:
         # a's declared json output never parses: the capture failure fails a
         # itself (defect C) instead of settling it valueless, so b's required
@@ -4817,6 +4842,20 @@ class FactoryExecutorTest(_ExecutorTestCase):
         self.assertEqual(len(self.all_events_of(result, "infra_respawn")), 2)
         self.assertEqual(len(self.all_events_of(result, "retry")), 1)
         self.assertEqual(self.host.notice_kinds(), ["paused", "finished"])
+
+    @async_test
+    async def test_resume_note_reaches_the_retried_prompt_only(self) -> None:
+        self.host.child_outcomes["child-1"] = {"status": "error", "error": "boom"}
+        self.store_factory({"nodes": [{"id": "work", "subagent": {"prompt": "Build it."}, "retries": 0}]})
+        result = await self.start()
+        paused = await self.settle(result)
+        self.assertEqual(paused["state"], "paused")
+        resumed = await rlm_module.rlm.factory.resume(result["run_id"], note="  Use approach B.  ")
+        self.assertEqual(resumed["notes_applied"], 1)
+        final = await self.settle(result)
+        self.assertEqual(final["state"], "done")
+        prompts = [call["prompt"] for call in self.host.spawn_calls("work")]
+        self.assertEqual(prompts, ["Build it.", "Build it.\n\nReviewer note for this retry: Use approach B."])
 
     # -- budgets ----------------------------------------------------------------------
 
@@ -7400,6 +7439,24 @@ class FactoryMachineDirectoryTest(_ExecutorTestCase):
             [call["prompt"] for call in self.host.spawn_calls("work")],
             ['Do ["ship it", 400] for ship it, at most 400 lines.'],
         )
+
+    @async_test
+    async def test_a_project_factory_directory_is_refused(self) -> None:
+        project = self.library.parent / "proj" / ".prime" / "machines" / "draft"
+        project.mkdir(parents=True)
+        (project / "machine.toml").write_text("format = 1\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "Project factories run through the Captain after approval"):
+            await rlm_module.rlm.factory.run(str(project))
+        self.assertEqual(self.host.calls_of("factory.compile"), [])
+        # A copy outside such a tree (the Captain's approved run copy) still runs.
+        copy = self.library.parent / "captains" / "runs" / "m1" / "machine" / "review"
+        copy.parent.mkdir(parents=True)
+        import shutil
+        shutil.copytree(self.machine_dir, copy)
+        self.host.compiled[str(copy)] = self.host.compiled[str(self.machine_dir)]
+        self.host.outcomes["work"] = {"status": "done", "answer": "done"}
+        result = await rlm_module.rlm.factory.run(str(copy), params={"task": "ship it"})
+        self.assertEqual(result["machine_path"], str(copy))
 
     @async_test
     async def test_params_need_a_machine_directory(self) -> None:

@@ -73,7 +73,16 @@ pub async fn run_interactive(
     options: InteractiveOptions,
     ui: UiMode,
 ) -> Result<InteractiveOutcome> {
-    run_interactive_route(options, ui, SessionOpenRoute::Cli).await
+    let route = match &options.session {
+        super::SessionSelection::ResumeWith {
+            panel: Some(panel), ..
+        } => SessionOpenRoute::Origin(super::SelectionOrigin {
+            panel: panel.clone(),
+            closes_to_agents_view: false,
+        }),
+        _ => SessionOpenRoute::Cli,
+    };
+    run_interactive_route(options, ui, route).await
 }
 
 /// Run one interactive session opened from the agents view (see
@@ -228,6 +237,9 @@ async fn run_interactive_surface(
     let (commands_tx, mut commands_rx) =
         mpsc::unbounded_channel::<crate::session_ui::CommandCatalogUpdate>();
     let (page_tx, mut page_rx) = mpsc::unbounded_channel::<crate::session_ui::TranscriptPageNote>();
+    // Background `pa thread captain` calls (the Captain panel and the breadcrumb) report here.
+    let (captain_tx, mut captain_rx) =
+        mpsc::unbounded_channel::<crate::session_ui::CaptainUpdate>();
     // The double-Ctrl+C force-quit guard: the terminal reader observes the pair while this loop is
     // wedged in a daemon request; a std-thread watchdog enforces the exit deadline without the
     // runtime.
@@ -364,6 +376,7 @@ async fn run_interactive_surface(
                     let factory_tx = factory_tx.clone();
                     let commands_tx = commands_tx.clone();
                     let page_tx = page_tx.clone();
+                    let captain_tx = captain_tx.clone();
                     async move {
                         let (client, events) = match first {
                             Some(first) => first,
@@ -390,6 +403,7 @@ async fn run_interactive_surface(
                                 bash: bash_tx,
                                 factory: factory_tx,
                                 commands: commands_tx,
+                                captain: captain_tx,
                             },
                             page_tx,
                         )
@@ -704,6 +718,17 @@ async fn run_interactive_surface(
             session.attach_event_sequence,
         );
     }
+    if !headless {
+        let hint = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| super::captain_hint::missing_captain_hint(&cwd));
+        if let Some(hint) = hint {
+            view.push_entry(crate::chat::ChatEntry::Status {
+                text: hint.to_string(),
+                kind: crate::chat::StatusKind::Info,
+            });
+        }
+    }
     if let Some(notice) = check_tmux_keyboard_setup().await {
         view.push_entry(crate::chat::ChatEntry::Status {
             text: format!("\u{26a0} {notice}"),
@@ -738,6 +763,16 @@ async fn run_interactive_surface(
     // previous chat view of this session left via the agents view or a
     // switch) returns to the editor when its chat reopens.
     session.restore_prompt_stash_on_open(&mut view);
+    // A chat of a Captain project shows its breadcrumb once the Captain records load.
+    session.refresh_captain_context();
+    if let super::SessionSelection::ResumeWith {
+        draft: Some(draft), ..
+    } = &options.session
+    {
+        if !draft.trim().is_empty() {
+            view.editor.set_text(draft);
+        }
+    }
     match route {
         SessionOpenRoute::AgentsView { panel: Some(panel) } => {
             session.open_agents_view_panel(panel, true, &mut view);
@@ -817,6 +852,7 @@ async fn run_interactive_surface(
     // queued behind the open dispatch first, in order.
     let mut last_bash_refresh = Instant::now();
     let mut last_factory_refresh = Instant::now();
+    let mut last_captain_refresh = Instant::now();
     // The enhanced-key modes settle once (kitty answer or fallback) and
     // report one adoption event; headless runs hold pipes and never probe.
     let mut enhanced_keys_pending = renderer.is_terminal();
@@ -1061,7 +1097,9 @@ async fn run_interactive_surface(
                         // Hand the terminal to the editor, then resume. The input reader would
                         // steal the editor's keys, so it stops (flag + join) and respawns after the
                         // resume.
-                        if let Some(command) = session.take_external_editor_request() {
+                        let workspace = session.take_workspace_command();
+                        let editor = session.take_external_editor_request();
+                        if workspace.is_some() || editor.is_some() {
                             let reader = match &renderer {
                                 Renderer::Terminal {
                                     ui_tx, exit_guard, ..
@@ -1091,9 +1129,31 @@ async fn run_interactive_surface(
                                     .stop()
                                 });
                                 let outcome = match stopped {
+                                    Ok(()) if workspace.is_some() => {
+                                        async {
+                                            let (name, query, _) = workspace
+                                                .as_ref()
+                                                .expect("workspace command requested");
+                                            // The only handoff: the machine editor's optional
+                                            // key, the user's editor on a library machine file.
+                                            anyhow::ensure!(
+                                                *name == "edit-file",
+                                                "unknown terminal handoff {name}"
+                                            );
+                                            let editor = crate::external_editor::editor_command()
+                                                .unwrap_or_else(|| "vi".to_owned());
+                                            crate::external_editor::edit_file(
+                                                &editor,
+                                                std::path::Path::new(query),
+                                            )
+                                            .await?;
+                                            Ok(None)
+                                        }
+                                        .await
+                                    }
                                     Ok(()) => {
                                         crate::external_editor::edit(
-                                            &command,
+                                            editor.as_deref().expect("editor requested"),
                                             &view.editor.get_expanded_text(),
                                         )
                                         .await
@@ -1115,7 +1175,16 @@ async fn run_interactive_surface(
                                     session.error_row(&format!("{error:#}"), &mut view);
                                 }
                                 spawn_session_reader(ui_tx, exit_guard);
-                                session.apply_external_editor_outcome(outcome, &mut view);
+                                if let Some((name, _, _)) = &workspace {
+                                    if let Err(error) = outcome {
+                                        session.error_row(&format!("{error:#}"), &mut view);
+                                    }
+                                    if *name == "edit-file" {
+                                        session.workspace_file_edited(&mut view);
+                                    }
+                                } else {
+                                    session.apply_external_editor_outcome(outcome, &mut view);
+                                }
                             }
                         }
                         // The `/mcp` view resolved to an auth request: mount the inline auth panel
@@ -1319,6 +1388,11 @@ async fn run_interactive_surface(
         let auto_scroll_armed = session.selection_auto_scroll_armed();
         let bash_refresh_wanted = session.kernel_bash_supported();
         let factory_refresh_wanted = session.factory_activity_supported();
+        // The open Captain panel or crew picker re-reads the Captain records on the same cadence.
+        let captain_refresh_wanted = matches!(
+            view.overlay,
+            Some(crate::view::Overlay::Captain(_) | crate::view::Overlay::CrewPicker(_))
+        );
         // A settle waiting out a member is pending work like the
         // autocomplete park: the gate runs at the loop top, so its
         // re-check (and the settle bound's expiry) needs this arm's
@@ -1491,6 +1565,14 @@ async fn run_interactive_surface(
             maybe_factory = factory_rx.recv() => {
                 if let Some(update) = maybe_factory {
                     session.apply_factory_update(update, &mut view);
+                }
+            }
+            maybe_captain = captain_rx.recv() => {
+                if let Some(update) = maybe_captain {
+                    session.apply_captain_update(update, &mut view);
+                    if let Some((path, draft, factory)) = session.pending_captain_open.take() {
+                        session.open_captain_session(&mut view, path, draft, factory).await?;
+                    }
                 }
             }
             maybe_commands = commands_rx.recv() => {
@@ -1688,6 +1770,18 @@ async fn run_interactive_surface(
             } => {
                 last_factory_refresh = Instant::now();
                 session.spawn_factory_refresh();
+            }
+            _captain_tick = async {
+                if !captain_refresh_wanted {
+                    std::future::pending::<()>().await;
+                }
+                tokio::time::sleep_until(
+                    tokio::time::Instant::from_std(last_captain_refresh + ACTIVITY_POLL_INTERVAL),
+                )
+                .await;
+            } => {
+                last_captain_refresh = Instant::now();
+                session.poll_captain(&view);
             }
             _frame = async {
                 match render_deadline {

@@ -55,6 +55,9 @@ impl DaemonClient {
 
     fn connect_raw(socket_path: &Path) -> std::io::Result<Self> {
         let stream = connect_blocking(socket_path)?;
+        // Set once: the timeout stays on the socket, and macOS refuses the call (EINVAL) after
+        // the daemon closes its end, which would hide the close and its reason.
+        stream.set_read_timeout(READ_POLL)?;
         let writer = stream.try_clone_box()?;
         Ok(DaemonClient {
             socket_path: socket_path.to_path_buf(),
@@ -166,10 +169,6 @@ impl DaemonClient {
         operation: Operation<'_>,
     ) -> Result<String> {
         loop {
-            self.reader
-                .get_mut()
-                .set_read_timeout(READ_POLL)
-                .map_err(|error| anyhow!("daemon socket error: {error}"))?;
             let read = self.reader.read_until(b'\n', &mut self.partial_line);
             match read {
                 Ok(0) => {

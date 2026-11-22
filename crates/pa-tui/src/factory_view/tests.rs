@@ -648,7 +648,8 @@ fn the_empty_state_names_the_surface() {
     let rows = frame_text(&mut view);
     let joined = rows.join("\n");
     assert!(joined.contains("No live factory runs."), "{joined}");
-    assert!(joined.contains("await rlm.factory.run"), "{joined}");
+    assert!(joined.contains("Press n"), "{joined}");
+    assert_eq!(view.handle_key("n", &kb()), FactoryViewAction::New);
     assert!(
         joined.contains("move"),
         "the hint names the arrows: {joined}"
@@ -2020,4 +2021,24 @@ fn a_graph_reply_counts_stored_specs_and_live_runs() {
         FactoryCounts::of(&response).label().as_deref(),
         Some("2 factories \u{b7} 1 running \u{b7} 1 paused")
     );
+}
+
+#[test]
+fn run_view_text_renders_one_captain_run_as_the_factory_panel() {
+    let snapshot = json!({
+        "run_id": "r1",
+        "spec_id": "gate-check",
+        "state": "paused",
+        "machine": {
+            "states": [{"id": "check", "entry": true, "lifecycle": "task", "max_entries": 1, "retries": 0}],
+            "transitions": []
+        },
+        "nodes": [{"id": "check", "status": "error", "entries": [{"index": 0, "status": "error", "error": "no verdict"}]}],
+        "events": [{"seq": 2, "kind": "milestone", "milestone": "paused"}]
+    });
+    let text = run_view_text(&snapshot, 80, 20).expect("a run snapshot renders");
+    assert!(text.contains("gate-check"), "{text}");
+    assert!(text.contains("paused"), "{text}");
+    assert!(text.contains("check"), "{text}");
+    assert!(run_view_text(&json!({"states": []}), 80, 20).is_none());
 }

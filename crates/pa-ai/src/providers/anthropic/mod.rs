@@ -29,10 +29,6 @@ mod stream_tests;
 
 pub const API_ANTHROPIC_MESSAGES: &str = "anthropic-messages";
 
-/// Claude Code version mimicked in OAuth mode. The API gates newer models on the claimed client
-/// version (e.g. claude-opus-5.5 requires >= 2.280), so keep this at or above the latest released
-/// Claude Code.
-const CLAUDE_CODE_VERSION: &str = "2.1.281";
 const FINE_GRAINED_TOOL_STREAMING_BETA: &str = "fine-grained-tool-streaming-2025-05-14";
 const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
 
@@ -327,8 +323,9 @@ pub(crate) fn headers_to_pairs(headers: &Map<String, Value>) -> Vec<(String, Str
         .collect()
 }
 
-/// Build the request headers for the messages endpoint, mirroring the SDK client configurations
-/// (OAuth/Claude Code mode, cloudflare gateway, github-copilot, plain API key).
+/// Build the request headers for the messages endpoint (cloudflare gateway, github-copilot, or
+/// standard Anthropic API key). Never spoofs Claude Code headers for OAuth tokens; subscription
+/// usage is routed through the official `claude` CLI instead.
 pub(crate) fn build_request_headers(
     model: &Model,
     api_key: &str,
@@ -337,7 +334,6 @@ pub(crate) fn build_request_headers(
     options_headers: Option<&std::collections::HashMap<String, String>>,
     session_id: Option<&str>,
 ) -> (Vec<(String, String)>, bool) {
-    let is_oauth = is_oauth_token(api_key);
     let needs_interleaved_beta = interleaved_thinking && !supports_adaptive_thinking(&model.id);
     let mut beta_features: Vec<&str> = Vec::new();
     if use_fine_grained_tool_streaming_beta {
@@ -403,22 +399,7 @@ pub(crate) fn build_request_headers(
                 "anthropic-dangerous-direct-browser-access".into(),
                 json!("true"),
             );
-            if is_oauth {
-                headers.insert(
-                    "anthropic-beta".into(),
-                    json!(["claude-code-20250219", "oauth-2025-04-20"]
-                        .iter()
-                        .chain(beta_features.iter())
-                        .copied()
-                        .collect::<Vec<_>>()
-                        .join(",")),
-                );
-                headers.insert(
-                    "user-agent".into(),
-                    json!(format!("claude-cli/{CLAUDE_CODE_VERSION}")),
-                );
-                headers.insert("x-app".into(), json!("cli"));
-            } else if let Some(beta) = &beta_header {
+            if let Some(beta) = &beta_header {
                 headers.insert("anthropic-beta".into(), json!(beta));
             }
             merge_headers(&[Some(headers), model_headers, options_headers_json])
@@ -429,12 +410,12 @@ pub(crate) fn build_request_headers(
     crate::providers::opencode_headers::apply(&mut pairs, &model.provider, session_id);
     // The Anthropic SDK always sends the API version; mirror it.
     pairs.insert(0, ("anthropic-version".into(), "2023-06-01".into()));
-    if model.provider == "cloudflare-ai-gateway" || model.provider == "github-copilot" || is_oauth {
+    if model.provider == "cloudflare-ai-gateway" || model.provider == "github-copilot" {
         pairs.push(("Authorization".into(), format!("Bearer {api_key}")));
     } else {
         pairs.push(("x-api-key".into(), api_key.to_string()));
     }
-    (pairs, is_oauth)
+    (pairs, false)
 }
 
 pub fn stream_simple_anthropic(
@@ -445,6 +426,14 @@ pub fn stream_simple_anthropic(
     let api_key = options
         .and_then(|options| options.base.api_key.clone())
         .or_else(|| get_env_api_key(&model.provider));
+    if api_key.as_deref().is_some_and(is_oauth_token)
+        || (api_key.is_none()
+            && model.provider == crate::providers::claude_cli::ANTHROPIC_PROVIDER
+            && crate::providers::claude_cli::is_available())
+    {
+        return crate::providers::claude_cli::ClaudeCliProvider
+            .stream_simple(model, context, options);
+    }
     let Some(api_key) = api_key else {
         let (writer, reader) = create_assistant_message_event_stream();
         let message = AssistantMessage {
@@ -620,20 +609,18 @@ mod subscription_identity_tests {
     }
 
     #[test]
-    fn oauth_requests_claim_the_claude_code_identity() {
+    fn oauth_tokens_never_spoof_claude_code_headers() {
         let (headers, is_oauth) =
             build_request_headers(&test_model(), "sk-ant-oat-test", false, false, None, None);
-        assert!(is_oauth);
+        assert!(!is_oauth);
         let header = |name: &str| {
             headers
                 .iter()
                 .find(|(key, _)| key.eq_ignore_ascii_case(name))
                 .map(|(_, value)| value.as_str())
         };
-        let user_agent = header("user-agent").expect("the OAuth request sends a user-agent");
-        assert!(user_agent.starts_with("claude-cli/"), "got {user_agent}");
-        assert_eq!(header("x-app"), Some("cli"));
-        let beta = header("anthropic-beta").expect("the OAuth request sends the claude-code beta");
-        assert!(beta.contains("claude-code-20250219"));
+        assert_eq!(header("user-agent"), None);
+        assert_eq!(header("x-app"), None);
+        assert!(header("anthropic-beta").is_none_or(|b| !b.contains("claude-code-20250219")));
     }
 }

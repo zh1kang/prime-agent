@@ -92,6 +92,9 @@ prime-agent update [--force]         # Update Prime Agent
 prime-agent shutdown [--force]       # Stop every agent, worker, and background service
 ```
 
+Use `prime-agent thread help` for provider connections, context handoff, child threads, and Git worktree review.
+See [Provider threads](docs/provider-threads.md) for commands and examples.
+
 ## Built for Long-Running Work
 Prime Agent is built for long-running work, especially for evaluations in research. These features are available in the TUI, and when run autonomously.
 

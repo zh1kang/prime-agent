@@ -687,7 +687,24 @@ impl RlmSubagentHost for InlineHost {
             let (selector, lane, thinking) = if let Some(script) = recipe.faux.as_ref() {
                 let queue = script
                 .get("children")
-                .and_then(|children| children.get(&name))
+                .and_then(Value::as_object)
+                .and_then(|children| {
+                    // A key with one `*` scripts every child name it matches, the
+                    // longest key first (factory children carry a random run slug).
+                    children.get(&name).or_else(|| {
+                        children
+                            .iter()
+                            .filter(|(key, _)| {
+                                key.split_once('*').is_some_and(|(head, tail)| {
+                                    name.len() >= head.len() + tail.len()
+                                        && name.starts_with(head)
+                                        && name.ends_with(tail)
+                                })
+                            })
+                            .max_by_key(|(key, _)| key.len())
+                            .map(|(_, queue)| queue)
+                    })
+                })
                 .ok_or_else(|| {
                     anyhow::anyhow!(
                         "PRIME_AGENT_FAUX_SCRIPT has no \"children.{name}\" entry: a scripted print run \

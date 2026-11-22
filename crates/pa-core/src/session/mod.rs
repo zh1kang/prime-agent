@@ -297,6 +297,19 @@ pub struct SessionContext {
     pub model: Option<(String, String)>,
 }
 
+impl SessionContext {
+    /// External transcript rows carry a source label without a runnable model.
+    pub fn restorable_model(&self) -> Option<&(String, String)> {
+        self.model.as_ref().filter(|(provider, model)| {
+            !(model == "imported"
+                && matches!(
+                    provider.as_str(),
+                    "t3" | "pa" | "codex" | "claude" | "antigravity"
+                ))
+        })
+    }
+}
+
 /// Walk the parent chain from the leaf, reconstructing the model context
 /// (summary-first when a compaction is on the path).
 pub fn build_session_context(entries: &[FileEntry], leaf_id: Option<&str>) -> SessionContext {

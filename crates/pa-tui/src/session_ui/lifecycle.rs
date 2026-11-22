@@ -46,7 +46,7 @@ impl SessionUi {
                 id
             }
             SessionSelection::Attach(id) => id.clone(),
-            SessionSelection::Resume(_) => {
+            SessionSelection::Resume(_) | SessionSelection::ResumeWith { .. } => {
                 create_session(&client, options, Some(&options.session)).await?
             }
         };
@@ -199,6 +199,15 @@ impl SessionUi {
             side_bash_discarded: None,
             side_bash_counter: 0,
             suspend_requested: false,
+            workspace_command: None,
+            captain_updates: activity_updates.captain,
+            captain_compose: None,
+            captain_context: None,
+            captain_parked: None,
+            captain_states: None,
+            captain_focus_query: None,
+            captain_pending_key: None,
+            pending_captain_open: None,
             external_editor_request: None,
             pending_mcp_auth: None,
             picker_restored_draft: false,
@@ -885,6 +894,7 @@ mod backfill_tests {
                 bash: mpsc::unbounded_channel().0,
                 factory: mpsc::unbounded_channel().0,
                 commands: mpsc::unbounded_channel().0,
+                captain: mpsc::unbounded_channel().0,
             },
             backfill_tx,
         )
@@ -1107,6 +1117,7 @@ mod backfill_tests {
                 bash: mpsc::unbounded_channel().0,
                 factory: mpsc::unbounded_channel().0,
                 commands: mpsc::unbounded_channel().0,
+                captain: mpsc::unbounded_channel().0,
             },
             mpsc::unbounded_channel().0,
         )

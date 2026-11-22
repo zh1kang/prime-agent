@@ -1129,6 +1129,9 @@ mod tests {
             fn ambient_identity_material(&self, _provider: &str) -> String {
                 String::new()
             }
+            fn local_cli_available(&self, _provider: &str) -> bool {
+                false
+            }
         }
         std::fs::write(
             dir.join("models.json"),

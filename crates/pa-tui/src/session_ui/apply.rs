@@ -191,6 +191,14 @@ impl SessionUi {
 
     /// Take a pending `app.editor.external` request: the interactive loop
     /// performs the editor child's terminal handoff.
+    pub(crate) fn take_workspace_command(
+        &mut self,
+    ) -> Option<(&'static str, String, std::path::PathBuf)> {
+        self.workspace_command
+            .take()
+            .map(|(command, query)| (command, query, self.cwd.clone()))
+    }
+
     pub(crate) fn take_external_editor_request(&mut self) -> Option<String> {
         self.external_editor_request.take()
     }

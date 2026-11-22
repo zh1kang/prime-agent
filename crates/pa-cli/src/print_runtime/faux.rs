@@ -17,6 +17,14 @@ use crate::print_runtime::{
 /// the script does not parse.
 pub(crate) fn faux_script_env() -> Result<Option<serde_json::Value>, String> {
     match std::env::var("PRIME_AGENT_FAUX_SCRIPT") {
+        // A file path holds the script, as in daemon mode; anything else is inline JSON.
+        Ok(path) if std::path::Path::new(&path).is_file() => std::fs::read_to_string(&path)
+            .map_err(|error| format!("invalid PRIME_AGENT_FAUX_SCRIPT: {error}"))
+            .and_then(|script| {
+                serde_json::from_str(&script)
+                    .map(Some)
+                    .map_err(|error| format!("invalid PRIME_AGENT_FAUX_SCRIPT: {error}"))
+            }),
         Ok(script) => serde_json::from_str(&script)
             .map(Some)
             .map_err(|error| format!("invalid PRIME_AGENT_FAUX_SCRIPT: {error}")),

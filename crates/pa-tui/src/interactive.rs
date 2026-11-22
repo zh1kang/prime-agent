@@ -21,6 +21,7 @@ use crate::keybindings::KeybindingsManager;
 use crate::session_ui::SessionUi;
 use crate::view::AgentView;
 
+pub(crate) mod captain_hint;
 mod onboarding;
 
 use onboarding::{run_onboarding_phase, PaneDrive};
@@ -76,6 +77,12 @@ pub enum SessionSelection {
     /// Attach an existing live session by active session id.
     Attach(String),
     Resume(PathBuf),
+    /// Resume a session with a Captain-provided draft and optional panel.
+    ResumeWith {
+        path: PathBuf,
+        draft: Option<String>,
+        panel: Option<SessionPanel>,
+    },
 }
 
 impl SessionSelection {

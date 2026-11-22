@@ -1,0 +1,2 @@
+- Added interactive threads with Prime, Claude Code, and Codex connections, native log import, context handoff, child conversations, and worktree review.
+- Added a persistent project Captain with a multi-project dashboard, crew reports, isolated writers, and factory recovery indicators.

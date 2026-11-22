@@ -38,7 +38,7 @@ impl SessionUi {
         match name.as_str() {
             "help" => {
                 self.note(
-                    "/help           this list\n/list           live sessions\n/switch <n|id>  switch to a session from /list\n/new            start a new session\n/exit           detach and exit",
+                    "/history [text] search local conversations\n/review         review this worktree\n/subthread      branch this conversation\n/help           this list\n/list           live sessions\n/switch <n|id>  switch to a session from /list\n/new            start a new session\n/exit           detach and exit",
                     view,
                 );
                 return Ok(());
@@ -167,8 +167,7 @@ impl SessionUi {
             }
             "resume" => {
                 if resolved.args.is_empty() {
-                    self.open_agents_view = true;
-                    self.exit_requested = true;
+                    self.open_workspace(crate::workspace_view::WorkspaceView::history(""), view);
                 } else {
                     match self.resolve_resume_selector(&resolved.args) {
                         Some(selection) => {
@@ -262,7 +261,18 @@ impl SessionUi {
                     self.note("Usage: /fork", view);
                 }
             }
-            "clone" => {
+            "history" => self.open_workspace(
+                crate::workspace_view::WorkspaceView::history(&resolved.args),
+                view,
+            ),
+            "review" => {
+                if resolved.args.is_empty() {
+                    self.open_workspace(crate::workspace_view::WorkspaceView::review(None), view);
+                } else {
+                    self.note("Usage: /review", view);
+                }
+            }
+            "clone" | "subthread" => {
                 if resolved.args.is_empty() {
                     self.track_feature_outcome("clone", "initiated", None);
                     self.handle_clone_command(view).await?;
@@ -385,9 +395,47 @@ impl SessionUi {
             // factory surfaces on the next client start (the running
             // connection keeps the advertisement its hello was built
             // with).
+            "fsm" => match resolved.args.trim() {
+                "edit" => {
+                    self.open_workspace(crate::workspace_view::WorkspaceView::machines(""), view);
+                }
+                arg if arg.starts_with("edit ") => self.open_workspace(
+                    crate::workspace_view::WorkspaceView::machines(arg[5..].trim()),
+                    view,
+                ),
+                "" | "live" => self.open_factory_page(view),
+                _ => self.error_row("Usage: /fsm [live | edit [machine]]", view),
+            },
+            "captain" => match resolved.args.trim() {
+                "chat" => self.open_parent_chat(view),
+                op @ ("stop" | "resume" | "delete") => self.captain_command(op, view),
+                query => self.open_captain_panel(view, query),
+            },
+            "crew" => self.open_crew_picker(view),
+            "threads" => {
+                self.open_workspace(crate::workspace_view::WorkspaceView::history(""), view);
+            }
+            "connect" => match resolved.args.trim() {
+                provider @ ("claude" | "codex" | "antigravity") => {
+                    self.run_provider_connect(provider, view);
+                }
+                _ => self.error_row("Usage: /connect claude|codex|antigravity", view),
+            },
             "factory" => {
                 let arg = resolved.args.trim().to_lowercase();
-                match arg.as_str() {
+                let arg = match arg.as_str() {
+                    "toggle"
+                        if self
+                            .client_settings
+                            .as_ref()
+                            .is_some_and(|s| s.factory_enabled()) =>
+                    {
+                        "off"
+                    }
+                    "toggle" => "on",
+                    value => value,
+                };
+                match arg {
                     "on" => {
                         let Some(settings) = &self.client_settings else {
                             self.note("/factory is not available in this client yet", view);

@@ -6,6 +6,7 @@
 mod apply;
 mod auth;
 mod bash;
+mod captain;
 mod commands;
 mod factory;
 mod heartbeats;
@@ -21,12 +22,14 @@ mod settings;
 mod share;
 mod stream;
 mod window;
+mod workspace;
 pub(crate) use window::TranscriptPageNote;
 
 pub(crate) use apply::CompactionAbortNote;
 use auth::{McpAuthIntent, PendingModelSignIn, SetModelOutcome};
 pub(crate) use bash::BashActivityUpdate;
 use bash::{ResyncBash, SideBashRun};
+pub(crate) use captain::{CaptainUpdate, CrewChat};
 pub(crate) use factory::FactoryUpdate;
 use heartbeats::paused_heartbeat_count;
 pub(crate) use heartbeats::HeartbeatsUpdate;
@@ -414,6 +417,23 @@ pub(crate) struct SessionUi {
     /// `app.suspend` (default ctrl+z) requested the process-group suspend: the interactive
     /// loop performs the cycle right after dispatch, because the renderer is the loop's terminal.
     suspend_requested: bool,
+    workspace_command: Option<(&'static str, String)>,
+    /// Where background `pa thread captain` calls deliver (the run loop folds them in).
+    captain_updates: mpsc::UnboundedSender<CaptainUpdate>,
+    /// A Captain text step that owns the prompt editor's submit and Esc.
+    captain_compose: Option<captain::CaptainCompose>,
+    /// The Captain project this chat belongs to: the breadcrumb and the crew picker.
+    captain_context: Option<captain::CaptainContext>,
+    /// The Captain panel kept while a text step uses the editor.
+    captain_parked: Option<crate::captain_view::CaptainView>,
+    /// The crew and factory states of the last Captain status, for the change toasts.
+    captain_states: Option<crate::captain_view::CrewStates>,
+    /// `/captain <name>`: the project to focus when the first status arrives.
+    captain_focus_query: Option<String>,
+    /// `/captain stop|resume|delete`: the panel key to press once the status arrives.
+    captain_pending_key: Option<&'static str>,
+    /// A chat the panel asked to open; the run loop opens it in place.
+    pub(crate) pending_captain_open: Option<(PathBuf, Option<String>, bool)>,
     external_editor_request: Option<String>,
     /// The `/mcp` view's internal auth resolution: the loop mounts the panel
     /// and spawns the command through the auth seam, never the typed-command path.

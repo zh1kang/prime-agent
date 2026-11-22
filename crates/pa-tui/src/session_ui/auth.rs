@@ -341,6 +341,32 @@ impl SessionUi {
 
     /// Run one internal MCP auth request: mount the inline auth panel and spawn the command against
     /// it; the settled line folds in through the panel channel.
+    /// `/connect PROVIDER`: the provider's login program runs inside pa, its link, codes, and
+    /// prompts in the inline auth panel (see `provider_connect`).
+    pub(crate) fn run_provider_connect(&mut self, provider: &str, view: &mut AgentView) {
+        let exe = match std::env::current_exe() {
+            Ok(exe) => exe,
+            Err(error) => {
+                self.error_row(&format!("Could not start pa: {error}"), view);
+                return;
+            }
+        };
+        let panel = crate::auth_panel::AuthPanelHandle::new(self.auth_panel_notes.clone());
+        let mut dialog = crate::auth_panel::AuthPanel::new(format!("Sign in to {provider}"));
+        dialog.set_cancel_signal(panel.cancel_signal());
+        view.overlay = Some(Overlay::AuthPanel(dialog));
+        self.dirty = true;
+        let mut command = tokio::process::Command::new(exe);
+        command
+            .args(["thread", "connect", provider])
+            .current_dir(&self.cwd);
+        let provider = provider.to_owned();
+        tokio::spawn(async move {
+            let note = crate::provider_connect::run(command, &provider, panel.clone()).await;
+            panel.send(crate::auth_panel::AuthPanelRequest::McpSettled { note });
+        });
+    }
+
     pub(crate) fn run_mcp_auth(&mut self, view: &mut AgentView) {
         let Some(intent) = self.pending_mcp_auth.take() else {
             return;

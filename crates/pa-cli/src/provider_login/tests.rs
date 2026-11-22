@@ -157,49 +157,29 @@ async fn login_options_list_providers_only() {
     );
 }
 
-/// Port of the TS #2645 warning detection: the ban-risk warning is
-/// reported exactly when the active Anthropic credential is the
-/// subscription (a stored OAuth login or an `sk-ant-oat` key), and
-/// its text names the risk.
+/// The TS #2645 ban-risk warning no longer applies: an Anthropic
+/// subscription (a stored OAuth login or an `sk-ant-oat` key) is served by
+/// the official `claude` CLI, so pa never identifies as Claude Code itself
+/// and no credential shape produces the warning.
 #[tokio::test]
-async fn the_anthropic_subscription_warning_matches_the_active_credential() {
+async fn the_anthropic_subscription_has_no_ban_risk_warning() {
     let dir = tempfile::tempdir().expect("temp dir");
     let agent = dir.path().join("agent");
     std::fs::create_dir_all(&agent).expect("agent dir");
-    std::env::remove_var("ANTHROPIC_API_KEY");
     let auth = ProviderAuth::new(dir.path(), agent.clone());
-
-    // No credential: no warning.
     assert_eq!(auth.anthropic_subscription_warning().await, None);
 
-    // A plain API key: no warning (an API key avoids the risk).
     let mut storage = pa_core::auth::AuthStorage::create(&agent);
-    storage.set(
-        "anthropic",
-        AuthCredential::ApiKey {
-            key: "sk-ant-api03-plain".to_string(),
-            prime_team: None,
-        },
-    );
-    assert_eq!(auth.anthropic_subscription_warning().await, None);
-
-    // A subscription token key (TS `isAnthropicSubscriptionAuthKey`).
-    storage.set(
-        "anthropic",
-        AuthCredential::ApiKey {
-            key: "sk-ant-oat-subscription".to_string(),
-            prime_team: None,
-        },
-    );
-    let warning = auth
-        .anthropic_subscription_warning()
-        .await
-        .expect("a sk-ant-oat key is the subscription");
-    assert!(warning.contains("identifies as Claude Code"));
-    assert!(warning.contains("restricted or banned"));
-    assert!(warning.contains("An Anthropic API key avoids the risk"));
-
-    // A stored OAuth login is the subscription too.
+    for key in ["sk-ant-api03-plain", "sk-ant-oat-subscription"] {
+        storage.set(
+            "anthropic",
+            AuthCredential::ApiKey {
+                key: key.to_string(),
+                prime_team: None,
+            },
+        );
+        assert_eq!(auth.anthropic_subscription_warning().await, None, "{key}");
+    }
     storage.set(
         "anthropic",
         AuthCredential::Oauth {
@@ -216,13 +196,7 @@ async fn the_anthropic_subscription_warning_matches_the_active_credential() {
             enterprise_url: None,
         },
     );
-    assert!(auth.anthropic_subscription_warning().await.is_some());
-
-    // An env subscription key resolves active with no stored credential.
-    storage.remove("anthropic");
-    std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-oat-env");
-    assert!(auth.anthropic_subscription_warning().await.is_some());
-    std::env::remove_var("ANTHROPIC_API_KEY");
+    assert_eq!(auth.anthropic_subscription_warning().await, None);
 }
 
 #[tokio::test]

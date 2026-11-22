@@ -108,6 +108,13 @@ impl AgentView {
                 dim,
             )]
         });
+        let header = header.or_else(|| {
+            self.editor_header.as_ref().map(|text| {
+                let dim = crate::chrome::editor_background(&self.theme)
+                    .patch(self.theme.fg_style(ThemeColor::Dim));
+                vec![Span::styled(text.clone(), dim)]
+            })
+        });
         let surface = editor_surface::render(
             &mut self.editor,
             &self.theme,

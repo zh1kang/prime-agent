@@ -13,9 +13,9 @@ use pa_tui::provider_auth::{
     ProviderWarningFuture,
 };
 
-/// The subscription login providers (every flow ported).
-const SUBSCRIPTION_PROVIDERS: [(&str, &str); 4] = [
-    ("anthropic", "Anthropic (Claude Pro/Max)"),
+/// The subscription login providers (Anthropic subscription uses the official `claude` CLI
+/// directly instead of OAuth API spoofing).
+const SUBSCRIPTION_PROVIDERS: [(&str, &str); 3] = [
     ("github-copilot", "GitHub Copilot"),
     ("openai-codex", "ChatGPT Plus/Pro (Codex Subscription)"),
     ("xai", "xAI (Grok)"),
@@ -78,6 +78,9 @@ fn is_api_key_login_provider(
     provider_id: &str,
     built_in_provider_ids: &std::collections::HashSet<String>,
 ) -> bool {
+    if provider_id == pa_ai::antigravity::ANTIGRAVITY_PROVIDER {
+        return false;
+    }
     if BUILT_IN_PROVIDER_DISPLAY_NAMES
         .iter()
         .any(|(id, _)| *id == provider_id)
@@ -178,10 +181,6 @@ fn ts_row_order(a: &ProviderRow, b: &ProviderRow) -> std::cmp::Ordering {
     a.name.cmp(&b.name)
 }
 
-/// Subscription requests identify as Claude Code, which may violate Anthropic's terms; an API key
-/// avoids the risk (#2645).
-const ANTHROPIC_SUBSCRIPTION_AUTH_WARNING: &str = "Anthropic subscription auth is active. Usage draws from your plan limits, but Prime Agent identifies as Claude Code and this may violate Anthropic's terms — your account can be restricted or banned. An Anthropic API key avoids the risk. Manage usage at https://claude.ai/settings/usage.";
-
 /// The provider auth surface against one daemon's shared directories.
 #[derive(Clone)]
 pub struct ProviderAuth {
@@ -209,18 +208,10 @@ impl ProviderAuth {
         (credential, status)
     }
 
-    /// The ban-risk warning (#2645) applies when the stored Anthropic credential
-    /// is an OAuth login or a subscription token (`sk-ant-oat...`). `None` = not one.
+    /// Anthropic subscription requests now route through the official `claude` CLI directly
+    /// instead of spoofing Claude Code headers, so no ban-risk warning applies.
     fn anthropic_subscription_warning_blocking(&self) -> Option<&'static str> {
-        let mut auth = self.auth_storage();
-        if let Some(credential) = auth.get_all().credential("anthropic") {
-            if matches!(credential, AuthCredential::Oauth { .. }) {
-                return Some(ANTHROPIC_SUBSCRIPTION_AUTH_WARNING);
-            }
-        }
-        auth.get_api_key("anthropic")
-            .is_some_and(|key| key.starts_with("sk-ant-oat"))
-            .then_some(ANTHROPIC_SUBSCRIPTION_AUTH_WARNING)
+        None
     }
 }
 

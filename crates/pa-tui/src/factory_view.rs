@@ -33,7 +33,10 @@ use crate::theme::{Theme, ThemeColor};
 use crate::width::truncate_line;
 use crate::{Line, Span};
 
+mod blocks;
 mod diagram;
+#[cfg(test)]
+mod mermaid;
 #[cfg(test)]
 mod tests;
 
@@ -41,6 +44,74 @@ use diagram::{
     edge_marker, node_glyph, run_state_color, FactoryEdge, FactoryNodeState, FactoryState,
     FactoryTransition, FactoryUsage,
 };
+
+/// Render an executable machine spec using the same boxes and wires as a live run.
+pub fn machine_graph(spec: &Value) -> Option<String> {
+    let theme = Theme::builtin("prime", crate::theme::ColorMode::TrueColor);
+    Some(
+        machine_graph_lines(&theme, spec)?
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|span| span.content.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+/// The static diagram of a machine spec (`pa factory compile`): the live page's boxes and
+/// wires with no run overlay. `None` when the spec has no states or transitions list.
+pub(crate) fn machine_graph_lines(theme: &Theme, spec: &Value) -> Option<Vec<Line>> {
+    let states: Vec<_> = spec
+        .get("states")?
+        .as_array()?
+        .iter()
+        .map(|row| {
+            let mut state = FactoryState::parse(row)?;
+            state.model = scrubbed_string(row.pointer("/subagent/model"));
+            // A compiled python state names its node as {import, callable, path}.
+            if let (Some(module), Some(callable)) = (
+                scrubbed_string(row.pointer("/python/import")),
+                scrubbed_string(row.pointer("/python/callable")),
+            ) {
+                state.python = Some(format!("{module}.{callable}"));
+            }
+            Some(state)
+        })
+        .collect::<Option<_>>()?;
+    let edges: Vec<_> = spec
+        .get("transitions")?
+        .as_array()?
+        .iter()
+        .map(FactoryTransition::parse)
+        .collect::<Option<_>>()?;
+    Some(blocks::block_diagram(theme, &states, &edges).lines)
+}
+
+/// Render one run's fused snapshot (the kernel `factory.graph` shape) as the
+/// factory view's panel text, without the page's key hint line.
+#[must_use]
+pub fn run_view_text(snapshot: &Value, width: usize, rows: usize) -> Option<String> {
+    let view = FactoryView::new(vec![parse_run(snapshot)?], rows);
+    let theme = Theme::builtin("prime", crate::theme::ColorMode::TrueColor);
+    let mut lines = view.render(&theme, width, &KeybindingsManager::new());
+    lines.pop();
+    Some(
+        lines
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|span| span.content.as_str())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
 
 /// The refresh cadence's watch bound (ms): the kernel's own collect poll
 /// slice (`POLL_TIMEOUT_MS`), so a change repaints at the run's pace.
@@ -398,6 +469,8 @@ fn parse_run(run: &Value) -> Option<FactoryRunSnapshot> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FactoryViewAction {
     None,
+    New,
+    Edit(String),
     /// Open the selected state's latest child session.
     Open {
         child_id: String,
@@ -441,6 +514,7 @@ impl FactoryRow {
 #[derive(Debug)]
 pub struct FactoryView {
     runs: Vec<FactoryRunSnapshot>,
+    graph_offset: Option<usize>,
     /// Per-run recent-change markers: set by [`Self::apply_runs`] when the
     /// signature changed, decayed on the next cycle (no per-transition
     /// repaint spam — one marker per notice-worthy change).
@@ -464,6 +538,7 @@ impl FactoryView {
         let recent_change = vec![false; runs.len()];
         let mut view = Self {
             runs,
+            graph_offset: None,
             recent_change,
             selected: None,
             armed: None,
@@ -618,6 +693,50 @@ impl FactoryView {
     /// state), and any other key only disarms. `r` resumes a paused run.
     #[must_use]
     pub fn handle_key(&mut self, key: &str, kb: &KeybindingsManager) -> FactoryViewAction {
+        if kb.matches(key, "app.factory.toggle") {
+            return FactoryViewAction::Close;
+        }
+        if let Some(offset) = self.graph_offset {
+            match key {
+                "g" | "escape" | "left" | "q" => self.graph_offset = None,
+                "down" | "pagedown" => {
+                    let height = self.selected_run().map_or(0, |run| {
+                        blocks::block_diagram(
+                            &Theme::builtin("prime", crate::theme::ColorMode::TrueColor),
+                            &run.states,
+                            &run.transitions,
+                        )
+                        .lines
+                        .len()
+                    });
+                    let step = if key == "down" {
+                        1
+                    } else {
+                        self.viewport_rows.max(1)
+                    };
+                    self.graph_offset =
+                        Some(offset.saturating_add(step).min(
+                            height.saturating_sub(self.viewport_rows.saturating_sub(1).max(1)),
+                        ));
+                }
+                "up" | "pageup" => {
+                    self.graph_offset = Some(offset.saturating_sub(if key == "up" {
+                        1
+                    } else {
+                        self.viewport_rows.max(1)
+                    }))
+                }
+                "e" => {
+                    return FactoryViewAction::Edit(
+                        self.selected_run()
+                            .map(|run| run.spec_id.clone())
+                            .unwrap_or_default(),
+                    )
+                }
+                _ => {}
+            }
+            return FactoryViewAction::None;
+        }
         let armed = self.armed.take();
         if kb.matches(key, "app.agents.delete") {
             let Some(row) = self.selected.clone() else {
@@ -656,7 +775,17 @@ impl FactoryView {
         // bindings, so a rebound Left/Right keeps its configured action.
         match key {
             "left" => FactoryViewAction::Close,
+            "n" => FactoryViewAction::New,
+            "g" if self.selected_run().is_some() => {
+                self.graph_offset = Some(0);
+                FactoryViewAction::None
+            }
             "right" => self.open_selected(),
+            "e" => FactoryViewAction::Edit(
+                self.selected_run()
+                    .map(|run| run.spec_id.clone())
+                    .unwrap_or_default(),
+            ),
             "r" => match self.selected_run() {
                 Some(run) if Self::available_actions(run).contains(&FactoryAction::Resume) => {
                     FactoryViewAction::Resume {
@@ -741,6 +870,20 @@ impl FactoryView {
     /// trailing key hint.
     #[must_use]
     pub fn render(&self, theme: &Theme, width: usize, kb: &KeybindingsManager) -> Vec<Line> {
+        if let (Some(offset), Some(run)) = (self.graph_offset, self.selected_run()) {
+            let graph = blocks::block_diagram(theme, &run.states, &run.transitions);
+            let visible = self.viewport_rows.saturating_sub(1).max(1);
+            let start = offset.min(graph.lines.len().saturating_sub(visible));
+            let mut lines: Vec<_> = graph
+                .lines
+                .into_iter()
+                .skip(start)
+                .take(visible)
+                .map(|line| truncate_line(&line, width, "…"))
+                .collect();
+            lines.push(vec![Span::raw("↑/↓ scroll · e edit machine · g back")]);
+            return lines;
+        }
         // The panel area: one panel per run; the selected row's line (and
         // its panel's start) is recorded for the budget window below.
         let mut panels: Vec<Line> = Vec::new();
@@ -755,7 +898,7 @@ impl FactoryView {
                 Span::raw("  "),
                 theme.fg_span(
                     ThemeColor::Muted,
-                    "Start one from the conversation: await rlm.factory.run('<spec_id>')",
+                    "Press n to choose a machine for this project.",
                 ),
             ]);
         }
@@ -845,6 +988,7 @@ impl FactoryView {
                 key("tui.select.down", "\u{2193}"),
             ),
             format!("{}/\u{2192} open", key("tui.select.confirm", "Enter")),
+            "n new run · g graph · e edit machine".to_string(),
             "\u{2190} back".to_string(),
         ];
         if self

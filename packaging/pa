@@ -1,0 +1,12 @@
+#!/bin/sh
+# Durable threads use their own store. Interactive Prime uses its usual settings.
+if [ "$1" = thread ]; then
+    export PRIME_AGENT_CODING_AGENT_DIR="${PRIME_AGENT_CODING_AGENT_DIR:-$HOME/.prime/harness}"
+fi
+if [ -n "$PRIME_AGENT_CODING_AGENT_DIR" ]; then
+    socket="$PRIME_AGENT_CODING_AGENT_DIR/daemon.sock"
+else
+    socket="$HOME/.prime/agent/harness-daemon.sock"
+fi
+export PRIME_AGENT_DAEMON_SOCKET="${PRIME_AGENT_DAEMON_SOCKET:-$socket}"
+exec "$HOME/.local/share/pa-harness/prime-agent" "$@"

@@ -608,7 +608,7 @@ pub(crate) fn saved_session_context_from_parts(
     has_thinking_level: bool,
 ) -> crate::engine::SavedSessionContext {
     crate::engine::SavedSessionContext {
-        model: context.model.clone(),
+        model: context.restorable_model().cloned(),
         thinking: has_thinking_level
             .then(|| pa_ai::models::thinking_level_from_str(&context.thinking_level))
             .flatten(),

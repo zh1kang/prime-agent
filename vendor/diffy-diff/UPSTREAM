@@ -1,0 +1,4 @@
+https://github.com/seatedro/diffy
+78f8a268c628495630ac18c7e7b3b25c4d56e3e3 crates/diffy-diff
+The package version is explicit for standalone builds.
+compare.rs uses a stable if-let in place of an experimental match guard.

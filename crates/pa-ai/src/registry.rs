@@ -119,6 +119,8 @@ pub fn register_builtin_api_providers() {
         Arc::new(crate::providers::mistral::MistralConversationsProvider),
         Arc::new(crate::providers::bedrock::BedrockConverseStreamProvider),
         Arc::new(crate::providers::openai_codex_responses::OpenAICodexResponsesProvider),
+        Arc::new(crate::providers::antigravity::AntigravityCliProvider),
+        Arc::new(crate::providers::claude_cli::ClaudeCliProvider),
     ];
     for provider in builtins {
         registry.insert(

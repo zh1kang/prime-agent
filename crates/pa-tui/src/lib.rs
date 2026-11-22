@@ -37,6 +37,7 @@ pub mod bash_card;
 pub mod bash_view;
 pub(crate) mod branch;
 pub(crate) mod browser;
+pub(crate) mod captain_view;
 pub mod chat;
 pub mod chat_slash;
 mod choice_picker;
@@ -96,6 +97,7 @@ pub(crate) mod program_status;
 pub(crate) mod prompt_highlight;
 pub mod prompt_stash;
 pub mod provider_auth;
+mod provider_connect;
 pub mod queued;
 pub(crate) mod search_input;
 pub mod selection;
@@ -122,6 +124,7 @@ pub(crate) mod update_restart_wait;
 pub mod user_message_selector;
 pub mod view;
 pub mod width;
+pub(crate) mod workspace_view;
 
 use ratatui::style::Style;
 

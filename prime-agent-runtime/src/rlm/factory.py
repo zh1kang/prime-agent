@@ -1550,6 +1550,11 @@ def _render_prompt(
     return rendered
 
 
+def _with_preamble(run: "FactoryRun", prompt: str) -> str:
+    """Prefix the run's caller preamble, when set, to one agent prompt."""
+    return f"{run.preamble}\n\n{prompt}" if run.preamble else prompt
+
+
 def _json_equal(actual: Any, expected: Any) -> bool:
     """JSON-strict equality for eq/ne guards: a boolean never equals a
     number (true != 1, false != 0), numbers compare numerically (1 == 1.0),
@@ -1856,6 +1861,9 @@ class FactoryRun:
     # asset is read on its first use, and later entries bind the same text.
     assets_dir: Path | None = None
     assets: dict[str, str] = field(default_factory=dict)
+    # Caller text placed before every agent state's rendered prompt, such
+    # as a project's standing rules. Python states never read it.
+    preamble: str | None = None
     states: dict[str, _StateRun] = field(default_factory=dict)
     order: list[str] = field(default_factory=list)
     transitions_from: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
@@ -1927,10 +1935,14 @@ class FactoryExecutor:
         self._sleep_fn: Callable[[float], Any] = sleep or asyncio.sleep
         self._harness = harness
         self._runs: dict[str, FactoryRun] = {}
+        self._captain_journal: Path | None = None
+        self._captain_owner: IO[str] | None = None
 
     # -- public API ---------------------------------------------------------
 
-    async def run(self, spec_id: str, *, name: str | None = None) -> dict[str, Any]:
+    async def run(
+        self, spec_id: str, *, name: str | None = None, preamble: str | None = None
+    ) -> dict[str, Any]:
         """Validate a stored factory spec and start a run of it.
 
         The dry run happens in two halves. Write time (``create_factory``)
@@ -1957,7 +1969,7 @@ class FactoryExecutor:
         resolved, reference_errors = self._resolve_subagents(harness, canonical)
         if reference_errors:
             raise ValueError("; ".join(reference_errors))
-        run = self._create_run(entry.id, canonical, resolved, name=name)
+        run = self._create_run(entry.id, canonical, resolved, name=name, preamble=preamble)
         return await self._launch_run(run)
 
     async def run_machine(
@@ -1967,6 +1979,7 @@ class FactoryExecutor:
         machine_path: Path | None = None,
         assets_dir: Path | None = None,
         name: str | None = None,
+        preamble: str | None = None,
     ) -> dict[str, Any]:
         """Validate a library machine and start a run of it.
 
@@ -1984,7 +1997,7 @@ class FactoryExecutor:
         resolved, reference_errors = self._resolve_subagents(harness, canonical)
         if reference_errors:
             raise ValueError("; ".join(reference_errors))
-        run = self._create_run(machine.name, canonical, resolved, name=name)
+        run = self._create_run(machine.name, canonical, resolved, name=name, preamble=preamble)
         run.assets_dir = assets_dir
         result = await self._launch_run(run)
         result["machine"] = machine.name
@@ -2099,8 +2112,13 @@ class FactoryExecutor:
         self._event(run, "run_stopped", detail=f"stopped; {len(stopped)} state(s) cancelled")
         return {"run_id": run.run_id, "state": "stopped", "cancelled": stopped}
 
-    async def resume(self, run_id: str) -> dict[str, Any]:
+    async def resume(self, run_id: str, note: str | None = None) -> dict[str, Any]:
         """Resume a paused run (escalate, budget, or max_transitions pause).
+
+        ``note`` is reviewer guidance for an escalate pause: it is appended
+        to the prompt of every re-admitted instance. ``notes_applied`` in the
+        result counts those instances, so a caller can tell when a budget or
+        max_transitions pause had no failed attempt to carry the note.
 
         An escalate pause holds its failed entry unsettled, so resume
         re-admits that entry first: a fresh attempt of the same rendered
@@ -2131,7 +2149,7 @@ class FactoryExecutor:
         # An escalate pause holds its failed entry unsettled: re-admit it
         # BEFORE anything evaluates or admits, so the retry -- not the
         # failure's propagation -- is what resume runs.
-        self._readmit_held_entries(run)
+        notes_applied = self._readmit_held_entries(run, note.strip() if note else None)
         # Evaluate settles next: a max_transitions pause left transitions
         # mid-settle, and resume continues after the ones that fired.
         await self._evaluate_settles(run)
@@ -2147,9 +2165,10 @@ class FactoryExecutor:
             "state": run.state,
             "started": started,
             "pending": self._pending_state_ids(run),
+            "notes_applied": notes_applied,
         }
 
-    def _readmit_held_entries(self, run: FactoryRun) -> None:
+    def _readmit_held_entries(self, run: FactoryRun, note: str | None = None) -> int:
         """Re-admit every entry an escalate pause holds unsettled.
 
         An escalate failure never queues its settle (the pause lands before
@@ -2163,7 +2182,11 @@ class FactoryExecutor:
         attempt count). A binding-failure entry has no instances: it
         re-binds through the readiness pass, and a still-broken upstream
         settles it into the same pause again.
+
+        A ``note`` is appended to each re-admitted instance's prompt as
+        reviewer guidance. Returns how many instances received it.
         """
+        applied = 0
         for state_id in run.order:
             state = run.states[state_id]
             for entry in state.entries:
@@ -2184,13 +2207,21 @@ class FactoryExecutor:
                     instance.rate_limit_streak = 0
                     instance.retry_base = instance.attempt
                     instance.infra_respawned = False
+                    if note:
+                        instance.prompt = f"{instance.prompt}\n\nReviewer note for this retry: {note}"
+                        applied += 1
                 self._event(
                     run,
                     "readmitted",
                     node=state_id,
                     entry=entry.index,
-                    detail="resume re-admits the failed entry (same rendered prompt)",
+                    detail=(
+                        "resume re-admits the failed entry with a reviewer note"
+                        if note
+                        else "resume re-admits the failed entry (same rendered prompt)"
+                    ),
                 )
+        return applied
 
     # -- graph, watch, host activity ------------------------------------------
 
@@ -2669,12 +2700,14 @@ class FactoryExecutor:
         resolved: dict[str, tuple[str, str | None, str | None, str | None]],
         *,
         name: str | None,
+        preamble: str | None = None,
     ) -> FactoryRun:
         run_spec = canonical["run"]
         run = FactoryRun(
             run_id=uuid4().hex,
             spec_id=spec_id,
             name=name,
+            preamble=preamble or None,
             machine=canonical,
             started_at=self._now_fn(),
             max_parallel=run_spec["max_parallel"],
@@ -2740,6 +2773,13 @@ class FactoryExecutor:
             event["detail"] = detail
         event.update(extra)
         run.events.append(event)
+        if kind in ("run_started", "spawned", "milestone", "resumed", "run_stopped"):
+            try:
+                self._record_captain_event(run, event)
+            except OSError as exc:
+                # Progress recording is optional. Keep the actual run controllable
+                # and surface the error on its ledger for the live view.
+                event["captain_record_error"] = str(exc)
         # Every ledger event is an observable mutation, so the watch
         # bookkeeping rides the same seam: bump the revision and resolve
         # every registered watcher. ``watch`` re-checks its signature, so
@@ -2747,6 +2787,28 @@ class FactoryExecutor:
         # backoff notice, a repeated milestone) just re-arms the wait.
         self._touch(run)
         return event
+
+    def _record_captain_event(self, run: FactoryRun, event: dict[str, Any]) -> None:
+        # A registered Captain creates this directory. Other sessions keep their
+        # normal in-memory executor. The lock distinguishes a live kernel from
+        # a restarted one even when the operating system reuses the PID.
+        if self._captain_journal is None:
+            if event["kind"] != "run_started" or not (root := os.getenv("RLM_SESSION_DIR")):
+                return
+            directory = Path(root) / "captain"
+            if not directory.is_dir():
+                return
+            import fcntl
+            owner = (directory / (uuid4().hex + ".owner")).open("x")
+            fcntl.flock(owner, fcntl.LOCK_EX)
+            self._captain_owner = owner
+            self._captain_journal = directory / "runs.jsonl"
+        assert self._captain_owner is not None
+        summary = {k: event[k] for k in ("seq", "kind", "milestone", "detail", "child", "node") if k in event}
+        summary.update(run=run.run_id, title=run.name or run.spec_id, state=run.state,
+                       owner=Path(self._captain_owner.name).name)
+        with self._captain_journal.open("a", encoding="utf-8") as journal:
+            journal.write(json.dumps(summary) + "\n")
 
     def _touch(self, run: FactoryRun) -> None:
         """Bump the run's watch revision and wake every registered watcher."""
@@ -3173,7 +3235,9 @@ class FactoryExecutor:
             assert state.prompt_template is not None
             instance = _NodeInstance(
                 index=state.instance_counter,
-                prompt=_render_prompt(state.prompt_template, values, rendered_params),
+                prompt=_with_preamble(
+                    run, _render_prompt(state.prompt_template, values, rendered_params)
+                ),
                 inputs={**params, **bound},
             )
             state.instance_counter += 1
@@ -3186,10 +3250,13 @@ class FactoryExecutor:
             instances.append(
                 _NodeInstance(
                     index=state.instance_counter + len(instances),
-                    prompt=_render_prompt(
-                        state.prompt_template,
-                        {**values, foreach["over"]: instance_value},
-                        rendered_params,
+                    prompt=_with_preamble(
+                        run,
+                        _render_prompt(
+                            state.prompt_template,
+                            {**values, foreach["over"]: instance_value},
+                            rendered_params,
+                        ),
                     ),
                     inputs={**params, **bound, foreach["over"]: item},
                 )
@@ -4492,7 +4559,11 @@ def default_factory_executor() -> FactoryExecutor:
 
 
 async def run_factory(
-    spec_id: str, *, name: str | None = None, params: "dict[str, Any] | None" = None
+    spec_id: str,
+    *,
+    name: str | None = None,
+    params: "dict[str, Any] | None" = None,
+    preamble: str | None = None,
 ) -> dict[str, Any]:
     """Validate a factory spec and start a nonblocking run of it.
 
@@ -4508,8 +4579,11 @@ async def run_factory(
     A machine directory is loaded, checked, and compiled by the session's
     Rust loader (the ``factory.compile`` host request, the same one
     ``prime-agent factory validate`` uses) with ``params`` bound; params
-    apply to machine directories only.
+    apply to machine directories only. ``preamble`` is text placed before
+    every agent state's prompt, such as a project's crew rules.
     """
+    if preamble is not None and not isinstance(preamble, str):
+        raise TypeError(f"preamble must be a str, got {type(preamble).__name__}")
     require_factory_enabled()
     if params is not None and not isinstance(params, dict):
         raise TypeError(f"params must be a dict, got {type(params).__name__}")
@@ -4519,6 +4593,7 @@ async def run_factory(
     if directory is None and harness.get("factory", spec_id) is None:
         directory = _resolve_machine_dir(spec_id)
     if directory is not None:
+        _refuse_project_factory(directory)
         from . import host_request
 
         compiled = await host_request(
@@ -4531,7 +4606,9 @@ async def run_factory(
             author=compiled.get("author") or "",
             spec=compiled["spec"],
         )
-        return await executor.run_machine(machine, machine_path=directory, assets_dir=directory, name=name)
+        return await executor.run_machine(
+            machine, machine_path=directory, assets_dir=directory, name=name, preamble=preamble
+        )
     if params:
         raise ValueError(
             f"params apply to machine directories (machine.toml); {spec_id!r} is a stored "
@@ -4560,8 +4637,8 @@ async def run_factory(
                 f"unknown factory spec {spec_id!r}: no stored factory entry, and "
                 f"the id is not a valid machine name either ({error})"
             ) from None
-        return await executor.run_machine(machine, machine_path=path, name=name)
-    return await executor.run(spec_id, name=name)
+        return await executor.run_machine(machine, machine_path=path, name=name, preamble=preamble)
+    return await executor.run(spec_id, name=name, preamble=preamble)
 
 
 async def status_factory(run_id: str) -> dict[str, Any]:
@@ -4576,14 +4653,15 @@ async def stop_factory(run_id: str) -> dict[str, Any]:
     return await default_factory_executor().stop(run_id)
 
 
-async def resume_factory(run_id: str) -> dict[str, Any]:
+async def resume_factory(run_id: str, note: str | None = None) -> dict[str, Any]:
     """Resume a paused run (escalate, budget, or max_transitions pause).
 
     An escalate pause re-admits the failed entry as a fresh attempt of the
-    same rendered prompt first; see ``FactoryExecutor.resume``.
+    same rendered prompt first, with ``note`` appended as reviewer guidance
+    when given; see ``FactoryExecutor.resume``.
     """
     require_factory_enabled()
-    return await default_factory_executor().resume(run_id)
+    return await default_factory_executor().resume(run_id, note)
 
 
 def graph_factory(ref: str | None = None, *, compact: bool = False) -> dict[str, Any]:
@@ -5311,6 +5389,22 @@ def list_machines(
     ``factory list`` can say why a machine does not show.
     """
     return _scan_machine_library(repo_dir=repo_dir, user_dir=user_dir)[0]
+
+
+def _refuse_project_factory(directory: Path) -> None:
+    """Refuse a machine directory inside a ``<dir>/.prime/machines/`` tree.
+
+    A Captain writes project factories itself, so they run only through the
+    Captain after the user approves one exact version; the Captain runs an
+    approved copy from its own control folder, which is outside such a tree.
+    """
+    parts = Path(directory).resolve().parts
+    for index in range(len(parts) - 1):
+        if parts[index] == ".prime" and parts[index + 1] == "machines":
+            raise ValueError(
+                f"{directory} is a project factory. Project factories run through the "
+                "Captain after approval."
+            )
 
 
 def _machine_dir_argument(spec_id: str) -> "Path | None":

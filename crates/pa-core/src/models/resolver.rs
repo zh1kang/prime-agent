@@ -196,6 +196,30 @@ pub fn find_preferred_default_model(available_models: &[Model]) -> Option<&Model
         .find(|model| default_model_per_provider(&model.provider).is_some_and(|id| model.id == id))
 }
 
+/// The model chosen when the user named none: the featured default, then
+/// the first available model. Models served by a local provider CLI (claude,
+/// agy) are chosen only when no credentialed provider has an available model,
+/// so an installed CLI never displaces a provider the user configured.
+#[must_use]
+pub fn find_automatic_default_model(available_models: &[Model]) -> Option<&Model> {
+    let (credentialed, local_cli): (Vec<Model>, Vec<Model>) = available_models
+        .iter()
+        .cloned()
+        .partition(|model| !is_local_cli_model(model));
+    let pick = |pool: &[Model]| {
+        let chosen = find_preferred_default_model(pool).or_else(|| pool.first())?;
+        available_models
+            .iter()
+            .find(|model| model.provider == chosen.provider && model.id == chosen.id)
+    };
+    pick(&credentialed).or_else(|| pick(&local_cli))
+}
+
+fn is_local_cli_model(model: &Model) -> bool {
+    model.api == pa_ai::claude_cli::CLAUDE_CLI_API
+        || model.api == pa_ai::antigravity::ANTIGRAVITY_API
+}
+
 pub(crate) fn is_valid_thinking_level(value: &str) -> bool {
     matches!(
         value,
@@ -607,6 +631,8 @@ pub struct InitialModelOptions<'a> {
 ///    saved id is missing from the catalog
 /// 4. The featured default (prime-inference glm-5.3, then per-provider ids)
 /// 5. The first available model.
+///
+/// Steps 4 and 5 try local-CLI models (claude, agy) last.
 #[must_use]
 pub fn find_initial_model(options: &InitialModelOptions<'_>) -> Option<Model> {
     if let (Some(provider), Some(pattern)) = (options.cli_provider, options.cli_model) {
@@ -646,9 +672,7 @@ pub fn find_initial_model(options: &InitialModelOptions<'_>) -> Option<Model> {
             }
         }
     }
-    find_preferred_default_model(options.available_models)
-        .cloned()
-        .or_else(|| options.available_models.first().cloned())
+    find_automatic_default_model(options.available_models).cloned()
 }
 
 /// The private-model predicate without a full `Model` value (TS

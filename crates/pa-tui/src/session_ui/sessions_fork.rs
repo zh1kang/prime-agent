@@ -495,6 +495,7 @@ pub(super) async fn create_session(
 ) -> Result<String> {
     let session_path = match selection {
         Some(SessionSelection::Resume(path)) => Some(path.to_string_lossy().to_string()),
+        Some(SessionSelection::ResumeWith { path, .. }) => Some(path.to_string_lossy().to_string()),
         Some(
             SessionSelection::New | SessionSelection::NewChild { .. } | SessionSelection::Attach(_),
         )

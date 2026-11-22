@@ -35,10 +35,10 @@ pub use prime_inference::{
     private_prime_inference_models, PRIME_INFERENCE_BASE_URL,
 };
 pub use resolver::{
-    build_fallback_model, failover_candidates, find_exact_model_reference_match,
-    find_initial_model, find_preferred_default_model, resolve_cli_model,
-    resolve_model_scope_from_models, scope_patterns_select_reference, InitialModelOptions,
-    ResolveCliModelResult, ScopedModel, PRIME_INFERENCE_DEFAULT_MODEL_ID,
+    build_fallback_model, failover_candidates, find_automatic_default_model,
+    find_exact_model_reference_match, find_initial_model, find_preferred_default_model,
+    resolve_cli_model, resolve_model_scope_from_models, scope_patterns_select_reference,
+    InitialModelOptions, ResolveCliModelResult, ScopedModel, PRIME_INFERENCE_DEFAULT_MODEL_ID,
 };
 pub use session_restore::{
     find_session_model_with_readiness_wait, resolve_model_scope_from_models_with_readiness,

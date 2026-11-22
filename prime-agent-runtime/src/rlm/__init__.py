@@ -842,9 +842,14 @@ class _RLMFactoryNamespace:
     """
 
     async def run(
-        self, spec_id: str, *, name: str | None = None, params: dict[str, Any] | None = None
+        self,
+        spec_id: str,
+        *,
+        name: str | None = None,
+        params: dict[str, Any] | None = None,
+        preamble: str | None = None,
     ) -> dict[str, Any]:
-        return await run_factory(spec_id, name=name, params=params)
+        return await run_factory(spec_id, name=name, params=params, preamble=preamble)
 
     async def status(self, run_id: str) -> dict[str, Any]:
         return await status_factory(run_id)
@@ -852,8 +857,8 @@ class _RLMFactoryNamespace:
     async def stop(self, run_id: str) -> dict[str, Any]:
         return await stop_factory(run_id)
 
-    async def resume(self, run_id: str) -> dict[str, Any]:
-        return await resume_factory(run_id)
+    async def resume(self, run_id: str, note: str | None = None) -> dict[str, Any]:
+        return await resume_factory(run_id, note)
 
     async def graph(self, ref: str | None = None) -> dict[str, Any]:
         return graph_factory(ref)

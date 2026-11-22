@@ -17,6 +17,37 @@ fn auth_without_env(data: &serde_json::Value) -> AuthStorage {
     AuthStorage::in_memory_without_env(&data, Arc::new(NoOAuth))
 }
 
+/// An environment source that reports the named local CLIs as installed and
+/// nothing else: local CLI tests do not depend on the machine's PATH.
+struct LocalClis(&'static [&'static str]);
+
+impl crate::auth::manager::EnvCredentialSource for LocalClis {
+    fn key_names(&self, _provider: &str) -> Option<Vec<String>> {
+        None
+    }
+
+    fn api_key(&self, _provider: &str) -> Option<String> {
+        None
+    }
+
+    fn prime_team_id(&self) -> Option<String> {
+        None
+    }
+
+    fn ambient_identity_material(&self, provider: &str) -> String {
+        provider.to_string()
+    }
+
+    fn local_cli_available(&self, provider: &str) -> bool {
+        self.0.contains(&provider)
+    }
+}
+
+fn auth_with_local_clis(data: &serde_json::Value, clis: &'static [&'static str]) -> AuthStorage {
+    let data = AuthStorageData(data.as_object().cloned().unwrap_or_default());
+    AuthStorage::in_memory_with_env(&data, Arc::new(NoOAuth), Arc::new(LocalClis(clis)))
+}
+
 fn model(id: &str, provider: &str) -> Model {
     serde_json::from_value(serde_json::json!({
         "id": id, "name": id, "api": "openai-completions", "provider": provider,
@@ -695,4 +726,113 @@ fn a_prime_base_url_override_voids_the_live_serving_label() {
     let overridden = probe(&registry);
     assert_eq!(overridden.base_url, "https://my-gateway.example/v1");
     assert_eq!(overridden.serving, None);
+}
+
+#[test]
+fn antigravity_models_surface_when_cli_is_available() {
+    let dir = tempfile::tempdir().unwrap();
+    let models_path = dir.path().join("models.json");
+    let auth = auth_with_local_clis(&serde_json::json!({}), &["antigravity"]);
+    let mut registry = ModelRegistry::create(auth, &models_path);
+    let neon = registry
+        .get_available()
+        .into_iter()
+        .find(|m| m.provider == "antigravity" && m.id == "gemini-4-neon")
+        .expect("antigravity/gemini-4-neon should be available when agy is installed")
+        .clone();
+    assert_eq!(neon.api, pa_ai::antigravity::ANTIGRAVITY_API);
+    assert!(registry.has_configured_auth(&neon));
+    assert!(registry.get_provider_auth_status("antigravity").configured);
+    assert!(registry
+        .resolve_set_model_selection("antigravity", "gemini-4-neon")
+        .is_ok());
+    let resolved = registry.get_api_key_and_headers(&neon, None);
+    assert!(resolved.ok);
+    assert!(resolved.error.is_none());
+}
+
+#[test]
+fn anthropic_routes_through_claude_cli_without_real_api_key() {
+    if std::env::var("ANTHROPIC_API_KEY")
+        .is_ok_and(|k| !k.trim().is_empty() && !k.contains("sk-ant-oat"))
+    {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let models_path = dir.path().join("models.json");
+    let auth = auth_with_local_clis(&serde_json::json!({}), &["anthropic"]);
+    let mut registry = ModelRegistry::create(auth, &models_path);
+    let claude = registry
+        .get_available()
+        .into_iter()
+        .find(|m| m.provider == "anthropic")
+        .expect("anthropic model available via claude CLI")
+        .clone();
+    assert_eq!(claude.api, pa_ai::claude_cli::CLAUDE_CLI_API);
+    assert!(registry.has_configured_auth(&claude));
+    assert!(registry.get_provider_auth_status("anthropic").configured);
+    let resolved = registry.get_api_key_and_headers(&claude, None);
+    assert!(resolved.ok);
+    assert!(resolved.api_key.is_none());
+
+    // With a real Anthropic API key, anthropic models keep the native Messages API.
+    let api_auth = auth_with_local_clis(
+        &serde_json::json!({
+            "anthropic": { "type": "api_key", "key": "sk-ant-api-real-key" }
+        }),
+        &["anthropic"],
+    );
+    let api_registry = ModelRegistry::create(api_auth, &models_path);
+    let api_claude = api_registry
+        .get_available()
+        .into_iter()
+        .find(|m| m.provider == "anthropic")
+        .expect("anthropic model available via API key");
+    assert_eq!(api_claude.api, "anthropic-messages");
+}
+
+#[test]
+fn hermetic_storage_never_finds_local_clis() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = ModelRegistry::create(
+        auth_without_env(&serde_json::json!({})),
+        dir.path().join("models.json"),
+    );
+    assert!(registry
+        .get_available()
+        .iter()
+        .all(|m| m.provider != "anthropic" && m.provider != "antigravity"));
+}
+
+#[test]
+fn a_local_cli_is_the_automatic_default_only_without_a_credentialed_provider() {
+    let dir = tempfile::tempdir().unwrap();
+    let models_path = dir.path().join("models.json");
+    std::fs::write(
+        &models_path,
+        serde_json::json!({"providers": {"my-gateway": {
+            "baseUrl": "http://127.0.0.1:9/v1", "apiKey": "synthetic-only",
+            "api": "openai-completions", "models": [{"id": "my-model"}]
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    let both = ModelRegistry::create(
+        auth_with_local_clis(&serde_json::json!({}), &["anthropic"]),
+        &models_path,
+    );
+    let available: Vec<Model> = both.get_available().into_iter().cloned().collect();
+    assert!(available.iter().any(|m| m.provider == "anthropic"));
+    let chosen = crate::models::find_automatic_default_model(&available).unwrap();
+    assert_eq!(
+        (chosen.provider.as_str(), chosen.id.as_str()),
+        ("my-gateway", "my-model")
+    );
+
+    let cli_only: Vec<Model> = available
+        .into_iter()
+        .filter(|m| m.provider == "anthropic")
+        .collect();
+    let chosen = crate::models::find_automatic_default_model(&cli_only).unwrap();
+    assert_eq!(chosen.provider, "anthropic");
 }

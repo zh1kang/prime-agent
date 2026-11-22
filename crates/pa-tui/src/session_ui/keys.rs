@@ -339,6 +339,57 @@ impl SessionUi {
         }
         // Any non-Escape key re-arms the double-Esc tree shortcut (one shot per input chain);
         // Escape itself never resets, so repeated Escape converges to the inert empty state.
+        if view.overlay.is_none()
+            && id
+                .as_ref()
+                .is_some_and(|key| view.editor.keybindings().matches(key, "app.factory.toggle"))
+        {
+            self.escape_tree_shortcut_spent = false;
+            // F6 is the project-level entry point: the native Captain panel. `/fsm` stays the
+            // direct live-machine view. During a Captain text step it returns to the panel.
+            if self.captain_compose_active() {
+                self.captain_compose_key("escape", view);
+            } else {
+                self.open_captain_panel(view, "");
+            }
+            return Ok(());
+        }
+        if view.overlay.is_none() {
+            if let Some(key_id) = id.as_deref() {
+                if self.captain_compose_key(key_id, view) {
+                    return Ok(());
+                }
+                let (crew, parent) = {
+                    let kb = view.editor.keybindings();
+                    (
+                        kb.matches(key_id, "app.captain.crew"),
+                        kb.matches(key_id, "app.captain.parent"),
+                    )
+                };
+                if crew {
+                    self.open_crew_picker(view);
+                    return Ok(());
+                }
+                if parent {
+                    self.open_parent_chat(view);
+                    return Ok(());
+                }
+                let step = {
+                    let kb = view.editor.keybindings();
+                    if kb.matches(key_id, "app.captain.next") {
+                        Some(1)
+                    } else if kb.matches(key_id, "app.captain.previous") {
+                        Some(-1)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(step) = step {
+                    self.cycle_crew_chat(step, view);
+                    return Ok(());
+                }
+            }
+        }
         if id.is_some_and(|id| id != "escape") {
             self.escape_tree_shortcut_spent = false;
         }
@@ -351,6 +402,18 @@ impl SessionUi {
             }
             Some(Overlay::Mcp(_)) => return self.handle_mcp_view_key(key, view),
             Some(Overlay::Factory(_)) => return self.handle_factory_view_key(key, view).await,
+            Some(Overlay::Captain(_)) => {
+                self.handle_captain_view_key(key, view);
+                return Ok(());
+            }
+            Some(Overlay::Workspace(_)) => {
+                self.handle_workspace_key(key, view);
+                return Ok(());
+            }
+            Some(Overlay::CrewPicker(_)) => {
+                self.handle_crew_picker_key(key, view);
+                return Ok(());
+            }
             Some(Overlay::Heartbeats(_)) => {
                 return self.handle_heartbeats_picker_key(key, view).await;
             }

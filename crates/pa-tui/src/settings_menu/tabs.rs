@@ -54,7 +54,19 @@ const TAB_LAYOUT: &[TabLayout] = &[
     TabLayout {
         name: "Agents",
         ids: &[
+            "/fsm",
+            "/captain",
             "skill-commands",
+            "/fsm edit",
+            "/factory toggle",
+            "/review",
+            "/resume",
+            "/subthread",
+            "/login",
+            "/connect codex",
+            "/connect claude",
+            "/connect antigravity",
+            "/threads",
             "builtin-skills",
             "idle-eviction-minutes",
             "tree-filter-mode",
@@ -102,12 +114,7 @@ pub(crate) fn row_indices(rows: &[SettingsMenuRow]) -> Vec<(&'static str, Vec<us
 /// The tab strip: one `N Name` per tab — the number dim, the name muted, the active tab white bold
 /// (the theme's text color, not the dock's background band — the operator's 2026-09-28 selection
 /// ruling). The numbers are the digit keys that jump straight to the tab.
-pub(crate) fn strip_row(
-    theme: &Theme,
-    width: usize,
-    names: &[&'static str],
-    active: usize,
-) -> Line {
+pub(crate) fn strip_row(theme: &Theme, width: usize, names: &[&str], active: usize) -> Line {
     let mut line: Line = vec![Span::raw("  ")];
     for (index, name) in names.iter().enumerate() {
         if index > 0 {

@@ -265,6 +265,10 @@ impl SessionUi {
             .iter()
             .map(ToString::to_string)
             .collect();
+        values.factory_enabled = self
+            .client_settings
+            .as_ref()
+            .is_some_and(|s| s.factory_enabled());
         let rows = crate::settings_menu::settings_menu_rows(&values);
         view.overlay = Some(Overlay::Settings(crate::settings_menu::SettingsMenu::new(
             rows,
@@ -292,6 +296,11 @@ impl SessionUi {
             // No-op closes: a bare None and Esc inside a submenu keep the menu open.
             crate::settings_menu::SettingsMenuAction::None
             | crate::settings_menu::SettingsMenuAction::SubmenuClosed => {}
+            crate::settings_menu::SettingsMenuAction::Open(command) => {
+                view.overlay = None;
+                self.handle_slash(command, super::SubmitBehavior::Steer, view)
+                    .await?;
+            }
             crate::settings_menu::SettingsMenuAction::Cancel => {
                 view.overlay = None;
             }

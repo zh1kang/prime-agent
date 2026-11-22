@@ -344,6 +344,10 @@ impl NewSessionParams {
 pub struct PromptParams {
     pub session_id: String,
     pub prompt: Vec<Value>,
+    /// `_meta["ai.primeintellect.prime-agent"].hiddenContext`: text the model
+    /// reads before this prompt as a `display: false` custom row, so a host
+    /// (the Captain) can send instructions that transcripts do not show.
+    pub hidden_context: Option<String>,
 }
 
 impl PromptParams {
@@ -359,6 +363,13 @@ impl PromptParams {
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default(),
+            hidden_context: params
+                .get("_meta")
+                .and_then(|meta| meta.get(super::meta::PRIME_AGENT_META_NAMESPACE))
+                .and_then(|meta| meta.get("hiddenContext"))
+                .and_then(Value::as_str)
+                .filter(|text| !text.trim().is_empty())
+                .map(str::to_string),
         }
     }
 }

@@ -59,6 +59,7 @@ pub fn hotkeys_guide(kb: &KeybindingsManager) -> String {
     let select_model = key_display(kb, "app.model.select");
     let expand_tools = key_display(kb, "app.tools.expand");
     let focus_subagents = key_display(kb, "app.subagents.focus");
+    let factory_toggle = key_display(kb, "app.factory.toggle");
     let external_editor = key_display(kb, "app.editor.external");
     let prompt_stash = key_display(kb, "app.prompt.stash");
     let follow_up = key_display(kb, "app.message.followUp");
@@ -143,6 +144,7 @@ pub fn hotkeys_guide(kb: &KeybindingsManager) -> String {
     let _ = writeln!(
         hotkeys,
         r"| `{focus_subagents}` | Focus activity (←/→ select group, Enter open) |
+| `{factory_toggle}` | Open or close the live factory |
 | `{external_editor}` | Edit message in external editor |
 | `{prompt_stash}` | Stash or restore draft prompt |
 | `{follow_up}` | Queue follow-up message |

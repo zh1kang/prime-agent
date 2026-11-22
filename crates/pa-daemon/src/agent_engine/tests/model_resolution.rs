@@ -484,6 +484,15 @@ async fn revived_session_restores_its_pinned_model_not_the_startup_default() {
 }
 
 #[tokio::test]
+async fn imported_transcript_resumes_without_a_model_warning() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = session_file_pinning_model(dir.path(), "t3", "imported");
+    let engine = restore_test_engine(dir.path(), None, None);
+    engine.restore_session_model(&path, None).await;
+    assert!(engine.model_fallback_message().is_none());
+}
+
+#[tokio::test]
 async fn revived_session_fallback_is_on_the_record() {
     let dir = tempfile::TempDir::new().unwrap();
     let agent_dir = dir.path().join("agent");

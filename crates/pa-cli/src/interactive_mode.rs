@@ -296,6 +296,19 @@ async fn run_agents_view_flow(
                     (requester, page)
                 });
                 let mut next = base.clone();
+                if let SessionSelection::Resume(path) | SessionSelection::ResumeWith { path, .. } =
+                    &selection
+                {
+                    let header = pa_core::session::manager::read_session_header(path)
+                        .context("Could not read selected session header")?;
+                    let cwd = PathBuf::from(header.cwd);
+                    anyhow::ensure!(
+                        cwd.is_dir(),
+                        "Saved project directory is unavailable: {}",
+                        cwd.display()
+                    );
+                    next.cwd = cwd;
+                }
                 next.session = selection;
                 next.session_rlm_depth = outcome.selection_rlm_depth;
                 let outcome =
@@ -436,7 +449,12 @@ fn build_tui_options(
     // daemon create config. Explicit --cwd and --fork retain their directory.
     let mut resolved_options = options.clone();
     if !options.session.cwd_from_flag && options.session.fork.is_none() {
-        if let SessionSelection::Resume(path) = &mut session {
+        let resume_path = match &mut session {
+            SessionSelection::Resume(path) => Some(path),
+            SessionSelection::ResumeWith { path, .. } => Some(path),
+            _ => None,
+        };
+        if let Some(path) = resume_path {
             *path = std::path::absolute(&*path)?;
             if let Some(header) = pa_core::session::manager::read_session_header(path)
                 .filter(|header| !header.cwd.is_empty())

@@ -157,6 +157,9 @@ pub(crate) trait EnvCredentialSource: Send + Sync {
     /// Identity material for ambient multi-variable credential sources
     /// (AWS profiles, container credentials, Google ADC projects).
     fn ambient_identity_material(&self, provider: &str) -> String;
+    /// Whether a signed-in local CLI (claude, agy) on PATH can serve the
+    /// provider. It is ambient like an env key, so hermetic sources say no.
+    fn local_cli_available(&self, provider: &str) -> bool;
 }
 
 struct ProcessEnvCredentials;
@@ -181,9 +184,21 @@ impl EnvCredentialSource for NoEnvCredentials {
     fn ambient_identity_material(&self, provider: &str) -> String {
         provider.to_string()
     }
+
+    fn local_cli_available(&self, _provider: &str) -> bool {
+        false
+    }
 }
 
 impl EnvCredentialSource for ProcessEnvCredentials {
+    fn local_cli_available(&self, provider: &str) -> bool {
+        match provider {
+            pa_ai::claude_cli::ANTHROPIC_PROVIDER => pa_ai::claude_cli::is_available(),
+            pa_ai::antigravity::ANTIGRAVITY_PROVIDER => pa_ai::antigravity::is_available(),
+            _ => false,
+        }
+    }
+
     fn key_names(&self, provider: &str) -> Option<Vec<String>> {
         pa_ai::env_api_keys::find_env_keys(provider)
     }
@@ -709,6 +724,12 @@ impl AuthStorage {
 
     pub fn has(&self, provider: &str) -> bool {
         self.data.get(provider).is_some()
+    }
+
+    /// Whether a local CLI on PATH (claude, agy) can serve `provider`.
+    /// Storage built without an environment source always answers no.
+    pub fn local_cli_available(&self, provider: &str) -> bool {
+        self.env_credentials.local_cli_available(provider)
     }
 
     /// Any form of auth configured (never refreshes tokens).

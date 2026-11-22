@@ -67,10 +67,14 @@ impl super::SessionUi {
     /// reports exactly that instead of mounting nothing silently.
     pub(crate) fn open_factory_page(&mut self, view: &mut AgentView) {
         if !self.factory_activity_supported() {
-            self.note(
-                "The factory page needs a daemon that advertises the factory lane",
-                view,
-            );
+            let mut page = FactoryView::new(Vec::new(), picker_viewport_rows(view.terminal_rows()));
+            page.set_error(Some(
+                "Live runs require /factory on and a client restart. Press e to edit machines."
+                    .into(),
+            ));
+            self.factory_view_session = Some(self.session_id.clone());
+            view.overlay = Some(Overlay::Factory(page));
+            self.dirty = true;
             return;
         }
         // The mounted view belongs to this durable session: a later
@@ -109,6 +113,19 @@ impl super::SessionUi {
         self.sync_factory_selection(view);
         match action {
             Some(FactoryViewAction::None) | None => {}
+            Some(FactoryViewAction::New) => {
+                if self.factory_activity_supported() {
+                    self.open_factory_launch(view);
+                } else if let Some(Overlay::Factory(page)) = view.overlay.as_mut() {
+                    page.set_error(Some(
+                        "Enable Factory in /settings > Agents, then restart pa to launch a run."
+                            .into(),
+                    ));
+                }
+            }
+            Some(FactoryViewAction::Edit(name)) => {
+                self.open_workspace(crate::workspace_view::WorkspaceView::machines(&name), view);
+            }
             Some(FactoryViewAction::Close) => {
                 self.factory_selected_run = None;
                 self.factory_view_session = None;
@@ -362,6 +379,13 @@ impl super::SessionUi {
                         session: active_session_id,
                         epoch,
                         data,
+                    });
+                }
+                Ok(Err(error)) if crate::daemon_client::is_kernel_not_running(&error) => {
+                    let _ = tx.send(FactoryUpdate::Snapshot {
+                        session: active_session_id,
+                        epoch,
+                        data: serde_json::json!({"runs":[]}),
                     });
                 }
                 Ok(Err(error)) => {

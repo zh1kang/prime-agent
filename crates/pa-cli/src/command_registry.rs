@@ -46,6 +46,12 @@ impl CommandSpec {
 
 /// All public command specs, in registry order.
 pub const COMMAND_SPECS: &[CommandSpec] = &[
+    CommandSpec::new(&["thread"], "thread [command]", "Manage provider connections, conversations, and worktrees"),
+    CommandSpec::new(
+        &["thread", "captain"],
+        "thread captain [status|act <operation>|stop|resume|delete]",
+        "Script project Captains; open the panel in pa with F6",
+    ),
     CommandSpec::new(&["help"], "help [command]", "Show command help"),
     CommandSpec::new(&["agents"], "agents", "Search and open sessions"),
     CommandSpec::new(

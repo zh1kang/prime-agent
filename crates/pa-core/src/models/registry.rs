@@ -95,6 +95,16 @@ pub struct ModelRegistry {
     /// The process-shared live catalog chain (`catalog_chain::catalog_for`);
     /// `resolve()` sources built-ins from it.
     catalog: std::sync::Arc<pa_models::ModelCatalog>,
+    /// Local CLI providers (claude, agy) found once at construction through
+    /// the auth storage's environment source; hermetic storage finds none.
+    local_cli: LocalCliProviders,
+}
+
+/// Which local provider CLIs serve requests for this registry.
+#[derive(Debug, Clone, Copy, Default)]
+struct LocalCliProviders {
+    claude: bool,
+    antigravity: bool,
 }
 
 /// Under a stored xAI subscription the provider's models switch onto the
@@ -170,6 +180,15 @@ impl ModelRegistry {
 
     fn new(auth: AuthStorage, models_json_path: Option<PathBuf>) -> Self {
         let catalog = catalog_chain::catalog_for(models_json_path.as_deref());
+        // In-memory registries (hosts without an agent dir) never use local CLIs.
+        let local_cli = if models_json_path.is_some() {
+            LocalCliProviders {
+                claude: auth.local_cli_available(pa_ai::claude_cli::ANTHROPIC_PROVIDER),
+                antigravity: auth.local_cli_available(pa_ai::antigravity::ANTIGRAVITY_PROVIDER),
+            }
+        } else {
+            LocalCliProviders::default()
+        };
         let mut registry = Self {
             auth,
             models_json_path,
@@ -179,6 +198,7 @@ impl ModelRegistry {
             model_request_headers: HashMap::new(),
             xai_model_sources: HashMap::new(),
             catalog,
+            local_cli,
         };
         registry.load_models();
         registry
@@ -238,7 +258,47 @@ impl ModelRegistry {
             .collect()
     }
 
+    fn has_real_anthropic_api_key(&self) -> bool {
+        if let Some(AuthCredential::ApiKey { key, .. }) =
+            self.auth.get_all().credential("anthropic")
+        {
+            if !key.trim().is_empty() && !key.contains("sk-ant-oat") {
+                return true;
+            }
+        }
+        if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+            if !key.trim().is_empty() && !key.contains("sk-ant-oat") {
+                return true;
+            }
+        }
+        if let Some(config) = self.provider_request_configs.get("anthropic") {
+            if config.headers.is_some() || config.auth_header.is_some() {
+                return true;
+            }
+            if config.api_key.as_deref().is_some_and(|key| {
+                crate::auth::resolve_config_value::resolve_config_value(key)
+                    .is_some_and(|resolved| !resolved.contains("sk-ant-oat"))
+            }) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn anthropic_uses_claude_cli(&self) -> bool {
+        self.local_cli.claude && !self.has_real_anthropic_api_key()
+    }
+
     pub fn has_configured_auth(&self, model: &Model) -> bool {
+        if model.provider == pa_ai::antigravity::ANTIGRAVITY_PROVIDER && self.local_cli.antigravity
+        {
+            return true;
+        }
+        if model.provider == pa_ai::claude_cli::ANTHROPIC_PROVIDER
+            && self.anthropic_uses_claude_cli()
+        {
+            return true;
+        }
         self.auth.has_auth(&model.provider)
             || self.has_configured_provider_request_auth(&model.provider)
     }
@@ -247,6 +307,20 @@ impl ModelRegistry {
     /// classifying unauthenticated vs stale providers read this instead of
     /// probing for keys.
     pub fn get_provider_auth_status(&self, provider: &str) -> crate::auth::types::AuthStatus {
+        if provider == pa_ai::antigravity::ANTIGRAVITY_PROVIDER && self.local_cli.antigravity {
+            return crate::auth::types::AuthStatus {
+                configured: true,
+                source: Some(crate::auth::types::AuthSource::Environment),
+                label: Some("Antigravity CLI".to_string()),
+            };
+        }
+        if provider == pa_ai::claude_cli::ANTHROPIC_PROVIDER && self.anthropic_uses_claude_cli() {
+            return crate::auth::types::AuthStatus {
+                configured: true,
+                source: Some(crate::auth::types::AuthSource::Environment),
+                label: Some("Claude Code CLI".to_string()),
+            };
+        }
         self.auth.get_auth_status(provider)
     }
 
@@ -383,6 +457,13 @@ impl ModelRegistry {
                 }
             }
         }
+        if self.anthropic_uses_claude_cli() {
+            for model in &mut self.models {
+                if model.provider == pa_ai::claude_cli::ANTHROPIC_PROVIDER {
+                    model.api = pa_ai::claude_cli::CLAUDE_CLI_API.to_string();
+                }
+            }
+        }
     }
 
     fn load_custom_models_file(&mut self, path: &Path) -> CustomModelsResult {
@@ -400,8 +481,17 @@ impl ModelRegistry {
         };
         let mut result = load_custom_models(
             &content,
-            &|provider| !pa_ai::models_generated::get_models(provider).is_empty(),
             &|provider| {
+                provider == pa_ai::antigravity::ANTIGRAVITY_PROVIDER
+                    || !pa_ai::models_generated::get_models(provider).is_empty()
+            },
+            &|provider| {
+                if provider == pa_ai::antigravity::ANTIGRAVITY_PROVIDER {
+                    return Some((
+                        pa_ai::antigravity::ANTIGRAVITY_API.to_string(),
+                        "antigravity://local".to_string(),
+                    ));
+                }
                 pa_ai::models_generated::get_models(provider)
                     .first()
                     .map(|model| (model.api.clone(), model.base_url.clone()))
@@ -481,8 +571,18 @@ impl ModelRegistry {
         custom: &CustomModelsResult,
         credentials: Option<&pa_models::PrimeCredentials>,
     ) -> Vec<Model> {
-        self.catalog
-            .resolve(credentials)
+        let mut resolved = self.catalog.resolve(credentials);
+        if self.local_cli.antigravity {
+            for agy_model in pa_ai::antigravity::models() {
+                if !resolved
+                    .iter()
+                    .any(|m| m.provider == agy_model.provider && m.id == agy_model.id)
+                {
+                    resolved.push(agy_model);
+                }
+            }
+        }
+        resolved
             .into_iter()
             .map(|mut model| {
                 if let Some(provider_override) = custom.provider_overrides.get(&model.provider) {
@@ -552,6 +652,10 @@ impl ModelRegistry {
         self.catalog
             .refresh_with_credentials(force, credentials.as_ref())
             .await;
+        if self.local_cli.antigravity {
+            let _ = tokio::task::spawn_blocking(move || pa_ai::antigravity::refresh_models(force))
+                .await;
+        }
         self.load_models();
         self.get_available().into_iter().cloned().collect()
     }
@@ -562,6 +666,17 @@ impl ModelRegistry {
         model: &Model,
         request_headers: Option<&BTreeMap<String, String>>,
     ) -> ResolvedRequestAuth {
+        if model.api == pa_ai::claude_cli::CLAUDE_CLI_API
+            || model.api == pa_ai::antigravity::ANTIGRAVITY_API
+        {
+            return ResolvedRequestAuth {
+                ok: true,
+                api_key: None,
+                headers: request_headers.cloned().filter(|h| !h.is_empty()),
+                error: None,
+                request_model: None,
+            };
+        }
         let stored = self
             .auth
             .get_api_key_with_source_token(&model.provider, false);

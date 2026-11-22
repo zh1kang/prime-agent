@@ -52,6 +52,10 @@ pub(crate) mod sessions_table_format;
 pub(crate) mod skills_command;
 pub(crate) mod subscription_login;
 pub(crate) mod telemetry_notice;
+mod thread_command;
+mod thread_runtime;
+mod thread_tools;
+mod thread_workspace;
 pub(crate) mod traces_login;
 
 /// The runtime boundary: everything a mode-runner crate implements to plug
@@ -112,6 +116,11 @@ fn main_impl(args: &[String], runtime: &dyn mode::Runtime) -> Result<i32, String
 
     // Public command routing: help requests, removed commands, management
     // commands, and the model/session rewrites.
+    if args.first().is_some_and(|arg| arg == "thread") {
+        crate::config::require_agent_dir()?;
+        thread_command::run(&args[1..]).map_err(|e| format!("{e:#}"))?;
+        return Ok(0);
+    }
     let public_command = public_command::handle_public_command(args);
     if public_command.handled {
         return Ok(public_command.exit_code.unwrap_or(0));

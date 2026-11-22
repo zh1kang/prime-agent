@@ -132,6 +132,47 @@ pub fn stream_anthropic(
     let context = context.clone();
     let (writer, reader) = create_assistant_message_event_stream();
 
+    let resolved_key = options
+        .as_ref()
+        .and_then(|opt| opt.base.api_key.clone())
+        .or_else(|| get_env_api_key(&model.provider));
+    if resolved_key
+        .as_deref()
+        .is_some_and(crate::providers::anthropic::is_oauth_token)
+        || (resolved_key.is_none()
+            && model.provider == crate::providers::claude_cli::ANTHROPIC_PROVIDER
+            && crate::providers::claude_cli::is_available())
+    {
+        let base = options
+            .as_ref()
+            .map(|opt| opt.base.clone())
+            .unwrap_or_default();
+        let reasoning = options
+            .as_ref()
+            .and_then(|opt| opt.effort)
+            .map(|effort| match effort {
+                crate::providers::anthropic::AnthropicEffort::Low => {
+                    crate::types::ModelThinkingLevel::Low
+                }
+                crate::providers::anthropic::AnthropicEffort::Medium => {
+                    crate::types::ModelThinkingLevel::Medium
+                }
+                crate::providers::anthropic::AnthropicEffort::High => {
+                    crate::types::ModelThinkingLevel::High
+                }
+                crate::providers::anthropic::AnthropicEffort::Xhigh => {
+                    crate::types::ModelThinkingLevel::Xhigh
+                }
+                crate::providers::anthropic::AnthropicEffort::Max => {
+                    crate::types::ModelThinkingLevel::Max
+                }
+            });
+        tokio::spawn(async move {
+            crate::providers::claude_cli::run_stream(writer, model, context, base, reasoning).await;
+        });
+        return reader;
+    }
+
     tokio::spawn(async move {
         let mut output = AssistantMessage {
             content: Vec::new(),

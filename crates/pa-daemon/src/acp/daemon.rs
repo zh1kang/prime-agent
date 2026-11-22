@@ -1705,6 +1705,9 @@ fn prompt_block_error(id: &Value, error: &types::PromptBlockError) -> Value {
 }
 
 /// Run one admitted prompt turn and return its reply frame.
+/// The custom type of a host's hidden per-turn context row.
+const HIDDEN_CONTEXT_CUSTOM_TYPE: &str = "hidden_context";
+
 async fn prompt_turn(
     id: Value,
     params: Value,
@@ -1734,6 +1737,37 @@ async fn prompt_turn(
     if cancelled {
         producer.finish_prompt(turn_id).await;
         return cancelled_response(&id);
+    }
+    if let Some(context) = &params.hidden_context {
+        // The worker replays parked rows at the start of its next delivered turn, before
+        // the accepted prompt; the row persists hidden and reaches the model as context.
+        let row = json!({
+            "role": "custom",
+            "customType": HIDDEN_CONTEXT_CUSTOM_TYPE,
+            "content": context,
+            "display": false,
+            "timestamp": 0,
+        });
+        let park = DaemonCommand::RestoreNextTurn {
+            id: None,
+            active_session_id: hosted_daemon_session_id.clone(),
+            messages: vec![serde_json::from_value(row).expect("a custom row parses")],
+            rest: Map::default(),
+        };
+        match link.request(park).await {
+            Ok(response) if response.success => {}
+            Ok(response) => {
+                producer.finish_prompt(turn_id).await;
+                let failure = response
+                    .error
+                    .unwrap_or_else(|| "unknown error".to_string());
+                return super::turn_failure_error(&id, &failure, &failure);
+            }
+            Err(error) => {
+                producer.finish_prompt(turn_id).await;
+                return super::turn_failure_error(&id, &error.to_string(), &error.to_string());
+            }
+        }
     }
     let prompt = DaemonCommand::PromptAndWait {
         id: None,
