@@ -207,12 +207,19 @@ fn captain_resume_selection_carries_draft_and_factory_panel() {
     let selection = SessionSelection::ResumeWith {
         path: "/tmp/project/session.jsonl".into(),
         draft: Some("Continue the migration".into()),
-        panel: Some(crate::interactive::SessionPanel::FactoryRuns { row: None }),
+        panel: Some(crate::interactive::SessionPanel::FactoryRuns {
+            row: None,
+            node: None,
+        }),
     };
     let SessionSelection::ResumeWith {
         path,
         draft,
-        panel: Some(crate::interactive::SessionPanel::FactoryRuns { row: None }),
+        panel:
+            Some(crate::interactive::SessionPanel::FactoryRuns {
+                row: None,
+                node: None,
+            }),
     } = selection
     else {
         panic!("Captain handoff lost resume metadata");

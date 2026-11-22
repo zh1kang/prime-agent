@@ -1140,6 +1140,9 @@ own roster previews cap at 160 characters, ``compactRlmText``).
 """
 
 ANSWER_BINDING_CAP = 65_536
+NODE_PROMPT_CAP = 65_536
+NODE_INPUTS_CAP = 16_384
+NODE_OUTPUTS_CAP = 16_384
 """Local cap for the settle-capture binding lane, at parity with the
 host's collect bound (the daemon's ANSWER_TEXT_MAX_CHARS: 65,536
 characters).
@@ -1215,16 +1218,6 @@ the machine library's list/graph reads, ``node`` inspection, and ``peek`` —
 the unscoped graph minus the rehydration re-arm, the read another session's
 display polls through (the kernel namespace is the same surface plus
 ``graph``/``watch`` for agents)."""
-
-NODE_PROMPT_CAP = 65_536
-"""Byte cap on one ``node`` reply's realized prompt (the exact spawn text
-the child received), with ``promptTruncated`` set when it fires."""
-
-NODE_INPUTS_CAP = 16_384
-"""Byte cap on one ``node`` reply's serialized bound inputs."""
-
-NODE_OUTPUTS_CAP = 16_384
-"""Byte cap on one ``node`` reply's serialized settle outputs."""
 
 ACTIVITY_TIMEOUT_MS_CAP = int(WATCH_TIMEOUT_CAP_SECONDS * 1000)
 """Upper bound on one factory_activity frame's timeoutMs (the watch wait
@@ -1880,6 +1873,9 @@ class _NodeInstance:
     spawned_at: float | None = None
     duration_ms: int | None = None
     answer: str | None = None  # the binding lane's captured answer (ANSWER_BINDING_CAP)
+    answer_truncated: bool = False  # the capture clipped a longer answer at
+    # ANSWER_BINDING_CAP; the node report flags it instead of inferring it
+    # from the already-capped text
     provisional: bool = False  # the answer came from a child EXIT, not a
     # settle: the state reads needs-verify instead of silently counting the
     # exit's last assistant text as delivered work (the M4 class).
@@ -3640,9 +3636,10 @@ class FactoryExecutor:
         instance_at: int | None = None,
     ) -> dict[str, Any]:
         """One state's node document (the ``node`` lane's reply): the
-        state's live report (the instance list), the selected entry's
-        settle-output preview, and the selected instance's realized prompt,
-        inputs, and answer — capped and flagged, never silently truncated.
+        state's live report (the instance list) and prompt template,
+        the selected entry's settle-output preview, and the selected
+        instance's realized prompt, inputs, and answer — capped and
+        flagged, never silently truncated.
         Stored settle outputs remain full. The default selection is the
         latest entry and its latest instance, or no instance for an empty
         entry, or neither for a state never entered; selectors pick any
@@ -3652,6 +3649,14 @@ class FactoryExecutor:
         if state is None:
             raise ValueError(f"unknown state {state_id!r} in run {run_id!r}")
         entries = state.entries
+        template = state.prompt_template
+        template_truncated = False
+        if template is not None:
+            template_truncated = len(template.encode("utf-8")) > NODE_PROMPT_CAP
+            if template_truncated:
+                template = template.encode("utf-8")[:NODE_PROMPT_CAP].decode(
+                    "utf-8", errors="ignore"
+                )
         if not entries:
             if entry_at is not None:
                 raise ValueError(
@@ -3661,6 +3666,8 @@ class FactoryExecutor:
                 "run_id": run.run_id,
                 "spec_id": run.spec_id,
                 "name": run.name,
+                "template": template,
+                "template_truncated": template_truncated,
                 "state": self._state_report(state, include_answer=False),
                 "entry": None,
                 "instance": None,
@@ -3698,14 +3705,11 @@ class FactoryExecutor:
                 inputs_text = inputs_text.encode("utf-8")[:NODE_INPUTS_CAP].decode(
                     "utf-8", errors="ignore"
                 )
+        # The capture caps the answer at ANSWER_BINDING_CAP and records
+        # whether it clipped a longer one; the stored text cannot answer
+        # that itself.
         answer = instance.answer if instance is not None else None
-        answer_truncated = bool(
-            answer and len(answer.encode("utf-8")) > ANSWER_BINDING_CAP
-        )
-        if answer_truncated and answer is not None:
-            answer = answer.encode("utf-8")[:ANSWER_BINDING_CAP].decode(
-                "utf-8", errors="ignore"
-            )
+        answer_truncated = instance.answer_truncated if instance is not None else False
         outputs_text = None
         outputs_truncated = False
         if entry.outputs is not None:
@@ -3740,6 +3744,8 @@ class FactoryExecutor:
             "run_id": run.run_id,
             "spec_id": run.spec_id,
             "name": run.name,
+            "template": template,
+            "template_truncated": template_truncated,
             "state": self._state_report(state, include_answer=False),
             "entry": {
                 "index": entry.index,
@@ -5362,7 +5368,9 @@ class FactoryExecutor:
             if entry.status != "running":
                 return
         instance.status = "done"
-        instance.answer = json.dumps(outputs, separators=(",", ":"))[:ANSWER_BINDING_CAP]
+        answer = json.dumps(outputs, separators=(",", ":"))
+        instance.answer_truncated = len(answer) > ANSWER_BINDING_CAP
+        instance.answer = answer[:ANSWER_BINDING_CAP]
         self._event(
             run,
             "settled",
@@ -5434,11 +5442,11 @@ class FactoryExecutor:
             # died without reporting; the answer is preserved on the
             # instance and the state reads needs-verify instead of silently
             # counting the exit as settled work.
-            exit_answer = (
-                (result.answer_text or result.answer_preview or "")[:ANSWER_BINDING_CAP] or None
-            )
+            captured = result.answer_text or result.answer_preview or ""
+            exit_answer = captured[:ANSWER_BINDING_CAP] or None
             if exit_answer:
                 instance.answer = exit_answer
+                instance.answer_truncated = len(captured) > ANSWER_BINDING_CAP
                 instance.provisional = True
                 instance.capture_failed = False  # the preserved text is an exit now
             # Child failures retry (same rendered prompt, attempts+1) while
@@ -5477,9 +5485,9 @@ class FactoryExecutor:
         # keeps the whole fenced JSON; the 160-character roster preview is
         # the fallback (older hosts, a capture that raced a worker
         # teardown). Both are capped locally at ANSWER_BINDING_CAP.
-        instance.answer = (
-            (result.answer_text or result.answer_preview or "")[:ANSWER_BINDING_CAP] or None
-        )
+        captured = result.answer_text or result.answer_preview or ""
+        instance.answer_truncated = len(captured) > ANSWER_BINDING_CAP
+        instance.answer = captured[:ANSWER_BINDING_CAP] or None
         instance.provisional = False  # a real settle supersedes any exit capture
         instance.capture_failed = False
         self._event(
@@ -5965,10 +5973,16 @@ class FactoryExecutor:
                 result = by_child.get(instance.child_id or "")
                 if result is None:
                     continue
-                answer = (result.answer_text or result.answer_preview or "")[:ANSWER_BINDING_CAP] or None
+                captured = result.answer_text or result.answer_preview or ""
+                answer = captured[:ANSWER_BINDING_CAP] or None
                 if answer and (instance.answer is None or len(answer) > len(instance.answer)):
                     instance.answer = answer
                     changed = True
+                # The reported text cannot say whether it was clipped: the
+                # capture that produced it owns the flag, so a longer source
+                # with the same capped prefix still flags.
+                if answer and instance.answer == answer:
+                    instance.answer_truncated = len(captured) > ANSWER_BINDING_CAP
             if changed:
                 entry.answer = self._entry_answer(entry)
             missing = any(

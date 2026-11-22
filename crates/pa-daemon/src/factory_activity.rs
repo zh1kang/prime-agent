@@ -51,7 +51,9 @@ pub(crate) fn stored_factory_spec_count(session_artifact_dir: &Path) -> usize {
 pub(crate) fn advertised_server_capabilities(agent_dir: &Path) -> Vec<String> {
     let mut capabilities = crate::protocol::default_server_capabilities();
     if !factory_lane_enabled(agent_dir) {
-        capabilities.retain(|capability| capability != "factory_activity");
+        capabilities.retain(|capability| {
+            capability != "factory_activity" && capability != "factory_node_activity"
+        });
     }
     capabilities
 }
@@ -168,7 +170,7 @@ impl Worker {
                                 "factory_activity",
                                 &format!("{error:#}"),
                                 None,
-                            )
+                            );
                         }
                     }
                 }
@@ -202,6 +204,71 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn malformed_explicit_node_selectors_are_rejected_before_kernel_dispatch() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).expect("sessions dir");
+        let worker = Worker::new(
+            crate::worker::WorkerConfig {
+                socket_path: dir.path().join("worker.sock"),
+                supervisor_socket_path: std::path::PathBuf::new(),
+                token: "token".to_string(),
+                worker_instance_id: String::new(),
+                active_session_id: "malformed-selectors".to_string(),
+                agent_dir: dir.path().join("agent"),
+                recovery_journal_path: dir.path().join("recovery.jsonl"),
+                telemetry_disabled: Some(true),
+                script: Some(serde_json::json!({ "responses": [] })),
+            },
+            None,
+        );
+        let created = worker
+            .dispatch(
+                "create",
+                &serde_json::json!({ "cwd": "/tmp", "sessionDir": sessions }),
+            )
+            .await;
+        assert!(created.success, "{created:?}");
+
+        let cases = [
+            (
+                "null pair",
+                serde_json::json!({ "action": "node", "entry": null, "instance": null }),
+                "factory activity node entry must be a non-negative integer",
+            ),
+            (
+                "malformed entry",
+                serde_json::json!({ "action": "node", "entry": "0", "instance": 0 }),
+                "factory activity node entry must be a non-negative integer",
+            ),
+            (
+                "malformed instance",
+                serde_json::json!({ "action": "node", "entry": 0, "instance": -1 }),
+                "factory activity node instance must be a non-negative integer",
+            ),
+            (
+                "entry without instance",
+                serde_json::json!({ "action": "node", "entry": 0 }),
+                "factory activity node entry and instance selectors must be provided together",
+            ),
+            (
+                "instance without entry",
+                serde_json::json!({ "action": "node", "instance": 0 }),
+                "factory activity node entry and instance selectors must be provided together",
+            ),
+        ];
+        for (label, payload, expected_error) in cases {
+            let response = worker.dispatch("factory_activity", &payload).await;
+            assert_eq!(
+                response.error.as_deref(),
+                Some(expected_error),
+                "{label}: {response:?}"
+            );
+        }
+        let _ = worker.dispatch("kill", &serde_json::json!({})).await;
+    }
 
     /// A live session without a kernel (not booted yet, or passivated) still answers the unscoped
     /// graph: no runs, and its own stored specs from its local harness store — never the global
@@ -277,71 +344,6 @@ mod tests {
         let _ = worker.dispatch("kill", &serde_json::json!({})).await;
     }
 
-    #[tokio::test]
-    async fn malformed_explicit_node_selectors_are_rejected_before_kernel_dispatch() {
-        let dir = tempfile::TempDir::new().expect("temp dir");
-        let sessions = dir.path().join("sessions");
-        std::fs::create_dir_all(&sessions).expect("sessions dir");
-        let worker = Worker::new(
-            crate::worker::WorkerConfig {
-                socket_path: dir.path().join("worker.sock"),
-                supervisor_socket_path: std::path::PathBuf::new(),
-                token: "token".to_string(),
-                worker_instance_id: String::new(),
-                active_session_id: "malformed-selectors".to_string(),
-                agent_dir: dir.path().join("agent"),
-                recovery_journal_path: dir.path().join("recovery.jsonl"),
-                telemetry_disabled: Some(true),
-                script: Some(serde_json::json!({ "responses": [] })),
-            },
-            None,
-        );
-        let created = worker
-            .dispatch(
-                "create",
-                &serde_json::json!({ "cwd": "/tmp", "sessionDir": sessions }),
-            )
-            .await;
-        assert!(created.success, "{created:?}");
-
-        let cases = [
-            (
-                "null pair",
-                serde_json::json!({ "action": "node", "entry": null, "instance": null }),
-                "factory activity node entry must be a non-negative integer",
-            ),
-            (
-                "malformed entry",
-                serde_json::json!({ "action": "node", "entry": "0", "instance": 0 }),
-                "factory activity node entry must be a non-negative integer",
-            ),
-            (
-                "malformed instance",
-                serde_json::json!({ "action": "node", "entry": 0, "instance": -1 }),
-                "factory activity node instance must be a non-negative integer",
-            ),
-            (
-                "entry without instance",
-                serde_json::json!({ "action": "node", "entry": 0 }),
-                "factory activity node entry and instance selectors must be provided together",
-            ),
-            (
-                "instance without entry",
-                serde_json::json!({ "action": "node", "instance": 0 }),
-                "factory activity node entry and instance selectors must be provided together",
-            ),
-        ];
-        for (label, payload, expected_error) in cases {
-            let response = worker.dispatch("factory_activity", &payload).await;
-            assert_eq!(
-                response.error.as_deref(),
-                Some(expected_error),
-                "{label}: {response:?}"
-            );
-        }
-        let _ = worker.dispatch("kill", &serde_json::json!({})).await;
-    }
-
     /// The opt-in default: no settings file, no factory lane.
     #[test]
     fn the_factory_lane_stays_unadvertised_until_enabled() {
@@ -350,6 +352,9 @@ mod tests {
         std::fs::create_dir_all(&agent_dir).expect("agent dir");
 
         let disabled = advertised_server_capabilities(&agent_dir);
+        assert!(!disabled
+            .iter()
+            .any(|capability| capability == "factory_node_activity"));
         assert!(
             !disabled
                 .iter()
@@ -366,6 +371,9 @@ mod tests {
         )
         .expect("write settings");
         let enabled = advertised_server_capabilities(&agent_dir);
+        assert!(enabled
+            .iter()
+            .any(|capability| capability == "factory_node_activity"));
         assert!(
             enabled
                 .iter()
@@ -382,6 +390,9 @@ mod tests {
         )
         .expect("write settings");
         let disabled_again = advertised_server_capabilities(&agent_dir);
+        assert!(!disabled_again
+            .iter()
+            .any(|capability| capability == "factory_node_activity"));
         assert!(
             !disabled_again
                 .iter()
