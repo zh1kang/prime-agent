@@ -62,7 +62,7 @@ outputs = { done = "text" }
 emit = lambda port, value: {"content": [{"type": "toolCall", "name": "python_repl", "arguments": {"code": f"await rlm.factory.emit({port}={value!r})"}}]}
 CHILDREN = {
     "sw-review-*": {"responses": [emit("finding", "No issues in parser"), "Emitted."]},
-    "sw-check-*": {"responses": ["I could not verify the tree."]},
+    "sw-check-*": {"responses": ["I could not verify the tree.", "Still could not verify the tree."]},
     "sw-check-*-a2": {"responses": [emit("verdict", "verified"), "Emitted."]},
 }
 

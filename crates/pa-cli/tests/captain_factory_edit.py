@@ -5,7 +5,18 @@ import json, os, pathlib, subprocess, sys
 exe = sys.argv[1]
 r = pathlib.Path(sys.argv[2]).resolve()
 a = r / "alpha"; a.mkdir(); agent = r / "agent"; agent.mkdir()
-env = dict(os.environ, PRIME_AGENT_CODING_AGENT_DIR=str(agent), PA_CAPTAIN_HOME=str(agent), PRIME_AGENT_DAEMON_SOCKET=str(r / "d.sock"))
+env = dict(
+    os.environ,
+    PRIME_AGENT_CODING_AGENT_DIR=str(agent),
+    PA_CAPTAIN_HOME=str(agent),
+    PA_CAPTAIN_NATIVE_HOME=str(agent),
+    PRIME_AGENT_DAEMON_SOCKET=str(r / "d.sock"),
+    PA_CAPTAIN_NATIVE_SOCKET=str(r / "d.sock"),
+    PRIME_AGENT_FAUX_SCRIPT=json.dumps({"responses": ["Captain received the brief."]}),
+    DO_NOT_TRACK="1",
+)
+for key in ("PRIME_AGENT_KERNEL_PYTHON", "PA_CAPTAIN_ACTOR", "PA_CAPTAIN_SESSION"):
+    env.pop(key, None)
 subprocess.check_call(["git", "-C", str(a), "init", "-q"])
 pf = a / ".prime/machines/proj-build"; (pf / "nodes").mkdir(parents=True)
 toml = ('format = 1\nname = "proj-build"\nversion = 1\ndescription = "Write a marker."\n'
@@ -39,4 +50,5 @@ assert factory()["state"] == "changed", factory()
 print("project factory edit: saved, digest changed, state", factory()["state"])
 assert fsm("draft", name="../x", project=str(a))[0] == "ERR"
 assert fsm("draft", name="nope", project=str(a))[0] == "ERR"
+act("stop", project=pid)
 print("ok")

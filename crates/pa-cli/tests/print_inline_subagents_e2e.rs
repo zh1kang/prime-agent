@@ -468,12 +468,6 @@ fn print_inline_subagents_enforce_the_depth_limit() {
     );
 }
 
-/// A settled child re-tasked by its parent must keep the run open: the
-/// parent sends the follow-up, ends its turn, and the print run waits
-/// for the re-tasked child's second reply before the terminal answer.
-/// The quiescence predicate reads the child's live session state (the
-/// queued follow-up row), so the run cannot exit while the row sits in
-/// the settled child's steering lane.
 /// A factory state's child in print mode: the spawn's run tag carries the
 /// state's output contract, so the inline child's `rlm.factory.emit`
 /// checks the value and writes the accepted outputs beside its session
@@ -539,6 +533,81 @@ fn print_inline_factory_child_emits_through_its_contract() {
     assert_eq!(outputs, serde_json::json!({"line": "about tides"}));
 }
 
+/// A settled factory child's collect reports its task work idle: the inline
+/// settle already waits out background bash, so the executor need not pause
+/// the run as unverified. An ordinary child carries no task-activity flag.
+#[test]
+fn print_inline_collect_reports_a_settled_factory_child_idle() {
+    let lane = lane();
+    let kernel = PrintLane::kernel_python();
+    let cell = "from rlm import _spawn\n\
+        f = await _spawn(\"finish the state\", name=\"stater\", \
+        factory={\"runId\": \"run-1\", \"specId\": \"spec\", \"stateId\": \"plan\"})\n\
+        p = await rlm.spawn(\"finish the task\", name=\"plain\")\n\
+        done = await rlm.collect([f, p], timeout_ms=60000)\n\
+        print(\"TASK_BUSY\", [(r.settled, r.factory_task_busy) for r in done])";
+    let script = serde_json::json!({
+        "responses": [
+            { "content": [
+                { "type": "toolCall", "name": "ipython", "arguments": { "code": cell } },
+            ] },
+            "PARENT DONE",
+        ],
+        "repeatLastResponse": true,
+        "children": {
+            "stater": { "responses": ["state finished"] },
+            "plain": { "responses": ["task finished"] },
+        },
+    });
+    let (stdout, stderr, code) = lane.run(&["-p", "collect the children"], &script, &kernel, &[]);
+    assert_eq!(code, 0, "stderr: {stderr}\nstdout: {stdout}");
+    let parent_text =
+        serde_json::to_string(&PrintLane::entries(&lane.parent_session_file())).unwrap();
+    assert!(
+        parent_text.contains("TASK_BUSY [(True, False), (True, None)]"),
+        "the settled factory child reads idle and the plain child carries no flag: {parent_text}"
+    );
+}
+
+/// A print session's children live in its own process, so its factory runs
+/// end with it: resuming a run this process did not start refuses and names
+/// the daemon path.
+#[test]
+fn print_factory_resume_refuses_a_run_this_process_did_not_start() {
+    let lane = lane();
+    let kernel = PrintLane::kernel_python();
+    std::fs::write(
+        lane.agent_dir.join("settings.json"),
+        r#"{"factory": {"enabled": true}}"#,
+    )
+    .unwrap();
+    let cell = "try:\n    await rlm.factory.resume(\"run-from-an-earlier-process\")\n\
+        except ValueError as error:\n    print(\"REFUSED\", error)";
+    let script = serde_json::json!({
+        "responses": [
+            { "content": [
+                { "type": "toolCall", "name": "ipython", "arguments": { "code": cell } },
+            ] },
+            "PARENT DONE",
+        ],
+        "repeatLastResponse": true,
+    });
+    let (stdout, stderr, code) = lane.run(&["-p", "resume the run"], &script, &kernel, &[]);
+    assert_eq!(code, 0, "stderr: {stderr}\nstdout: {stdout}");
+    let parent_text =
+        serde_json::to_string(&PrintLane::entries(&lane.parent_session_file())).unwrap();
+    assert!(
+        parent_text.contains("REFUSED") && parent_text.contains("run machines under the daemon"),
+        "the print host refuses the resume and names the daemon: {parent_text}"
+    );
+}
+
+/// A settled child re-tasked by its parent must keep the run open: the
+/// parent sends the follow-up, ends its turn, and the print run waits
+/// for the re-tasked child's second reply before the terminal answer.
+/// The quiescence predicate reads the child's live session state (the
+/// queued follow-up row), so the run cannot exit while the row sits in
+/// the settled child's steering lane.
 #[test]
 fn print_inline_subagents_wait_for_a_retasked_child() {
     let lane = lane();
