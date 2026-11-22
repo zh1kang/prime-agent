@@ -1102,7 +1102,8 @@ impl SessionEngine {
     }
 
     /// One factory activity over this session's live kernel: the `/factory`
-    /// view's bridge lane (graph/status/watch/run/stop/resume). A `run`
+    /// view's bridge lane (graph/status/watch/run/stop/resume, plus the
+    /// arming-free `peek` the all-session overview polls through). A `run`
     /// prefights the spec's declared models first (allowlist pin, request
     /// auth) so a doomed run fails before any child spawns; then the
     /// out-of-band frame carries the request into the kernel's executor,
@@ -1119,6 +1120,8 @@ impl SessionEngine {
         run_id: Option<&str>,
         spec_id: Option<&str>,
         timeout_ms: Option<u64>,
+        entry: Option<u64>,
+        instance: Option<u64>,
     ) -> anyhow::Result<serde_json::Value> {
         let request = super::factory_host::FactoryActivityRequest::parse(
             action, run_id, spec_id, timeout_ms,
@@ -1150,6 +1153,8 @@ impl SessionEngine {
                 request.run_id.as_deref(),
                 request.spec_id.as_deref(),
                 request.timeout_ms,
+                entry,
+                instance,
             )
             .await
     }
