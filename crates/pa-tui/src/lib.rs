@@ -36,6 +36,7 @@ pub mod bash_bang;
 pub mod bash_card;
 pub mod bash_view;
 pub(crate) mod branch;
+pub mod brand;
 pub(crate) mod browser;
 pub(crate) mod captain_view;
 pub mod chat;

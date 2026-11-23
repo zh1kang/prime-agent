@@ -8,17 +8,6 @@ use serde_json::Value;
 
 use crate::theme::{Theme, ThemeBg, ThemeColor};
 
-/// The compact 7-row brand butterfly.
-pub const PRIME_COMPACT_BUTTERFLY_LOGO: &str = concat!(
-    "                 \u{2597}\u{2584}\u{2584}\u{2588}\u{2580}\n",
-    "   \u{2588}\u{2588}\u{2588}\u{2584}       \u{2597}\u{2584}\u{2588}\u{2588}\u{2588}\u{2580}\n",
-    "  \u{2597}\u{2588}\u{259b}\u{2590}\u{2588}\u{2599}   \u{2597}\u{2584}\u{2588}\u{2580}\u{2597}\u{2588}\u{2580}\n",
-    " \u{2597}\u{2588}\u{259b} \u{259f}\u{2588}\u{2588}\u{2599}\u{2584}\u{2588}\u{2588}\u{259b} \u{259f}\u{259b}\n",
-    " \u{2597}\u{259f}\u{258c} \u{2590}\u{2588}\u{2588}\u{2588}\u{259b}\u{2598}\u{2597}\u{2584}\u{2588}\u{2596}\n",
-    "\u{259f}\u{2588}\u{2588}\u{2588}\u{2584}  \u{2584}\u{2584}\u{259f}\u{2588}\u{2588}\u{2588}\u{2580}\n",
-    "\u{259c}\u{2588}\u{259b}\u{2580}\u{2598}  \u{259c}\u{2588}\u{259b}\u{2580}\u{2598}",
-);
-
 /// Truncate a plain string to a visible width (cut on grapheme
 /// boundaries, appending the ellipsis).
 fn truncate_to_width(value: &str, max_width: usize, ellipsis: &str) -> String {
@@ -41,7 +30,7 @@ fn truncate_to_width(value: &str, max_width: usize, ellipsis: &str) -> String {
 /// Where a session runs; drives labels that depend on persistence.
 #[derive(Debug, Clone, Default)]
 pub struct ChromeState {
-    /// Product version shown in the splash (`prime agent vX`).
+    /// Product version shown in the splash (`radiata vX`).
     pub version: String,
     /// Session working directory (splash `cwd` line; `~`-compressed).
     pub cwd: String,
@@ -85,6 +74,86 @@ pub struct ChromeState {
     /// Hide the splash `cwd` line (the scoped agents view keeps its
     /// metadata rows centered against the logo).
     pub splash_hide_cwd: bool,
+    /// The view's navigation memory: the dock's Captain sub-row selection,
+    /// where the open overlay was launched from, and each chat's scroll
+    /// position across in-place switches.
+    pub nav: NavMemory,
+}
+
+/// Navigation state that outlives one overlay or one attached session.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NavMemory {
+    /// The selected `⚓ captain` sub-row while the expanded dock holds focus;
+    /// `None` selects a group row.
+    pub dock_captain_item: Option<usize>,
+    /// The open overlay was launched from the activity dock: its close hands
+    /// focus back to the expanded dock instead of the editor.
+    pub opened_from_dock: bool,
+    /// The session whose transcript the view currently renders.
+    pub transcript_session: Option<String>,
+    /// Each session's paused reader position (`(entry, row)`), keyed by session id; a
+    /// following session has no entry.
+    pub session_scroll: std::collections::HashMap<String, (usize, usize)>,
+}
+
+impl NavMemory {
+    /// Swap the transcript to `session`: remember the outgoing session's reader position and
+    /// return the incoming one's saved position, if any. The same session keeps its place.
+    pub fn switch_transcript(
+        &mut self,
+        session: &str,
+        outgoing: Option<(usize, usize)>,
+    ) -> Option<(usize, usize)> {
+        if self.transcript_session.as_deref() == Some(session) {
+            return None;
+        }
+        if let Some(previous) = self.transcript_session.take() {
+            match outgoing {
+                Some(position) => {
+                    self.session_scroll.insert(previous, position);
+                }
+                None => {
+                    self.session_scroll.remove(&previous);
+                }
+            }
+        }
+        self.transcript_session = Some(session.to_string());
+        self.session_scroll.get(session).copied()
+    }
+}
+
+/// The expanded dock's keyboard selection: a group row, or one of the
+/// selectable sub-rows under `⚓ captain` (by index into its active items).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DockSelection {
+    Group(ActivityGroup),
+    CaptainItem(usize),
+}
+
+impl Default for DockSelection {
+    fn default() -> Self {
+        Self::Group(ActivityGroup::default())
+    }
+}
+
+impl DockSelection {
+    /// The group that owns this selection (a Captain sub-row belongs to the Captain group).
+    #[must_use]
+    pub fn group(self) -> ActivityGroup {
+        match self {
+            Self::Group(group) => group,
+            Self::CaptainItem(_) => ActivityGroup::Captain,
+        }
+    }
+
+    /// The Captain sub-row index, if this selects one.
+    #[must_use]
+    pub fn captain_item(self) -> Option<usize> {
+        match self {
+            Self::Group(_) => None,
+            Self::CaptainItem(index) => Some(index),
+        }
+    }
 }
 
 /// Which actionable group owns the dock's selection. Every group is
@@ -101,6 +170,11 @@ pub enum ActivityGroup {
     /// opens the factory page over the lane — the same navigation family
     /// as the subagents, heartbeats, and shells pages.
     Factory,
+    /// The project Captain: renders only when the current project has a
+    /// Captain, fed from the Captain backend's atomic status file (no
+    /// subprocess per tick), and opens the Captain panel (F6) for this
+    /// project.
+    Captain,
     /// The machine library page: every library machine listed, one drill-in
     /// per machine. Its group rides the factory group's exact gate (the
     /// same `factory_activity` advertisement — the library is the
@@ -120,6 +194,32 @@ pub enum ActivityDirection {
     Prev,
     /// The next group, wrapping past the last.
     Next,
+}
+
+/// One active crew member, factory run, or draft factory shown in the
+/// expanded Captain dock group.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CaptainDockActiveItem {
+    pub label: String,
+    pub kind: String,
+    pub state: String,
+    pub state_text: String,
+    pub step: Option<String>,
+}
+
+/// Summary of the current project's Captain for the bottom activity dock,
+/// read from `<hub>/captains/status/<project-id>.json`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CaptainDockState {
+    pub project_id: String,
+    pub name: String,
+    /// active, stopping, paused, or deleting.
+    pub state: String,
+    pub working: usize,
+    pub needs_you: usize,
+    pub factory_running: usize,
+    pub factory_paused: usize,
+    pub active: Vec<CaptainDockActiveItem>,
 }
 
 /// The bottom activity dock: it renders in every session, all-zero
@@ -171,6 +271,10 @@ pub struct ActivityDock {
     /// mounts no factory group anywhere: no row (the run page's or the
     /// machine library's), no traversal, no click, no page.
     pub factory_group: bool,
+    /// The current project's Captain summary: `None` when the current
+    /// project has no Captain, in which case `ActivityGroup::Captain`
+    /// does not render.
+    pub captain: Option<CaptainDockState>,
     /// The active goal's dock label — `Pursuing goal (12m 05s)`-style,
     /// the elapsed-time form (the operator's 2026-09-24 directive: the
     /// row reads the time, the token budget lives inside the goal
@@ -178,6 +282,9 @@ pub struct ActivityDock {
     /// completed or idle goal carries no dock segment).
     pub goal_label: Option<String>,
     pub selected: ActivityGroup,
+    /// The selected Captain sub-row when `selected` is the Captain group;
+    /// `None` highlights the group row itself.
+    pub captain_item: Option<usize>,
     pub focused: bool,
 }
 
@@ -203,6 +310,9 @@ impl ActivityDock {
         if self.factory_group {
             groups.push(ActivityGroup::Factory);
         }
+        if self.captain.is_some() {
+            groups.push(ActivityGroup::Captain);
+        }
         if self.goal_label.is_some() {
             groups.push(ActivityGroup::Goal);
         }
@@ -227,6 +337,84 @@ impl ActivityDock {
             ActivityDirection::Next => position + 1,
         };
         groups[neighbor % len]
+    }
+
+    /// The current selection: the selected group, or its Captain sub-row.
+    #[must_use]
+    pub fn selection(&self) -> DockSelection {
+        match self.captain_item {
+            Some(index)
+                if self.selected == ActivityGroup::Captain && index < self.captain_item_count() =>
+            {
+                DockSelection::CaptainItem(index)
+            }
+            _ => DockSelection::Group(self.selected),
+        }
+    }
+
+    /// How many `⚓ captain` sub-rows are selectable (the rendered ones; the
+    /// `+N more` marker is not).
+    #[must_use]
+    pub fn captain_item_count(&self) -> usize {
+        self.captain.as_ref().map_or(0, |captain| {
+            captain.active.len().min(EXPANDED_CAPTAIN_MAX_ROWS)
+        })
+    }
+
+    /// Every selectable row top to bottom: each group, with the Captain
+    /// group's sub-rows right under it.
+    #[must_use]
+    pub fn selections(&self) -> Vec<DockSelection> {
+        let mut rows = Vec::new();
+        for group in self.groups() {
+            rows.push(DockSelection::Group(group));
+            if group == ActivityGroup::Captain {
+                rows.extend((0..self.captain_item_count()).map(DockSelection::CaptainItem));
+            }
+        }
+        rows
+    }
+
+    /// One Up/Down step over [`Self::selections`], wrapping at the ends; a
+    /// `current` that no longer renders steps from the first row.
+    #[must_use]
+    pub fn step_selection(
+        &self,
+        current: DockSelection,
+        direction: ActivityDirection,
+    ) -> DockSelection {
+        let rows = self.selections();
+        let len = rows.len();
+        let position = rows.iter().position(|row| *row == current).unwrap_or(0);
+        let neighbor = match direction {
+            ActivityDirection::Prev => position + len - 1,
+            ActivityDirection::Next => position + 1,
+        };
+        rows[neighbor % len]
+    }
+
+    /// Fold the Captain's live and paused factory runs into the factory
+    /// group: the count, the paused cluster, and one `⚓ <run> <state>` item
+    /// each, so `⚙ N factory` covers the runs the Captain started too.
+    #[must_use]
+    pub fn with_captain_factory_runs(mut self) -> Self {
+        let Some(captain) = &self.captain else {
+            return self;
+        };
+        self.factory_counts.running += captain.factory_running;
+        self.factory_counts.paused += captain.factory_paused;
+        let mut runs: Vec<&CaptainDockActiveItem> = captain
+            .active
+            .iter()
+            .filter(|item| item.kind == "factory")
+            .collect();
+        runs.sort_by_key(|item| item.state != "paused");
+        let items: Vec<String> = runs
+            .iter()
+            .map(|item| format!("⚓ {} {}", dock_text(&item.label), dock_text(&item.state)))
+            .collect();
+        self.factory_runs.extend(items);
+        self
     }
 }
 
@@ -366,19 +554,36 @@ pub fn render_top_bar(state: &ChromeState, theme: &Theme, width: usize) -> Line 
     line
 }
 
-/// The brand splash: butterfly logo beside the version/model/cwd metadata
+/// One row of the brand mark as spans, one run per theme tone; blank cells carry no color.
+fn logo_spans(row: usize, line: &str, theme: &Theme) -> Vec<Span> {
+    let mut spans: Vec<Span> = Vec::new();
+    let mut run = String::new();
+    let mut tone: Option<ThemeColor> = None;
+    for (column, glyph) in line.chars().enumerate() {
+        let cell_tone = (glyph != ' ').then(|| crate::brand::logo_tone(row, column));
+        if cell_tone != tone && !run.is_empty() {
+            let style = tone.map_or_else(Style::default, |t| theme.fg_style(t));
+            spans.push(Span::styled(std::mem::take(&mut run), style));
+        }
+        tone = cell_tone;
+        run.push(glyph);
+    }
+    if !run.is_empty() {
+        let style = tone.map_or_else(Style::default, |t| theme.fg_style(t));
+        spans.push(Span::styled(run, style));
+    }
+    spans
+}
+
+/// The brand splash: the spider lily mark beside the version/model/cwd metadata
 /// (TS `BrandSplashHeader`, `topPadding` always on).
 #[must_use]
 pub fn render_splash(state: &ChromeState, theme: &Theme, width: usize) -> Vec<Line> {
     let safe_width = width.max(1);
     let padding_x = usize::from(safe_width > 1);
     let content_width = safe_width.saturating_sub(padding_x * 2).max(1);
-    let logo_raw: Vec<&str> = PRIME_COMPACT_BUTTERFLY_LOGO.split('\n').collect();
-    let logo_canvas_width = logo_raw
-        .iter()
-        .map(|line| str_width(line))
-        .max()
-        .unwrap_or(0);
+    let logo_raw = crate::brand::LOGO_ROWS;
+    let logo_canvas_width = crate::brand::LOGO_WIDTH;
     let gutter = 3usize;
     let show_logo =
         logo_canvas_width > 0 && content_width.saturating_sub(logo_canvas_width + gutter) >= 24;
@@ -391,7 +596,7 @@ pub fn render_splash(state: &ChromeState, theme: &Theme, width: usize) -> Vec<Li
     let text = theme.fg_style(ThemeColor::Text);
     let muted = theme.fg_style(ThemeColor::Muted);
     let dim = theme.fg_style(ThemeColor::Dim);
-    let title = "prime agent";
+    let title = "radiata";
     let version = format!("v{}", state.version);
     let mut meta_lines: Vec<Line> = Vec::new();
     if str_width(&format!("{title} {version}")) <= meta_width {
@@ -445,14 +650,13 @@ pub fn render_splash(state: &ChromeState, theme: &Theme, width: usize) -> Vec<Li
     } else {
         0
     };
-    let logo_text = theme.fg_style(ThemeColor::Text);
     for index in 0..row_count {
         let mut spans: Line = Vec::new();
         let pad = if padding_x > 0 { " " } else { "" };
         spans.push(Span::styled(pad.to_string(), Style::default()));
         if show_logo {
             let logo_line = logo_raw.get(index).copied().unwrap_or("");
-            spans.push(Span::styled(logo_line.to_string(), logo_text));
+            spans.extend(logo_spans(index, logo_line, theme));
             let fill = logo_canvas_width.saturating_sub(str_width(logo_line)) + gutter;
             spans.push(Span::styled(" ".repeat(fill), Style::default()));
         }
@@ -759,6 +963,19 @@ pub fn render_activity_dock_segments(
                 cols: 0..width,
             });
             lines.push(render_expanded_dock_row(dock, group, theme, width));
+            if group == ActivityGroup::Captain {
+                if let Some(captain) = &dock.captain {
+                    let selected = dock.selection().captain_item();
+                    for sub_row in render_expanded_captain_rows(captain, theme, width, selected) {
+                        segments.push(ActivityDockSegment {
+                            group: ActivityGroup::Captain,
+                            row: lines.len(),
+                            cols: 0..width,
+                        });
+                        lines.push(sub_row);
+                    }
+                }
+            }
         }
         return (lines, segments);
     }
@@ -836,6 +1053,56 @@ pub fn render_activity_dock_segments(
                         &format!("◐ {} paused", factory.paused),
                         ThemeColor::Warning,
                     ));
+                }
+            }
+            ActivityGroup::Captain => {
+                if let Some(captain) = &dock.captain {
+                    let stopped = match captain.state.as_str() {
+                        "paused" => Some("paused"),
+                        "stopping" => Some("stopping"),
+                        "deleting" => Some("deleting"),
+                        _ => None,
+                    };
+                    if let Some(state_label) = stopped {
+                        line.push(theme.fg_span(ThemeColor::Muted, "⚓ captain".to_string()));
+                        line.extend(cluster(state_label, ThemeColor::Warning));
+                    } else {
+                        let active_total = captain.working + captain.factory_running;
+                        line.push(
+                            theme.fg_span(activity_color(active_total), "⚓ captain".to_string()),
+                        );
+                        if captain.working > 0 {
+                            line.extend(cluster(
+                                &format!("{} working", captain.working),
+                                ThemeColor::Success,
+                            ));
+                        }
+                        if captain.factory_running > 0 {
+                            line.extend(cluster(
+                                &format!(
+                                    "{} factory run{}",
+                                    captain.factory_running,
+                                    if captain.factory_running == 1 {
+                                        ""
+                                    } else {
+                                        "s"
+                                    }
+                                ),
+                                ThemeColor::Success,
+                            ));
+                        }
+                        if captain.needs_you > 0 {
+                            line.extend(cluster(
+                                &format!("{} needs you", captain.needs_you),
+                                ThemeColor::Warning,
+                            ));
+                        }
+                        if let Some((_, unread)) = captain.name.rsplit_once(" \u{2022}") {
+                            if !unread.is_empty() {
+                                line.extend(cluster(&format!("\u{2022}{unread}"), ThemeColor::Accent));
+                            }
+                        }
+                    }
                 }
             }
             // The machine library page's row carries no count: the
@@ -969,21 +1236,124 @@ fn render_expanded_dock_row(
                 &items,
             )
         }
+        ActivityGroup::Captain => match &dock.captain {
+            Some(captain) => {
+                let mut parts: Vec<String> = Vec::new();
+                match captain.state.as_str() {
+                    "paused" => parts.push("paused".to_string()),
+                    "stopping" => parts.push("stopping".to_string()),
+                    "deleting" => parts.push("deleting".to_string()),
+                    _ => {
+                        if captain.working > 0 {
+                            parts.push(format!("{} working", captain.working));
+                        }
+                        if captain.factory_running > 0 {
+                            parts.push(format!(
+                                "{} factory run{}",
+                                captain.factory_running,
+                                if captain.factory_running == 1 {
+                                    ""
+                                } else {
+                                    "s"
+                                }
+                            ));
+                        }
+                        if captain.needs_you > 0 {
+                            parts.push(format!("{} needs you", captain.needs_you));
+                        }
+                        if let Some((_, unread)) = captain.name.rsplit_once(" \u{2022}") {
+                            if !unread.is_empty() {
+                                parts.push(format!("\u{2022}{unread}"));
+                            }
+                        }
+                    }
+                }
+                let summary = (!parts.is_empty()).then(|| parts.join(" · "));
+                let count = if captain.state == "active" || captain.state.is_empty() {
+                    captain.working + captain.factory_running
+                } else {
+                    0
+                };
+                expanded_group_row(theme, width, ("⚓", "captain"), count, summary.as_slice())
+            }
+            None => expanded_group_row(theme, width, ("⚓", "captain"), 0, &[]),
+        },
         // The library row is label-only: no count to read, no items to
         // list (the page carries the machines).
         ActivityGroup::Library => expanded_group_row(theme, width, ("▤", "machines"), 0, &[]),
         ActivityGroup::Goal => vec![Span::raw(" "), goal_span(dock, theme)],
     };
     let mut row = truncate_spans_to_width(&row, width);
-    if dock.selected == group {
-        let filled: usize = row.iter().map(|s| str_width(&s.content)).sum();
-        row.push(Span::raw(" ".repeat(width.saturating_sub(filled))));
-        let band = theme.selection_row_style();
-        for span in &mut row {
-            span.style = span.style.patch(band);
-        }
+    if dock.selection() == DockSelection::Group(group) {
+        highlight_row(&mut row, theme, width);
     }
     row
+}
+
+/// Paint the selection band across a whole dock row.
+fn highlight_row(row: &mut Line, theme: &Theme, width: usize) {
+    let filled: usize = row.iter().map(|s| str_width(&s.content)).sum();
+    row.push(Span::raw(" ".repeat(width.saturating_sub(filled))));
+    let band = theme.selection_row_style();
+    for span in row.iter_mut() {
+        span.style = span.style.patch(band);
+    }
+}
+
+/// Expanded Captain sub-rows: one indented row per active crew member or run
+/// (capped so the dock stays compact on 24-row terminals).
+const EXPANDED_CAPTAIN_MAX_ROWS: usize = 6;
+
+/// Status-file text for one dock row: control characters, newlines included, become spaces.
+fn dock_text(value: &str) -> String {
+    crate::menu_panel::scrub_controls(value).replace('\n', " ")
+}
+
+fn render_expanded_captain_rows(
+    captain: &CaptainDockState,
+    theme: &Theme,
+    width: usize,
+    selected: Option<usize>,
+) -> Vec<Line> {
+    let mut rows = Vec::new();
+    let shown = captain.active.len().min(EXPANDED_CAPTAIN_MAX_ROWS);
+    for (index, item) in captain.active[..shown].iter().enumerate() {
+        let (glyph, color) = match item.state.as_str() {
+            "needs_you" | "paused" | "draft" | "changed" | "drift" => ("◐", ThemeColor::Warning),
+            "failed" => ("✗", ThemeColor::Error),
+            "running" => ("●", ThemeColor::Success),
+            _ => ("○", ThemeColor::Muted),
+        };
+        let mut line = vec![
+            Span::raw("   ".to_string()),
+            theme.fg_span(color, glyph.to_string()),
+            Span::raw(" ".to_string()),
+            theme.fg_span(ThemeColor::Text, dock_text(&item.label)),
+            theme.fg_span(ThemeColor::Dim, " · ".to_string()),
+            theme.fg_span(color, dock_text(&item.state_text)),
+        ];
+        if let Some(step) = item
+            .step
+            .as_deref()
+            .filter(|s| !s.is_empty() && *s != item.state_text)
+        {
+            line.push(theme.fg_span(ThemeColor::Dim, format!(" · {}", dock_text(step))));
+        }
+        let mut row = truncate_spans_to_width(&line, width);
+        if selected == Some(index) {
+            highlight_row(&mut row, theme, width);
+        }
+        rows.push(row);
+    }
+    if captain.active.len() > shown {
+        let more = captain.active.len() - shown;
+        let line = vec![
+            Span::raw("   ".to_string()),
+            theme.fg_span(ThemeColor::Dim, format!("+{more} more")),
+        ];
+        rows.push(truncate_spans_to_width(&line, width));
+    }
+    rows
 }
 
 /// A group row: the glyph and name, then the details (as many items as
@@ -1000,10 +1370,11 @@ fn expanded_group_row(
     if items.is_empty() {
         return vec![Span::raw(" "), theme.fg_span(ThemeColor::Dim, title)];
     }
+    let pad = (EXPANDED_NAME_CELLS + 2).saturating_sub(str_width(&title)) + 2;
     let mut row = vec![
         Span::raw(" "),
         theme.fg_span(activity_color(count), title),
-        Span::raw(" ".repeat(EXPANDED_NAME_CELLS - str_width(name) + 2)),
+        Span::raw(" ".repeat(pad)),
     ];
     let used: usize = row.iter().map(|s| str_width(&s.content)).sum();
     let available = width.saturating_sub(used);

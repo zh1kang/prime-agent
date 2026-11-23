@@ -14,9 +14,10 @@ use crate::corpus::{self, CacheMode, CorpusOptions, Manifest, Profile};
 use super::pty::PtyChild;
 
 /// The first paint's needle: the brand splash is the empty chat's header
-/// (the corpus settings keep the TUI out of the first-run flow). Pinned
-/// empirically against the real binary.
-const FIRST_PAINT_NEEDLE: &[u8] = "▗▄▄█▀".as_bytes();
+/// (the corpus settings keep the TUI out of the first-run flow), and its
+/// title is one plain run; the mark's rows change color mid-row, so escape
+/// codes split them in the byte stream.
+const FIRST_PAINT_NEEDLE: &[u8] = b"radiata";
 
 /// The ready needle: the tray's session-usage pill ("model · tokens
 /// (percent)") — the first content the chat surface can only paint once
@@ -1463,7 +1464,7 @@ mod tests {
 
     #[test]
     fn roster_settled_accounts_for_unloaded_pages() {
-        let large = "   ▗█▛▐█▙   ▗▄█▀▗█▀       prime agent v0.10.0
+        let large = "   ▗█▛▐█▙   ▗▄█▀▗█▀       radiata v0.10.0
   ▗█▛ ▟██▙▄██▛ ▟▛         agents 0 running, 0 idle, 200 inactive
 
  >   Search sessions

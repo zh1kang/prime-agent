@@ -387,8 +387,9 @@ function field(frame,   x, y, k, hash, cx, cy, contour, hy, si, seg, t, base, wa
   for (y = 0; y < MH; y++) {
     n = split(LOGO[y], parts, "|")
     for (i = 1; i <= n; i++) {
+      # x=<glyph><tone>: the tone is the last character (R petal, W anther, G stem).
       eq = index(parts[i], "=")
-      put(LI + substr(parts[i], 1, eq - 1), y, substr(parts[i], eq + 1), "T", 8)
+      put(LI + substr(parts[i], 1, eq - 1), y, substr(parts[i], eq + 1, length(parts[i]) - eq - 1), substr(parts[i], length(parts[i]), 1), 8)
     }
   }
 }
@@ -425,7 +426,7 @@ function compose(   n, line, label, detail, ppath, total, got, cmd, filled, bar,
   line = ""
   if ((getline line < brandf) < 0) line = ""
   close(brandf)
-  R[n++] = " " TX "Installing " BOLD "PRIME" RESET TX ITAL " Agent" RESET (line == "" ? "" : "  " DIM line RESET)
+  R[n++] = " " TX "Installing " BOLD "radiata" RESET (line == "" ? "" : "  " DIM line RESET)
   R[n++] = ""
   while ((getline line < logf) > 0) R[n++] = line
   close(logf)
@@ -465,19 +466,20 @@ function draw(n,   i) {
 }
 BEGIN {
   ESC = "\033"
-  MH = 7; LI = 5; QX0 = 5; QX1 = 26
-  LOGO[0] = "17=▗|18=▄|19=▄|20=█|21=▀"
-  LOGO[1] = "3=█|4=█|5=█|6=▄|14=▗|15=▄|16=█|17=█|18=█|19=▀"
-  LOGO[2] = "2=▗|3=█|4=▛|5=▐|6=█|7=▙|11=▗|12=▄|13=█|14=▀|15=▗|16=█|17=▀"
-  LOGO[3] = "1=▗|2=█|3=▛|5=▟|6=█|7=█|8=▙|9=▄|10=█|11=█|12=▛|14=▟|15=▛"
-  LOGO[4] = "1=▗|2=▟|3=▌|5=▐|6=█|7=█|8=█|9=▛|10=▘|11=▗|12=▄|13=█|14=▖"
-  LOGO[5] = "0=▟|1=█|2=█|3=█|4=▄|7=▄|8=▄|9=▟|10=█|11=█|12=█|13=▀"
-  LOGO[6] = "0=▜|1=█|2=▛|3=▀|4=▘|7=▜|8=█|9=▛|10=▀|11=▘"
+  MH = 7; LI = 5; QX0 = 5; QX1 = 25
+  LOGO[0] = "0=▗W|3=▐W|4=▄R|7=▙W|13=▗R|14=▌W|16=▗R|17=▟W|20=▗W"
+  LOGO[1] = "0=▝R|1=▜R|2=▄R|4=▝R|5=▚R|6=▄R|7=▝R|8=▜R|9=▄R|11=▗R|12=▟R|13=▀R|14=▗R|15=▄R|16=▀R|18=▗R|19=▟R|20=▀R"
+  LOGO[2] = "2=▝R|3=▀R|4=▙R|5=▄R|6=▟R|7=▀R|8=█R|9=█R|10=▙R|11=█R|12=█R|13=▛R|14=▜R|15=▄R|16=▄R|17=▛R|18=▀R"
+  LOGO[3] = "6=▝R|7=█R|8=▀R|9=▜R|10=█R|11=█R|12=▀R|13=▜R|14=▛R"
+  LOGO[4] = "7=▝R|8=▚R|9=▛R|10=▐G|11=▝R|12=▙R|13=▀R"
+  LOGO[5] = "10=▐G"
+  LOGO[6] = "10=▐G"
   if (color == 1) {
     RESET = ESC "[0m"; BOLD = ESC "[1m"; ITAL = ESC "[3m"; TX = ESC "[39m"
     DIM = ESC "[38;2;113;113;122m"; AC = ESC "[38;2;124;111;175m"
     TONE["T"] = ESC "[39m"; TONE["D"] = DIM; TONE["B"] = ESC "[38;2;82;82;91m"
     TONE["A"] = AC; TONE["L"] = ESC "[38;2;56;189;248m"; TONE["W"] = ESC "[38;2;245;158;11m"
+    TONE["R"] = ESC "[38;2;208;111;130m"; TONE["G"] = ESC "[38;2;125;168;118m"
   }
   W = width + 0
   if (parity == 1) {
@@ -590,7 +592,7 @@ title() {
   if [ -n "$ui_pid" ]; then
     printf '%s\n' "$1" > "$ui_brand"
   else
-    printf ' %sInstalling PRIME Agent%s  %s%s%s\n\n' "$C_BOLD" "$C_RESET" "$C_DIM" "$1" "$C_RESET" >&2
+    printf ' %sInstalling radiata%s  %s%s%s\n\n' "$C_BOLD" "$C_RESET" "$C_DIM" "$1" "$C_RESET" >&2
   fi
 }
 # step_start <label>: the step is running (the spinner row on a terminal;
@@ -2910,6 +2912,17 @@ EOF
   # failed install displaced - the bots' finding: the stale slot would
   # clobber the fresh .cmd at exit).
   preserved_cmd_file=""
+fi
+# The `radiata` command: a symlink beside the prime-agent launcher. A
+# foreign file at that name is left alone.
+radiata_link="${bin_dir}/radiata"
+if [ "$WINDOWS" != "yes" ]; then
+  if [ ! -e "$radiata_link" ] && [ ! -L "$radiata_link" ]; then
+    ln -s prime-agent "$radiata_link" 2>/dev/null \
+      || note "note: could not create the radiata command at ${radiata_link}"
+  elif [ -L "$radiata_link" ] && [ "$(readlink "$radiata_link")" != prime-agent ]; then
+    note "note: ${radiata_link} already exists and was left alone"
+  fi
 fi
 # The Rust launcher is live: the takeover stands — the displaced TS tree
 # stays in its legacy slot (with the printed rollback commands) and the

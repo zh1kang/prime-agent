@@ -16,7 +16,7 @@ if '--mode' not in sys.argv:
         peer.connect(str(path))
         peer.recv(4096)
         peer.sendall(b'held-ui\n')
-        sys.stdout.write('▗▄▄█▀ mock paint 0 (0%)\n')
+        sys.stdout.write('radiata mock paint 0 (0%)\n')
         sys.stdout.flush()
         # The mock UI remains connected until its owned process is stopped.
         while peer.recv(4096):

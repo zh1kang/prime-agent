@@ -7,6 +7,7 @@ fn the_live_goal_keeps_its_text_and_click_target_before_the_library() {
         heartbeats_paused: 1,
         shells: items(1),
         factory_group: true,
+        captain: None,
         goal_label: Some("Pursuing goal (0s)".to_string()),
         ..ActivityDock::default()
     };
@@ -160,6 +161,7 @@ fn activity_dock_frames_one_row_with_running_paused_and_goal_counts() {
         heartbeats_paused: 1,
         shells: items(1),
         factory_group: true,
+        captain: None,
         goal_label: Some("Pursuing goal (0s)".to_string()),
         ..ActivityDock::default()
     };
@@ -439,8 +441,10 @@ fn the_focused_dock_expands_into_one_row_per_group() {
             paused: 1,
         },
         factory_group: true,
+        captain: None,
         goal_label: Some("Pursuing goal (0s)".to_string()),
         selected: ActivityGroup::Subagents,
+        captain_item: None,
         focused: true,
     };
     let (frame, segments) = render_activity_dock_segments(&dock, &theme, 80);
@@ -686,6 +690,7 @@ fn dock_arrows_visit_the_same_groups_with_items() {
         heartbeats_paused: 1,
         shells: items(1),
         factory_group: true,
+        captain: None,
         goal_label: Some("Pursuing goal (0s)".to_string()),
         ..ActivityDock::default()
     };
@@ -896,12 +901,29 @@ fn splash_renders_logo_version_model_and_cwd() {
     let lines = render_splash(&state, &theme(), 120);
     assert_eq!(lines[0], Vec::new());
     let text = |line: &Line| line.iter().map(|s| s.content.as_str()).collect::<String>();
-    assert!(lines.iter().any(|l| text(l).contains("prime agent v0.0.0")));
+    assert!(lines.iter().any(|l| text(l).contains("radiata v0.0.0")));
     assert!(lines.iter().any(|l| text(l).contains("model faux-1")));
     assert!(lines.iter().any(|l| text(l).contains("cwd /tmp/project")));
-    assert!(lines
-        .iter()
-        .any(|l| text(l).contains("\u{2597}\u{2584}\u{2584}")));
+    // Every row of the spider lily mark renders, each glyph in its brand tone.
+    let theme = theme();
+    for (row, glyphs) in crate::brand::LOGO_ROWS.iter().enumerate() {
+        let line = &lines[row + 1];
+        assert!(text(line).contains(glyphs.trim_end()), "mark row {row}");
+        let mut column = 0;
+        for span in line.iter().skip(1) {
+            for glyph in span.content.chars() {
+                if column < glyphs.chars().count() && glyph != ' ' {
+                    let tone = crate::brand::logo_tone(row, column);
+                    assert_eq!(
+                        span.style.fg,
+                        theme.fg_style(tone).fg,
+                        "row {row} col {column}"
+                    );
+                }
+                column += 1;
+            }
+        }
+    }
 }
 
 #[test]
@@ -1108,4 +1130,304 @@ fn the_collapsed_shells_segment_counts_persistent_shells() {
     };
     assert_eq!(render(1), "▸ 2 shells · 1 persistent");
     assert_eq!(render(0), "▸ 2 shells");
+}
+
+#[test]
+fn the_captain_dock_group_renders_collapsed_expanded_needs_you_stopped_and_absent() {
+    let theme = theme();
+    // Absent when the current project has no Captain.
+    let none = ActivityDock {
+        factory_group: true,
+        ..ActivityDock::default()
+    };
+    assert!(!none.groups().contains(&ActivityGroup::Captain));
+    let (frame, segments) = render_activity_dock_segments(&none, &theme, 140);
+    let text: String = frame[1].iter().map(|s| s.content.as_str()).collect();
+    assert!(!text.contains("captain"), "{text}");
+    assert!(segments.iter().all(|s| s.group != ActivityGroup::Captain));
+
+    // Active with working, factory run, and needs you (in warning color).
+    let active = ActivityDock {
+        factory_group: true,
+        captain: Some(CaptainDockState {
+            project_id: "p1".into(),
+            name: "alpha".into(),
+            state: "active".into(),
+            working: 2,
+            needs_you: 1,
+            factory_running: 1,
+            factory_paused: 0,
+            active: vec![
+                CaptainDockActiveItem {
+                    label: "parser-fix".into(),
+                    kind: "thread".into(),
+                    state: "needs_you".into(),
+                    state_text: "needs you".into(),
+                    step: None,
+                },
+                CaptainDockActiveItem {
+                    label: "review-sweep".into(),
+                    kind: "factory".into(),
+                    state: "running".into(),
+                    state_text: "working".into(),
+                    step: Some("implement".into()),
+                },
+            ],
+        }),
+        ..ActivityDock::default()
+    };
+    assert_eq!(
+        active.groups(),
+        vec![
+            ActivityGroup::Subagents,
+            ActivityGroup::Heartbeats,
+            ActivityGroup::Bash,
+            ActivityGroup::Factory,
+            ActivityGroup::Captain,
+            ActivityGroup::Library,
+        ]
+    );
+    assert_eq!(
+        active.step(ActivityGroup::Factory, ActivityDirection::Next),
+        ActivityGroup::Captain
+    );
+    assert_eq!(
+        active.step(ActivityGroup::Captain, ActivityDirection::Next),
+        ActivityGroup::Library
+    );
+    assert_eq!(
+        active.step(ActivityGroup::Library, ActivityDirection::Prev),
+        ActivityGroup::Captain
+    );
+
+    let (frame, segments) = render_activity_dock_segments(&active, &theme, 160);
+    let collapsed: String = frame[1].iter().map(|s| s.content.as_str()).collect();
+    assert!(
+        collapsed.contains("⚓ captain · 2 working · 1 factory run · 1 needs you"),
+        "{collapsed}"
+    );
+    let needs_span = frame[1]
+        .iter()
+        .find(|s| s.content == "1 needs you")
+        .expect("needs you span");
+    assert_eq!(needs_span.style.fg, theme.fg_style(ThemeColor::Warning).fg);
+    let cap_seg = segments
+        .iter()
+        .find(|s| s.group == ActivityGroup::Captain)
+        .expect("captain click segment");
+    assert!(cap_seg.cols.end > cap_seg.cols.start);
+
+    // Paused / stopped state.
+    let paused = ActivityDock {
+        captain: Some(CaptainDockState {
+            project_id: "p1".into(),
+            name: "alpha".into(),
+            state: "paused".into(),
+            ..CaptainDockState::default()
+        }),
+        ..ActivityDock::default()
+    };
+    let (frame, _) = render_activity_dock_segments(&paused, &theme, 120);
+    let paused_text: String = frame[1].iter().map(|s| s.content.as_str()).collect();
+    assert!(paused_text.contains("⚓ captain · paused"), "{paused_text}");
+    let paused_span = frame[1]
+        .iter()
+        .find(|s| s.content == "paused")
+        .expect("paused span");
+    assert_eq!(paused_span.style.fg, theme.fg_style(ThemeColor::Warning).fg);
+
+    // Expanded mode: one header row + one row per active crew member or run.
+    let expanded = ActivityDock {
+        focused: true,
+        selected: ActivityGroup::Captain,
+        ..active
+    };
+    let (exp_frame, exp_segments) = render_activity_dock_segments(&expanded, &theme, 100);
+    let lines: Vec<String> = exp_frame
+        .iter()
+        .map(|row| row.iter().map(|s| s.content.as_str()).collect::<String>())
+        .collect();
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("parser-fix") && l.contains("needs you")),
+        "{lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("review-sweep")
+            && l.contains("working")
+            && l.contains("implement")),
+        "{lines:?}"
+    );
+    let cap_segs: Vec<_> = exp_segments
+        .iter()
+        .filter(|s| s.group == ActivityGroup::Captain)
+        .collect();
+    assert_eq!(
+        cap_segs.len(),
+        3,
+        "header row plus 2 active sub-rows are clickable"
+    );
+}
+
+#[test]
+fn expanded_captain_rows_scrub_control_characters() {
+    let theme = Theme::builtin("prime", ColorMode::TrueColor);
+    let captain = CaptainDockState {
+        project_id: "p1".into(),
+        name: "alpha".into(),
+        state: "active".into(),
+        working: 1,
+        needs_you: 0,
+        factory_running: 0,
+        factory_paused: 0,
+        active: vec![CaptainDockActiveItem {
+            label: "evil\u{1b}]52;c;aGk=\u{7}".into(),
+            kind: "thread".into(),
+            state: "running".into(),
+            state_text: "work\u{1b}[2Jing\nnext".into(),
+            step: Some("step\u{1b}[31m".into()),
+        }],
+    };
+    let rows = render_expanded_captain_rows(&captain, &theme, 200, None);
+    let text: String = rows[0].iter().map(|s| s.content.as_str()).collect();
+    assert!(
+        !text.chars().any(char::is_control),
+        "control characters reach the dock row: {text:?}"
+    );
+    assert!(text.contains("evil ]52;c;aGk= "), "{text:?}");
+    assert!(text.contains("work [2Jing next"), "{text:?}");
+}
+
+fn captain_dock() -> ActivityDock {
+    ActivityDock {
+        factory_group: true,
+        captain: Some(CaptainDockState {
+            project_id: "p1".into(),
+            name: "alpha".into(),
+            state: "active".into(),
+            factory_running: 1,
+            factory_paused: 1,
+            active: vec![
+                CaptainDockActiveItem {
+                    label: "gate-check".into(),
+                    kind: "factory".into(),
+                    state: "paused".into(),
+                    state_text: "paused".into(),
+                    step: None,
+                },
+                CaptainDockActiveItem {
+                    label: "ship".into(),
+                    kind: "project_factory".into(),
+                    state: "draft".into(),
+                    state_text: "needs review".into(),
+                    step: None,
+                },
+            ],
+            ..CaptainDockState::default()
+        }),
+        ..ActivityDock::default()
+    }
+}
+
+#[test]
+fn dock_selection_steps_through_the_captain_sub_rows() {
+    let dock = captain_dock();
+    use ActivityDirection::{Next, Prev};
+    use DockSelection::{CaptainItem, Group};
+    let captain = Group(ActivityGroup::Captain);
+    assert_eq!(dock.step_selection(captain, Next), CaptainItem(0));
+    assert_eq!(dock.step_selection(CaptainItem(0), Next), CaptainItem(1));
+    assert_eq!(
+        dock.step_selection(CaptainItem(1), Next),
+        Group(ActivityGroup::Library)
+    );
+    assert_eq!(
+        dock.step_selection(Group(ActivityGroup::Library), Prev),
+        CaptainItem(1)
+    );
+    assert_eq!(dock.step_selection(CaptainItem(0), Prev), captain);
+    assert_eq!(CaptainItem(1).group(), ActivityGroup::Captain);
+    assert_eq!(CaptainItem(1).captain_item(), Some(1));
+    assert_eq!(Group(ActivityGroup::Bash).captain_item(), None);
+
+    // A sub-row index past the rendered rows selects the group row.
+    let stale = ActivityDock {
+        selected: ActivityGroup::Captain,
+        captain_item: Some(5),
+        ..captain_dock()
+    };
+    assert_eq!(stale.selection(), captain);
+}
+
+#[test]
+fn the_selected_captain_sub_row_carries_the_highlight_band() {
+    let theme = Theme::builtin("prime", ColorMode::TrueColor);
+    let band = theme.selection_row_style().bg;
+    let dock = ActivityDock {
+        focused: true,
+        selected: ActivityGroup::Captain,
+        captain_item: Some(1),
+        ..captain_dock()
+    };
+    let (frame, _) = render_activity_dock_segments(&dock, &theme, 80);
+    let text = |row: &Line| row.iter().map(|s| s.content.as_str()).collect::<String>();
+    let banded = |row: &Line| row.iter().all(|s| s.style.bg == band);
+    let header = frame
+        .iter()
+        .find(|row| text(row).contains("⚓ captain"))
+        .unwrap();
+    let gate = frame
+        .iter()
+        .find(|row| text(row).contains("gate-check"))
+        .unwrap();
+    let ship = frame.iter().find(|row| text(row).contains("ship")).unwrap();
+    assert!(
+        !banded(header),
+        "the group row loses the band to its sub-row"
+    );
+    assert!(!banded(gate));
+    assert!(banded(ship));
+
+    let on_group = ActivityDock {
+        captain_item: None,
+        ..dock
+    };
+    let (frame, _) = render_activity_dock_segments(&on_group, &theme, 80);
+    let header = frame
+        .iter()
+        .find(|row| text(row).contains("⚓ captain"))
+        .unwrap();
+    assert!(banded(header));
+}
+
+#[test]
+fn captain_factory_runs_fold_into_the_factory_group() {
+    let theme = Theme::builtin("prime", ColorMode::TrueColor);
+    let dock = captain_dock().with_captain_factory_runs();
+    assert_eq!(dock.factory_counts.running, 1);
+    assert_eq!(dock.factory_counts.paused, 1);
+    assert_eq!(dock.factory_runs, vec!["⚓ gate-check paused".to_string()]);
+    let (frame, _) = render_activity_dock_segments(&dock, &theme, 160);
+    let row: String = frame[1].iter().map(|s| s.content.as_str()).collect();
+    assert!(row.contains("⚙ 1 factory · ◐ 1 paused"), "{row}");
+
+    let without = ActivityDock::default().with_captain_factory_runs();
+    assert_eq!(without.factory_counts.running, 0);
+    assert!(without.factory_runs.is_empty());
+}
+
+#[test]
+fn nav_memory_saves_and_restores_per_session_positions() {
+    let mut nav = NavMemory::default();
+    assert_eq!(nav.switch_transcript("a", Some((3, 1))), None);
+    assert_eq!(nav.switch_transcript("b", Some((7, 0))), None);
+    assert_eq!(nav.session_scroll.get("a"), Some(&(7, 0)));
+    assert_eq!(nav.switch_transcript("a", None), Some((7, 0)));
+    assert!(
+        !nav.session_scroll.contains_key("b"),
+        "a following chat saves nothing"
+    );
+    assert_eq!(nav.switch_transcript("a", Some((1, 1))), None);
+    assert_eq!(nav.transcript_session.as_deref(), Some("a"));
 }
