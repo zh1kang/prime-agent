@@ -1,121 +1,84 @@
 <p align="center">
-  <a href="https://primeintellect.ai">
-    <picture>
-      <source media="(prefers-color-scheme: light)" srcset="https://github.com/user-attachments/assets/40c36e38-c5bd-4c5a-9cb3-f7b902cd155d">
-      <source media="(prefers-color-scheme: dark)" srcset="https://github.com/user-attachments/assets/6414bc9b-126b-41ca-9307-9e982430cde8">
-      <img alt="Prime Intellect" src="https://github.com/user-attachments/assets/6414bc9b-126b-41ca-9307-9e982430cde8" width="312" style="max-width: 100%;">
-    </picture>
-  </a>
+  <img alt="radiata — red spider lily (Lycoris radiata)" src="assets/radiata-logo.svg" width="240" style="max-width: 100%;">
 </p>
 
-<h3 align="center">
-Prime Agent: A Self-Improving RLM Harness
-</h3>
+<h2 align="center">radiata</h2>
 
 <p align="center">
-  <a href="#install">Documentation</a> &bull;
-  <a href="https://github.com/PrimeIntellect-ai/verifiers">Verifiers</a> &bull;
-  <a href="https://github.com/PrimeIntellect-ai/prime-rl">PRIME-RL</a>
+  <strong>A minimal, multi-provider, token-efficient coding and orchestration harness.</strong><br/>
+  Forked from <a href="https://github.com/PrimeIntellect-ai/prime-agent">PrimeIntellect-ai/prime-agent</a> (MIT License).
 </p>
 
-<p align="center">
-  <a href="https://github.com/PrimeIntellect-ai/prime-agent/actions/workflows/ci.yml">
-    <img src="https://github.com/PrimeIntellect-ai/prime-agent/actions/workflows/ci.yml/badge.svg" alt="CI" />
-  </a>
-  <a href="https://arxiv.org/abs/2608.23552">
-    <img src="https://img.shields.io/badge/arXiv-2608.23552-b31b1b.svg" alt="arXiv" />
-  </a>
-</p>
+---
 
-<p align="center">
-  <a href="https://trendshift.io/repositories/104249?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-104249" target="_blank" rel="noopener noreferrer">
-    <img src="https://trendshift.io/api/badge/repositories/104249" alt="PrimeIntellect-ai%2Fprime-agent | Trendshift" width="250" height="55" />
-  </a>
-</p>
+**radiata** is a personal Rust/Python fork of [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent) built around Prime Agent's [Recursive Language Model (RLM)](https://www.primeintellect.ai/blog/rlm) Python kernel and [Continual Harness](https://arxiv.org/abs/2605.09998), extended to unify my favorite multi-agent workflows into one terminal-first harness without juggling separate apps, orchestrators, and code-review tools.
 
-Prime Agent is an open-source coding and research agent for general and long-running work. It is designed around two core abstractions:
+## What radiata Adds Over Upstream Prime Agent
 
-- The **[Recursive Language Model (RLM)](https://www.primeintellect.ai/blog/rlm)** treats context as variables (*prompt-as-a-variable*) and tools like recursive subagents as function calls (*programmatic tool /sub-agent calling*) inside a persistent REPL.
-- The **[Continual Harness](https://arxiv.org/abs/2605.09998)** stores supplemental prompts, memories, skill descriptions, and reusable subagent specifications as durable state that Prime Agent can refine through small, evidence-backed updates, local to the session by default.
+- **Unified Multi-Provider Streaming:** Run native API models alongside CLI-backed agents from one daemon and TUI — **Antigravity (`agy acp`)** with live chain-of-thought and tool telemetry + `session/load` resume, **Cursor (`cursor-agent`)**, official **Claude Code CLI (`claude`)**, **Codex**, and **Prime Inference** — with resume-safe prompt caching across providers.
+- **Persistent Project Captains (`F6` / `F7`):** Durable SQLite WAL (`synchronous=FULL`) project orchestration with a 4-tab hub (`Overview`, `Digest`, `Drive`, `Factories`), `F7` crew switcher, selectable bottom dock, human-readable run naming, live drill-in directly into active factory step subagents, mid-turn steering (`Enter` steer / `Alt+Enter` server-side queue) + image attachments, 1-key structured escalation cards, spend/token budgets, cron schedules, GitHub PR/CI watches, and inline diff review triage (`o`/`r`/`i` + `R` rollback).
+- **Compiled Finite-State Machine (FSM) Factories:** Typed `machine.toml` v1 pipelines with a 3-choice onboarding flow, interactive visual chart composer, deterministic Python gates (`validate`, `sanitize-diff`) before frontier models, cross-family adversarial `review-triad` (Claude + Codex + Gemini), error-signature anti-spin breakers, and dual output binding (`rlm.factory.emit` for native RLM models; fenced `` ```factory-outputs `` JSON / emit-file extraction for CLI-backed agents).
+- **Decoupled Code Approval vs. Live Model Policy:** Approval covers code and control flow via SHA-256 snapshots frozen at dispatch (eliminating TOCTOU races), while model and thinking-level overrides live in a SQLite model overlay — letting you or the Captain hot-swap models across every FSM stage live without invalidating approved digests or disturbing in-flight runs.
+- **Untracked-Safe Isolated Git Worktrees:** Writer tasks fork from temporary `GIT_INDEX_FILE` snapshots (`refs/pa/bases/`, excluding `.prime/`) and record pre-turn checkpoints (`refs/pa/checkpoints/`) so uncommitted repositories fork and roll back cleanly without mutating your branch.
+- **Aggressive Token & Prompt-Cache Hygiene:**
+  - **Orchestrator delta prompts (−92% hidden context per turn):** Monotonic `reports.rowid` delta cursors, SHA-cached static prefixes (including auth-filtered configured models), compact 1-line crew indexes, pointer-based `.prime/captain/reports/` & `handoffs/`, per-event wake policies (`react` / `context` / `ignore`), and debounce coalescing.
+  - **3-layer Context Absorption (`/absorb`):** Instead of switching back into bloated external chat transcripts, stay in a fresh chat and absorb context from previous **Prime, Claude, Codex, Cursor, Antigravity, or T3/Flock** chats as a content-addressed, prompt-cache-safe ~1.5k-token packet with a 10 ms live git freshness check and an on-demand indexed `transcript.md` pointer (~65× cheaper than raw replay).
 
-## Install
+## Build & Install
 
-Install the latest stable version with the one-command installer:
+Requires Rust (stable) and Python 3 (`uv` for `prime-agent-runtime` tests):
 
 ```bash
-curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh
+git clone https://github.com/zh1kang/prime-agent.git
+cd prime-agent
+cargo build --locked -p pa-cli
+
+# Install locally (retains `pa` / `prime-agent` compatibility alongside `radiata`)
+mkdir -p ~/.local/share/pa-harness ~/.local/bin
+cp target/debug/prime-agent ~/.local/share/pa-harness/prime-agent.new
+mv -f ~/.local/share/pa-harness/prime-agent.new ~/.local/share/pa-harness/prime-agent
+ln -sf ~/.local/bin/pa ~/.local/bin/radiata
 ```
 
-On Windows, install from PowerShell:
-
-```powershell
-irm https://app.primeintellect.ai/prime-agent/install.ps1 | iex
-```
-
-The Windows installer downloads the latest stable Windows x64 build and verifies its checksum before installation.
-
-## Why Prime Agent
-
-Prime Agent combines a persistent Python control environment with durable harness state, so useful working context and reusable operating patterns can outlive a single chat window.
-
-- **Everything is programmatic:** a persistent Python REPL is the built-in model tool; file operations, shell commands, tool use, subagents, and context management happen through code.
-- **Subagents are built in:** `rlm.spawn(...)` spawns real child agents for parallel or background work and returns their results programmatically.
-- **The harness can improve:** `/refine` reviews the current trajectory and can apply small, evidence-backed updates to supplemental harness state. It never rewrites the immutable base system prompt, and recorded snapshots support rollback.
-- **Skills can be executable:** Python skills in your user configuration are imported into the kernel; repository skills provide Markdown instructions without automatic code execution.
-- **Sessions run in the background:** daemon-backed agents keep running when the terminal disconnects and can be reattached later.
-- **Agents communicate directly:** running agents can exchange messages and orchestrate one another without routing everything through the user.
-- **Long tasks keep moving:** automatic compaction, persistent goals, heartbeats, schedules, autonomous mode, and retained subagents preserve progress across turns and terminal sessions.
+You can also use `./install-rust.sh` to build and wire the launcher scripts and `radiata` symlink automatically.
 
 ## Getting Started
 
-Start Prime Agent from the repository or directory you want it to work in:
+Launch **radiata** inside any repository:
 
 ```bash
 cd /path/to/project
-prime-agent
+radiata
 ```
 
-On first launch, run `/login` to choose a subscription or API-key provider. Prime Agent works in the current directory and can run commands and modify files there. Use a disposable clone, clean worktree, or another checkpoint you can inspect and restore.
+On first launch, run `/login` to connect your API keys or local provider CLIs (`claude`, `codex`, `agy`, `cursor-agent`).
 
 > [!WARNING]
-> Prime Agent executes model-generated Python and project commands with your user permissions. Its worker and kernel processes improve lifecycle isolation and recovery; they are **not** a security sandbox. Review changes and use trusted repositories, instructions, and skills only. Run untrusted code or instructions in an external sandbox or restricted environment.
+> Like upstream Prime Agent, **radiata** executes model-generated Python and project commands with your user permissions. Its worker processes, git worktrees, and SHA-256 factory approvals improve isolation and reviewability, but they are **not** a security sandbox. Review changes and use trusted repositories, instructions, and skills only.
 
-Useful commands:
+### Everyday Shortcuts & Commands
 
-```bash
-prime-agent agents                   # Browse running, idle, and saved sessions
-prime-agent attach <agent>           # Reattach to a running session
-prime-agent --resume [path|id]       # Browse sessions or resume one directly
-prime-agent status                   # Inspect background service state
-prime-agent doctor [--fix]           # Inspect or repair background services
-prime-agent update [--force]         # Update Prime Agent
-prime-agent shutdown [--force]       # Stop every agent, worker, and background service
-```
+| Command / Key | Action |
+| :--- | :--- |
+| `F6` / `/captain` | Open the 4-tab Captain hub (`Overview`, `Digest`, `Drive`, `Factories`) |
+| `F7` / `/crew` | Quick crew & live factory step-subagent switcher (`n` new thread, `a` add existing) |
+| `Shift+F7` | Jump straight back to the Captain chat |
+| `/fsm` | Open the project FSM review & interactive diagram editor |
+| `/absorb [query] [--focus …]` | Absorb distilled context from one or more prior chats into the current chat |
+| `Ctrl+L` / `/model` | Floating model + thinking-level picker |
+| `Alt+A` | Expand/focus the bottom activity dock |
+| `radiata --resume [id]` | Resume a native session |
+| `radiata thread connections` | Check connected CLI/API providers |
+| `radiata thread absorb <provider> <path>` | Generate a cached context packet from the CLI |
+| `radiata thread captain status` | Inspect Captain projects, crew, usage, and schedules as JSON |
 
-Use `prime-agent thread help` for provider connections, context handoff, child threads, and Git worktree review.
-See [Provider threads](docs/provider-threads.md) for commands and examples.
+See [docs/captain-design.md](docs/captain-design.md), [docs/provider-threads.md](docs/provider-threads.md), and [skills/captain/references/fsm-design-guide.md](skills/captain/references/fsm-design-guide.md) for architecture and FSM authoring details.
 
-## Built for Long-Running Work
-Prime Agent is built for long-running work, especially for evaluations in research. These features are available in the TUI, and when run autonomously.
+## Upstream Attribution & License
 
-- **Continual Harness:** `/refine` can persist focused, reviewable lessons as supplemental prompts, memories, reusable skill descriptions, or subagent specifications, with recorded refinement history. It does not replace packaging and reviewing new executable skills.
-- **Direct agent-to-agent communication:** running agents and retained subagents can discover one another, exchange messages, and steer active work.
-- **Daemon-backed continuity:** active sessions, Python REPL state, schedules, and subagents keep running when the terminal detaches and can be reattached later.
-- **Heartbeats and schedules:** `/heartbeat`, `rlm_heartbeat`, and `prime-agent schedule` can re-enter a session periodically or at a specific time.
-- **Persistent goals:** `/goal` keeps an objective and its progress active across turns until it is completed, paused, or cleared.
-- **Bounded autonomous mode:** `/autonomous` continues within configured turn, token, and time budgets and can run user-defined quality gates; at budget exhaustion the run gets one finalize wake to write its deliverable before the limit stop. A passed gate checks only what that gate verifies; reaching a limit does not imply task success.
+**radiata** is a fork of [PrimeIntellect-ai/prime-agent](https://github.com/PrimeIntellect-ai/prime-agent) and remains open source under the [MIT License](LICENSE).
 
-## Contributing
-
-Start with a GitHub Discussion for [general questions](https://github.com/PrimeIntellect-ai/prime-agent/discussions/categories/general), [bug reports](https://github.com/PrimeIntellect-ai/prime-agent/discussions/categories/bug-reports), and [feature requests](https://github.com/PrimeIntellect-ai/prime-agent/discussions/categories/feature-requests). Maintainers promote accepted work into Issues, and pull requests are reviewed from maintainers and vouched contributors.
-
-## License
-
-Prime Agent is fully open source and released under the [MIT License](LICENSE).
-
-## Citation
-
-If you use this codebase in your research, please cite Prime Agent:
+If you use this codebase in research, please cite upstream Prime Agent:
 
 ```bibtex
 @article{karten2026prime,
