@@ -321,12 +321,20 @@ async fn child_is_unsettled(child: &Arc<InlineChild>) -> bool {
         .pending_receipts
         .load(std::sync::atomic::Ordering::SeqCst)
         > 0
-        || !child.state.lock().await.settled
     {
         return true;
     }
+    // The agent's work is read before `settled`. The driver clears
+    // `settled` before its run claims the slot and drains the queue, and
+    // the slot is held until the run ends, so a row that left the queue
+    // reads as an active run, a stream, or a cleared `settled`. Reading
+    // `settled` first left a window: a delivered row drained after that
+    // read, before `is_streaming` flips, read as settled.
     let agent = child.engine.session.agent();
-    agent.has_queued_messages() || agent.state().await.is_streaming
+    if agent.has_queued_messages() || agent.has_active_run() || agent.state().await.is_streaming {
+        return true;
+    }
+    !child.state.lock().await.settled
 }
 
 /// Whether inline subagent work is unsettled (TS

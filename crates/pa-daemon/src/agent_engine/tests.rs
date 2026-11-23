@@ -24,6 +24,7 @@ mod session;
 mod streaming;
 
 fn bare_engine(dir: &std::path::Path) -> AgentSessionEngine {
+    crate::test_support::hermetic_env();
     let agent_dir = dir.join("agent");
     std::fs::create_dir_all(&agent_dir).unwrap();
     AgentSessionEngine::new(AgentEngineConfig {
@@ -94,6 +95,7 @@ pub(crate) fn faux_engine_with_settings(
     script: &serde_json::Value,
     reserve_tokens: u64,
 ) -> (std::sync::Arc<AgentSessionEngine>, tempfile::TempDir) {
+    crate::test_support::hermetic_env();
     let dir = tempfile::TempDir::new().unwrap();
     write_compaction_settings(dir.path(), reserve_tokens);
     let engine = AgentSessionEngine::new(AgentEngineConfig {

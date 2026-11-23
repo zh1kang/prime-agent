@@ -71,16 +71,30 @@ impl AgentSessionEngine {
             .clone()
     }
 
-    /// The current session's inbox store, when a session is built.
+    /// The current session's inbox store, when a session is built and its
+    /// model can read it. A CLI-backed model runs no RLM kernel, so it can
+    /// never call `rlm.inbox.read()`: it answers `None`, which every
+    /// router treats like `agentInbox.enabled: false` (direct notice rows,
+    /// no wake rows, no unread reminder).
     ///
     /// # Panics
     ///
     /// Panics when the inbox slot lock is poisoned.
     pub(crate) fn inbox(&self) -> Option<Arc<SessionInbox>> {
+        if self.is_cli_backed_model() {
+            return None;
+        }
         self.inbox
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    /// Whether the session's live model streams through an external CLI
+    /// (`antigravity-cli`, `claude-cli`, `cursor-cli`).
+    pub(crate) fn is_cli_backed_model(&self) -> bool {
+        self.session_model()
+            .is_ok_and(|model| is_cli_backed_api(&model.api))
     }
 
     /// Whether the given store is still the session's published inbox: the
@@ -160,6 +174,17 @@ impl AgentSessionEngine {
         }
         Some(inbox.withdraw_heartbeat(job_id))
     }
+}
+
+/// Whether an api id names a CLI-backed provider, which runs no RLM kernel
+/// and so cannot read the agent inbox.
+pub(crate) fn is_cli_backed_api(api: &str) -> bool {
+    matches!(
+        api,
+        pa_ai::antigravity::ANTIGRAVITY_API
+            | pa_ai::claude_cli::CLAUDE_CLI_API
+            | pa_ai::cursor_cli::CURSOR_CLI_API
+    )
 }
 
 /// `agentInbox.enabled` (default on): the kill switch that restores
@@ -248,4 +273,70 @@ pub(crate) fn spawn_inbox_reminder(
             );
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent_engine::AgentEngineConfig;
+
+    fn engine_on(
+        provider: Option<&str>,
+        model: Option<&str>,
+    ) -> (AgentSessionEngine, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let engine = AgentSessionEngine::new(AgentEngineConfig {
+            cwd: dir.path().to_path_buf(),
+            agent_dir,
+            provider: provider.map(str::to_owned),
+            model: model.map(str::to_owned),
+            api_key: None,
+            thinking: None,
+            session_dir: None,
+            session_file: None,
+            faux_script: None,
+            supervisor_link: None,
+            telemetry_disabled: None,
+            cron_store: None,
+            queued_steering_probe: None,
+        })
+        .unwrap();
+        (engine, dir)
+    }
+
+    #[test]
+    fn cli_backed_apis_are_recognized() {
+        assert!(is_cli_backed_api(pa_ai::antigravity::ANTIGRAVITY_API));
+        assert!(is_cli_backed_api(pa_ai::claude_cli::CLAUDE_CLI_API));
+        assert!(is_cli_backed_api(pa_ai::cursor_cli::CURSOR_CLI_API));
+        assert!(!is_cli_backed_api("anthropic-messages"));
+        assert!(!is_cli_backed_api("openai-responses"));
+    }
+
+    /// A CLI-backed session never exposes its store: the notice sink, the
+    /// agent-message and heartbeat routes, and the reminder cycle all see
+    /// no inbox, so no `[inbox …]` wake row or `[inbox reminder]` loop
+    /// ever asks it for an `rlm.inbox.read()` it cannot make.
+    #[test]
+    fn cli_backed_session_exposes_no_inbox_for_reminders() {
+        let (engine, _dir) = engine_on(Some("antigravity"), Some("gemini-4-neon"));
+        assert!(engine.is_cli_backed_model());
+        let inbox = Arc::new(SessionInbox::in_memory());
+        engine.set_inbox(Arc::clone(&inbox));
+        assert!(engine.inbox().is_none());
+        assert!(
+            engine.is_live_inbox(&inbox),
+            "the slot itself still holds the store"
+        );
+    }
+
+    #[test]
+    fn unresolved_model_keeps_the_inbox() {
+        let (engine, _dir) = engine_on(Some("no-such-provider"), Some("no-such-model"));
+        assert!(!engine.is_cli_backed_model());
+        engine.set_inbox(Arc::new(SessionInbox::in_memory()));
+        assert!(engine.inbox().is_some());
+    }
 }

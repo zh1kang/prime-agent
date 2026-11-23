@@ -345,7 +345,18 @@ impl TurnRunner {
                 .and_then(Value::as_str)
                 == Some(pa_core::session_engine::messages::TURN_HELD_NOTICE_CUSTOM_TYPE)
         });
-        let turn_held_window = (!pacing_only).then(|| {
+        let cli_backed_model = engine
+            .model_metadata()
+            .and_then(|meta| meta.get("api").and_then(Value::as_str).map(str::to_owned))
+            .is_some_and(|api| {
+                matches!(
+                    api.as_str(),
+                    pa_ai::antigravity::ANTIGRAVITY_API
+                        | pa_ai::claude_cli::CLAUDE_CLI_API
+                        | pa_ai::cursor_cli::CURSOR_CLI_API
+                )
+            });
+        let turn_held_window = (!pacing_only && !cli_backed_model).then(|| {
             let delivery = turn_held_delivery.clone();
             let core = Arc::clone(&self.core);
             let recovery = Arc::clone(&self.recovery);

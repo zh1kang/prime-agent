@@ -26,12 +26,49 @@ impl Worker {
         // the replacement gate so a session swap's model restore can never
         // interleave with it (one session, one mutation at a time).
         let _replacement_gate = self.replacement_gate.lock().await;
-        let Some(provider) = payload.get("provider").and_then(Value::as_str) else {
-            return response_failure(None, "set_model", "set_model requires a provider", None);
+        // A reused worker's create passes its `--model` flag as `selector`, resolved the way
+        // the create resolves it.
+        let selected;
+        let (provider, model_id) = if let Some(selector) =
+            payload.get("selector").and_then(Value::as_str)
+        {
+            let auth = pa_core::auth::AuthStorage::create(&self.config.agent_dir);
+            let registry = pa_core::models::ModelRegistry::create(
+                auth,
+                self.config.agent_dir.join("models.json"),
+            );
+            let resolved = pa_core::models::resolve_cli_model(
+                payload.get("provider").and_then(Value::as_str),
+                selector,
+                registry.get_all(),
+            );
+            let Some(model) = resolved.model else {
+                let error = resolved
+                    .error
+                    .unwrap_or_else(|| format!("Unknown model \"{selector}\""));
+                return response_failure(None, "set_model", &error, None);
+            };
+            selected = (model.provider.clone(), model.id.clone());
+            (selected.0.as_str(), selected.1.as_str())
+        } else {
+            let Some(provider) = payload.get("provider").and_then(Value::as_str) else {
+                return response_failure(None, "set_model", "set_model requires a provider", None);
+            };
+            let Some(model_id) = payload.get("modelId").and_then(Value::as_str) else {
+                return response_failure(None, "set_model", "set_model requires a modelId", None);
+            };
+            (provider, model_id)
         };
-        let Some(model_id) = payload.get("modelId").and_then(Value::as_str) else {
-            return response_failure(None, "set_model", "set_model requires a modelId", None);
-        };
+        let session_only = payload.get("sessionOnly").and_then(Value::as_bool) == Some(true);
+        let current = self.engine.model_metadata();
+        if session_only
+            && current.as_ref().is_some_and(|model| {
+                model["provider"].as_str() == Some(provider)
+                    && model["id"].as_str() == Some(model_id)
+            })
+        {
+            return response_success(None, "set_model", None);
+        }
         let model = match resolve_available_model(&self.config.agent_dir, provider, model_id) {
             Ok(model) => model,
             // A model whose provider is not signed in is a typed refusal
@@ -109,8 +146,10 @@ impl Worker {
             };
             // TS `session.setModel` persists the default provider/model so
             // the next session starts on the switched model.
-            let mut settings = pa_core::settings::SettingsManager::create(&cwd, &agent_dir);
-            let _ = settings.set_default_model_and_provider(&provider, &model_id);
+            if !session_only {
+                let mut settings = pa_core::settings::SettingsManager::create(&cwd, &agent_dir);
+                let _ = settings.set_default_model_and_provider(&provider, &model_id);
+            }
             Some(())
         })
         .await
@@ -163,6 +202,7 @@ impl Worker {
                 None,
             );
         };
+        let session_only = payload.get("sessionOnly").and_then(Value::as_bool) == Some(true);
         let previous = self.engine.effective_thinking_level();
         // The blocking switch owns the pre-switch level (the durable-row
         // change gate); the handler keeps its own copy for the roster push.
@@ -200,7 +240,7 @@ impl Worker {
             // TS persists the default when the model can think or the level
             // is a real reasoning request; the persisted value is the
             // clamped effective level, not the raw request.
-            if reasoning || effective != "off" {
+            if !session_only && (reasoning || effective != "off") {
                 let effective_level = pa_ai::models::thinking_level_from_str(&effective)
                     .expect("the engine reports a valid wire level");
                 let mut settings = pa_core::settings::SettingsManager::create(&cwd, &agent_dir);
@@ -249,6 +289,7 @@ mod tests {
     use serde_json::json;
 
     fn worker_config(dir: &std::path::Path) -> crate::worker::WorkerConfig {
+        crate::test_support::hermetic_env();
         crate::worker::WorkerConfig {
             socket_path: dir.join("worker.sock"),
             supervisor_socket_path: std::path::PathBuf::new(),
@@ -265,6 +306,7 @@ mod tests {
     /// A models.json fixture the `set_model` resolution reads (same shape
     /// as the setting-switches tests).
     fn models_fixture(dir: &std::path::Path) {
+        crate::test_support::hermetic_env();
         std::fs::create_dir_all(dir.join("agent")).expect("agent dir");
         std::fs::write(
             dir.join("agent").join("models.json"),
@@ -348,6 +390,61 @@ mod tests {
         assert_eq!(
             response.error.as_deref(),
             Some("This session does not support model switching")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reused_workers_model_flag_resolves_like_the_create() {
+        let dir = std::env::temp_dir().join(format!("pa-worker-sel-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        models_fixture(&dir);
+        std::fs::write(
+            dir.join("agent").join("settings.json"),
+            json!({ "allowedModels": ["anthropic/*"] }).to_string(),
+        )
+        .unwrap();
+        let worker = std::sync::Arc::new(crate::worker::Worker::new(worker_config(&dir), None));
+        let created = worker
+            .dispatch("create", &json!({ "noSession": true, "cwd": dir }))
+            .await;
+        assert!(created.success, "create failed: {created:?}");
+        // The allowlist names the resolved model, so it shows what each selector resolved to.
+        for selector in ["prime-inference/mock-1", "mock-1"] {
+            let response = worker
+                .dispatch(
+                    "set_model",
+                    &json!({
+                        "activeSessionId": "allowlist-session",
+                        "selector": selector,
+                        "sessionOnly": true,
+                    }),
+                )
+                .await;
+            assert!(!response.success);
+            assert!(
+                response
+                    .error
+                    .as_deref()
+                    .is_some_and(|e| e.starts_with("Model \"prime-inference/mock-1\" is blocked")),
+                "{selector}: {response:?}"
+            );
+        }
+        let response = worker
+            .dispatch(
+                "set_model",
+                &json!({"activeSessionId": "allowlist-session", "selector": "no-such-model"}),
+            )
+            .await;
+        assert!(!response.success);
+        assert!(!response
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("blocked"));
+        let settings = std::fs::read_to_string(dir.join("agent").join("settings.json")).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&settings).unwrap(),
+            json!({ "allowedModels": ["anthropic/*"] })
         );
     }
 

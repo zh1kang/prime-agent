@@ -58,6 +58,13 @@ pub(crate) fn advertised_server_capabilities(agent_dir: &Path) -> Vec<String> {
     capabilities
 }
 
+/// Write a host cell's outcome whole: a reader never sees a partial file.
+fn write_outcome(path: &Path, record: &Value) -> std::io::Result<()> {
+    let temporary = path.with_extension("tmp");
+    std::fs::write(&temporary, serde_json::to_vec(record)?)?;
+    std::fs::rename(&temporary, path)
+}
+
 impl Worker {
     /// `factory_activity`: one factory action over this session's kernel.
     /// The arm mirrors `handle_kernel_bash_activity`: the engine owns the
@@ -85,6 +92,43 @@ impl Worker {
             .and_then(Value::as_str)
             .map(str::to_string);
         let timeout_ms = payload.get("timeoutMs").and_then(Value::as_u64);
+        if action == "host" {
+            return self.handle_factory_host(payload).await;
+        }
+        let note = match payload.get("note") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(note)) => Some(note.trim()).filter(|note| !note.is_empty()),
+            Some(_) => {
+                return response_failure(
+                    None,
+                    "factory_activity",
+                    "factory activity note must be a string when provided",
+                    None,
+                );
+            }
+        };
+        if let (Some(note), "resume") = (note, action.as_str()) {
+            let Some(run_id) = run_id.as_deref().filter(|id| !id.trim().is_empty()) else {
+                return response_failure(
+                    None,
+                    "factory_activity",
+                    "factory activity resume requires runId",
+                    None,
+                );
+            };
+            let reply = match &self.agent_engine {
+                Some(engine) => engine.factory_resume_with_note(run_id, note).await,
+                None => Err(anyhow::anyhow!(
+                    pa_types::daemon::KERNEL_NOT_RUNNING_MESSAGE
+                )),
+            };
+            return match reply {
+                Ok(result) => response_success(None, "factory_activity", Some(result)),
+                Err(error) => {
+                    response_failure(None, "factory_activity", &format!("{error:#}"), None)
+                }
+            };
+        }
         // The `node` action's selectors ride the flattened rest map. Validate
         // present values before narrowing them: a malformed selector must not
         // turn into `None` and silently select the latest entry or instance.
@@ -180,6 +224,86 @@ impl Worker {
         }
     }
 
+    /// `factory_activity` `host`: start a factory host cell (`cell`) on this
+    /// session's kernel and answer once it runs. The cell outlives the
+    /// request, so its run lives with the daemon session instead of the
+    /// client that started it; when the cell ends, its outcome is written
+    /// to the optional `outcome` file as `{status, stdout, stderr, error}`.
+    async fn handle_factory_host(&self, payload: &Value) -> DaemonResponse {
+        let Some(cell) = payload
+            .get("cell")
+            .and_then(Value::as_str)
+            .filter(|cell| !cell.trim().is_empty())
+        else {
+            return response_failure(
+                None,
+                "factory_activity",
+                "factory activity host requires cell",
+                None,
+            );
+        };
+        let outcome = match payload.get("outcome") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(path)) if Path::new(path).is_absolute() => {
+                Some(std::path::PathBuf::from(path))
+            }
+            Some(_) => {
+                return response_failure(
+                    None,
+                    "factory_activity",
+                    "factory activity host outcome must be an absolute path",
+                    None,
+                );
+            }
+        };
+        let agent_dir = self.config.agent_dir.clone();
+        let enabled = tokio::task::spawn_blocking(move || factory_lane_enabled(&agent_dir))
+            .await
+            .unwrap_or(false);
+        if !enabled {
+            return response_failure(
+                None,
+                "factory_activity",
+                pa_core::refinement::FACTORY_DISABLED_MESSAGE,
+                None,
+            );
+        }
+        let Some(engine) = &self.agent_engine else {
+            return response_failure(
+                None,
+                "factory_activity",
+                pa_types::daemon::KERNEL_NOT_RUNNING_MESSAGE,
+                None,
+            );
+        };
+        let running = match engine.start_factory_host_cell(cell.to_string()).await {
+            Ok(running) => running,
+            Err(error) => {
+                return response_failure(None, "factory_activity", &format!("{error:#}"), None);
+            }
+        };
+        tokio::spawn(async move {
+            let record = match running.await {
+                Ok(Ok(result)) => json!({
+                    "status": if result.status == pa_core::kernel::shared::ExecuteStatus::Ok { "ok" } else { "error" },
+                    "stdout": result.stdout,
+                    "stderr": result.stderr,
+                    "error": result.error.map(|error| json!({ "ename": error.ename, "evalue": error.evalue })),
+                }),
+                Ok(Err(error)) => {
+                    json!({ "status": "error", "error": { "evalue": format!("{error:#}") } })
+                }
+                Err(error) => {
+                    json!({ "status": "error", "error": { "evalue": error.to_string() } })
+                }
+            };
+            if let Some(path) = outcome {
+                let _ = tokio::task::spawn_blocking(move || write_outcome(&path, &record)).await;
+            }
+        });
+        response_success(None, "factory_activity", Some(json!({ "hosting": true })))
+    }
+
     /// This session's stored factory specs; an in-memory session has none.
     async fn stored_factory_specs(&self) -> anyhow::Result<usize> {
         let artifacts = {
@@ -265,6 +389,113 @@ mod tests {
                 response.error.as_deref(),
                 Some(expected_error),
                 "{label}: {response:?}"
+            );
+        }
+        let _ = worker.dispatch("kill", &serde_json::json!({})).await;
+    }
+
+    /// A `resume` with a note runs the namespace's `resume(run_id, note)`: the run id and the
+    /// note reach it verbatim (quotes, newlines, and non-ASCII included), and the reply is the
+    /// wire payload the cell prints.
+    #[test]
+    fn a_noted_resume_forwards_the_note_to_the_factory_resume() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let package = dir.path().join("rlm");
+        std::fs::create_dir_all(&package).expect("package dir");
+        std::fs::write(package.join("__init__.py"), "").expect("package init");
+        std::fs::write(
+            package.join("factory.py"),
+            "async def resume_factory(run_id, note=None):\n    \
+                 return {'run_id': run_id, 'note': note, 'notes_applied': 1}\n\
+             def _wire_payload(value):\n    \
+                 return {'runId': value['run_id'], 'note': value['note'], 'notesApplied': value['notes_applied']}\n",
+        )
+        .expect("fake factory");
+        let note = "Use the \"fast\" path,\nnot 'slow' — ünïcode \\ ok";
+        let cell = crate::agent_engine::factory_resume_cell("run-1", note).unwrap();
+        let output = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(
+                "import ast, asyncio, sys\n\
+                 code = compile(sys.argv[1], '<cell>', 'exec', flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)\n\
+                 asyncio.run(eval(code, {}))\n",
+            )
+            .arg(&cell)
+            .env("PYTHONPATH", dir.path())
+            .output()
+            .expect("python3");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let reply: Value = serde_json::from_slice(&output.stdout).expect("wire payload");
+        assert_eq!(
+            reply,
+            json!({ "runId": "run-1", "note": note, "notesApplied": 1 })
+        );
+    }
+
+    /// The noted resume and the host lane validate before any kernel work; a session without
+    /// a kernel answers the noted resume with the kernel refusal, like the plain lane.
+    #[tokio::test]
+    async fn noted_resumes_and_hosts_validate_their_payloads() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).expect("sessions dir");
+        let worker = Worker::new(
+            crate::worker::WorkerConfig {
+                socket_path: dir.path().join("worker.sock"),
+                supervisor_socket_path: std::path::PathBuf::new(),
+                token: "token".to_string(),
+                worker_instance_id: String::new(),
+                active_session_id: "noted-resume".to_string(),
+                agent_dir: dir.path().join("agent"),
+                recovery_journal_path: dir.path().join("recovery.jsonl"),
+                telemetry_disabled: Some(true),
+                script: Some(serde_json::json!({ "responses": [] })),
+            },
+            None,
+        );
+        let created = worker
+            .dispatch(
+                "create",
+                &serde_json::json!({ "cwd": "/tmp", "sessionDir": sessions }),
+            )
+            .await;
+        assert!(created.success, "{created:?}");
+        let cases = [
+            (
+                json!({ "action": "resume", "runId": "run-1", "note": 3 }),
+                "factory activity note must be a string when provided",
+            ),
+            (
+                json!({ "action": "resume", "note": "retry" }),
+                "factory activity resume requires runId",
+            ),
+            (
+                json!({ "action": "resume", "runId": "run-1", "note": "retry" }),
+                pa_types::daemon::KERNEL_NOT_RUNNING_MESSAGE,
+            ),
+            (
+                json!({ "action": "host" }),
+                "factory activity host requires cell",
+            ),
+            (
+                json!({ "action": "host", "cell": "pass", "outcome": "relative.json" }),
+                "factory activity host outcome must be an absolute path",
+            ),
+            (
+                json!({ "action": "host", "cell": "pass" }),
+                pa_core::refinement::FACTORY_DISABLED_MESSAGE,
+            ),
+        ];
+        for (payload, expected_error) in cases {
+            let response = worker.dispatch("factory_activity", &payload).await;
+            assert_eq!(
+                response.error.as_deref(),
+                Some(expected_error),
+                "{payload}: {response:?}"
             );
         }
         let _ = worker.dispatch("kill", &serde_json::json!({})).await;

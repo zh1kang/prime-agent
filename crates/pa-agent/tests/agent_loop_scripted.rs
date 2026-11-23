@@ -841,3 +841,37 @@ fn scripted_event_shapes_round_trip_through_the_event_enum() {
             if matches!(**event, AssistantMessageEvent::Error { .. })
     )));
 }
+
+/// `end(Some(message))` on one thread and `result()` on another: the
+/// consumer must see the message, never "ended without a terminal event".
+#[test]
+fn a_stream_ended_with_a_result_on_another_thread_resolves_it() {
+    use pa_agent::stream::ModelStream;
+    let model = test_model();
+    let message = AssistantMessage {
+        content: Vec::new(),
+        api: model.api.clone(),
+        provider: model.provider.clone(),
+        model: model.id.clone(),
+        response_model: None,
+        response_id: None,
+        diagnostics: None,
+        usage: pa_agent::types::Usage::zero(),
+        stop_reason: StopReason::Stop,
+        stop_reason_raw: None,
+        error_message: None,
+        timestamp: 0,
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    for _ in 0..20_000 {
+        let (handle, mut consumer) = pa_agent::stream::event_stream();
+        let ended = message.clone();
+        let producer = std::thread::spawn(move || handle.end(Some(ended)));
+        let result = runtime.block_on(consumer.result());
+        producer.join().unwrap();
+        assert!(result.is_ok(), "{result:?}");
+    }
+}

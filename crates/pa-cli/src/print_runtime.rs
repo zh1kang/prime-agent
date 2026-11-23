@@ -207,8 +207,17 @@ fn daemon_acp_create(
     // client's own environment travels on the create so the session's
     // worker runs in the environment of the terminal that invoked it,
     // not the daemon's boot environment.
+    // A reused worker keeps the launch env of the client that started it, so a Captain
+    // identity never rides it: a session's tools derive their actor from RLM_SESSION_ID. The
+    // Captain homes stay, so those tools read the same project records.
     let launch_env = {
-        let env = pa_types::daemon::launch_env::collect_process_launch_env();
+        let mut env = pa_types::daemon::launch_env::collect_process_launch_env();
+        env.retain(|key, _| {
+            !matches!(
+                key.as_str(),
+                "PA_CAPTAIN_ACTOR" | "PA_CAPTAIN_SESSION" | "PA_CAPTAIN_SELECTION"
+            )
+        });
         (!env.is_empty()).then_some(env)
     };
     let create = pa_types::daemon::DaemonCommand::Create {

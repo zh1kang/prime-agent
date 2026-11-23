@@ -683,6 +683,7 @@ async fn rlm_max_depth_status_matches_the_ts_shape() {
 
 #[tokio::test]
 async fn model_catalog_and_available_models_match_the_ts_shapes() {
+    crate::test_support::hermetic_env();
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir_all(dir.path().join("agent")).expect("agent dir");
     std::fs::write(

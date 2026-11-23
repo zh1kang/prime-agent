@@ -2276,6 +2276,8 @@ async fn teardown(
     if let Some(hosted) = hosted.as_ref() {
         if let Some(turn) = hosted.turn.as_ref() {
             cancel_owned_admission(link, &binding.active_session_id, &turn.admission_id).await;
+            // The aborted turn's subagents would otherwise outlive the client that ran it.
+            let _ = cancel_outstanding_rlm_children(link, &binding.active_session_id).await;
         }
         if let Some(pause_id) = hosted.input_pause_id.as_ref() {
             let _ = release_session_input_pause(link, &binding.active_session_id, pause_id).await;

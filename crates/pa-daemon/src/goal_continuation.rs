@@ -247,6 +247,13 @@ impl AgentSessionEngine {
         if self.has_unsettled_rlm_work().await || self.has_live_background_bash_handles() {
             return false;
         }
+        if self
+            .factory_host_cells
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
+        {
+            return false;
+        }
         let probe = self
             .registered_jobs_probe
             .lock()

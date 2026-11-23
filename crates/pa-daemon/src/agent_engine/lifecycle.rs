@@ -144,6 +144,7 @@ impl AgentSessionEngine {
             stale_goal_terminal_pending: std::sync::Mutex::new(None),
             queue_modes,
             registered_jobs_probe: std::sync::Mutex::new(None),
+            factory_host_cells: std::sync::Arc::default(),
             session_file,
             selection: std::sync::RwLock::new(selection.clone()),
             restored_model: std::sync::Mutex::new(None),
@@ -787,6 +788,118 @@ impl AgentSessionEngine {
             .await
     }
 
+    /// The factory activity `resume` with a reviewer note. The kernel's
+    /// activity frame has no note field, so the resume runs as an internal
+    /// cell over the namespace's `resume(run_id, note)` on the already
+    /// running kernel; the reply is the activity lane's wire payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no session kernel is running or the resume
+    /// raises (the run is unknown or not paused).
+    pub async fn factory_resume_with_note(
+        &self,
+        run_id: &str,
+        note: &str,
+    ) -> anyhow::Result<Value> {
+        let manager = self
+            .running_kernel()
+            .await
+            .ok_or_else(|| anyhow::anyhow!(pa_types::daemon::KERNEL_NOT_RUNNING_MESSAGE))?;
+        // The resume cell would queue behind a running host cell, which
+        // owns its run and takes answers through its own control folder.
+        if self
+            .factory_host_cells
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
+        {
+            anyhow::bail!("A factory host runs on this session; answer the run through its host");
+        }
+        let cell = factory_resume_cell(run_id, note)?;
+        let result = manager
+            .execute(
+                &cell,
+                pa_core::kernel::shared::ExecuteOptions {
+                    internal: true,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        if result.status != pa_core::kernel::shared::ExecuteStatus::Ok {
+            let reason = result
+                .error
+                .map(|error| error.evalue)
+                .unwrap_or_else(|| "factory resume failed".to_string());
+            anyhow::bail!(reason);
+        }
+        let reply = result
+            .stdout
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("factory resume returned no result"))?;
+        Ok(serde_json::from_str(reply)?)
+    }
+
+    /// Start a factory host cell on this session's kernel, booting the
+    /// kernel when it is not running. The cell runs detached from the
+    /// request: it owns a run's whole lifetime, so a client that stops
+    /// waiting never stops it. While it runs, the kernel stays resident.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session is not built or its kernel cannot
+    /// start.
+    pub async fn start_factory_host_cell(
+        &self,
+        cell: String,
+    ) -> anyhow::Result<
+        tokio::task::JoinHandle<anyhow::Result<pa_core::kernel::shared::ExecuteResult>>,
+    > {
+        let model = self.resolve_model()?;
+        self.ensure_core_session_async(&model).await?;
+        let engine = self
+            .session
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!(pa_types::daemon::KERNEL_NOT_RUNNING_MESSAGE))?;
+        let provisioner = engine
+            .kernel_provisioner_weak()
+            .upgrade()
+            .ok_or_else(|| anyhow::anyhow!("The session kernel is unavailable"))?;
+        let manager = provisioner.ensure(None, None).await?;
+        let cells = Arc::clone(&self.factory_host_cells);
+        // A second host cell would queue behind the first for its whole run.
+        if cells
+            .compare_exchange(
+                0,
+                1,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            anyhow::bail!("A factory host already runs on this session");
+        }
+        Ok(tokio::spawn(async move {
+            let result = manager
+                .execute(&cell, pa_core::kernel::shared::ExecuteOptions::default())
+                .await;
+            cells.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            result
+        }))
+    }
+
+    async fn running_kernel(&self) -> Option<pa_core::kernel::manager::ReplKernelManager> {
+        let engine = self.session.lock().await.clone()?;
+        engine
+            .kernel_provisioner_weak()
+            .upgrade()
+            .and_then(|provisioner| provisioner.manager())
+            .filter(pa_core::kernel::manager::ReplKernelManager::is_running)
+    }
+
     /// Build the core session once (same once-only rule as `session_agent`),
     /// through the same guarded funnel.
     pub(crate) fn ensure_core_session(&self, model: &Model) -> anyhow::Result<()> {
@@ -1232,4 +1345,17 @@ impl AgentSessionEngine {
             }
         })
     }
+}
+
+/// The internal cell a noted `factory_activity` `resume` runs: the namespace's
+/// `resume(run_id, note)`, printing the activity lane's wire payload. Both values
+/// ride as JSON string literals, which Python reads verbatim.
+pub(crate) fn factory_resume_cell(run_id: &str, note: &str) -> anyhow::Result<String> {
+    Ok(format!(
+        "import json as _pa_json\n\
+         from rlm.factory import resume_factory as _pa_resume, _wire_payload as _pa_wire\n\
+         print(_pa_json.dumps(_pa_wire(await _pa_resume({}, {}))))\n",
+        serde_json::to_string(run_id)?,
+        serde_json::to_string(note)?,
+    ))
 }

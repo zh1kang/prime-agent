@@ -212,7 +212,10 @@ impl Supervisor {
                     return Err(anyhow!(rejection));
                 }
                 match self.reuse_summary_or_holder(resident, &path_text).await? {
-                    ReuseAnswer::Summary(summary) => return Ok(Some(summary)),
+                    ReuseAnswer::Summary(summary) => {
+                        self.apply_create_model(resident, command).await?;
+                        return Ok(Some(summary));
+                    }
                     // The routed resident went away with no successor: its teardown must
                     // settle, then the fresh classification re-checks the file (including any
                     // waitable successor).
@@ -291,6 +294,54 @@ impl Supervisor {
                 ))
             }
         }
+    }
+
+    /// A reused worker takes the create's `--model` and `--thinking` for its session only: the
+    /// global settings default stays what the user chose.
+    async fn apply_create_model(
+        self: &Arc<Self>,
+        resident: &Arc<ResidentWorker>,
+        command: &DaemonCommand,
+    ) -> Result<()> {
+        let DaemonCommand::Create {
+            config: Some(config),
+            ..
+        } = command
+        else {
+            return Ok(());
+        };
+        let model = config.get("model").and_then(Value::as_str);
+        let thinking = config.get("thinking").and_then(Value::as_str);
+        if model.is_none() && thinking.is_none() {
+            return Ok(());
+        }
+        let mut commands = Vec::new();
+        if let Some(model) = model {
+            let mut payload = json!({"selector": model});
+            if let Some(provider) = config.get("provider") {
+                payload["provider"] = provider.clone();
+            }
+            commands.push(("set_model", payload));
+        }
+        if let Some(level) = thinking {
+            commands.push(("set_thinking_level", json!({"level": level})));
+        }
+        for (name, mut payload) in commands {
+            payload["sessionOnly"] = json!(true);
+            let response = self
+                .route_command_ready_typed(
+                    resident,
+                    name,
+                    payload,
+                    ROUTE_TIMEOUT_MS,
+                    RouteAdmission::SupervisorInternal,
+                )
+                .await?;
+            if !response.success {
+                bail!(response.error.unwrap_or_else(|| format!("{name} failed")));
+            }
+        }
+        Ok(())
     }
 
     /// Wait until a holder that will not serve the create again is confirmed gone: only the

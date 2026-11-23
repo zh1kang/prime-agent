@@ -9,6 +9,38 @@
 #[cfg(test)]
 pub(crate) static TELEMETRY_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// The process `HOME` before [`hermetic_env`] replaced it.
+#[cfg(test)]
+static REAL_HOME: std::sync::OnceLock<Option<std::ffi::OsString>> = std::sync::OnceLock::new();
+
+/// Make this test binary independent of the user's machine, once per process: `HOME` points at
+/// an empty private directory (the `~/.agents/skills` scan and other home reads find nothing), and
+/// the claude and agy CLI providers skip ambient discovery (`PATH`, `~/.local/bin`, the T3 tools
+/// dir). A test that wants a local CLI sets `PA_CLAUDE_BIN` or `PA_ANTIGRAVITY_BIN` itself.
+#[cfg(test)]
+pub(crate) fn hermetic_env() {
+    static HOME_DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    // `REAL_HOME` initializes before `HOME` changes, so `real_home` never sees the test home.
+    REAL_HOME.get_or_init(|| std::env::var_os("HOME"));
+    HOME_DIR.get_or_init(|| {
+        let dir = tempfile::Builder::new()
+            .prefix("pa-daemon-test-home-")
+            .tempdir()
+            .expect("test home");
+        std::env::set_var("HOME", dir.path());
+        std::env::set_var("PA_CLAUDE_BIN", "none");
+        std::env::set_var("PA_ANTIGRAVITY_BIN", "none");
+        std::env::set_var("PA_CURSOR_BIN", "none");
+        dir
+    });
+}
+
+/// The user's real `HOME`, also after [`hermetic_env`] replaced the process value.
+#[cfg(test)]
+pub(crate) fn real_home() -> Option<std::ffi::OsString> {
+    REAL_HOME.get_or_init(|| std::env::var_os("HOME")).clone()
+}
+
 /// Write a harness store holding one factory spec per id (plus a memory, which never counts as a
 /// spec) — the on-disk shape the kernel's harness writes.
 #[cfg(test)]
@@ -201,10 +233,10 @@ impl Drop for KernelEnvOverride {
 /// The kernel python for the live-kernel tests (skipped without one).
 #[cfg(test)]
 pub(crate) fn live_kernel_python() -> Option<std::path::PathBuf> {
-    let candidate = std::path::PathBuf::from(std::env::var("HOME").map_or_else(
-        |_| "/home/ubuntu/.prime/agent/kernel-venv/bin/python".to_string(),
-        |home| format!("{home}/.prime/agent/kernel-venv/bin/python"),
-    ));
+    let candidate = real_home().map_or_else(
+        || std::path::PathBuf::from("/home/ubuntu/.prime/agent/kernel-venv/bin/python"),
+        |home| std::path::PathBuf::from(home).join(".prime/agent/kernel-venv/bin/python"),
+    );
     if candidate.exists() {
         return Some(candidate);
     }

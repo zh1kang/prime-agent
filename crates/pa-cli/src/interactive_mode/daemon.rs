@@ -175,6 +175,14 @@ fn spawn_supervisor_detached(socket_path: &Path, spawn_cwd: &Path, exe: &Path) -
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    // A Captain identity belongs to the session whose client carries it (the create's launch
+    // env), never to the shared daemon: a daemon that a Captain turn started would otherwise
+    // give every later session, including the user's own chats, that turn's actor.
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("PA_CAPTAIN_") {
+            command.env_remove(key);
+        }
+    }
     // The binary entry strips any inherited worker handshake env, so the
     // spawned supervisor never starts in worker mode. A daemon must also not
     // share the launching TUI's terminal session: a session-wide terminal

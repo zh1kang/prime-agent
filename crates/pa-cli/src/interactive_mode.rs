@@ -248,10 +248,7 @@ async fn run_agents_view_flow(
     // Every view run reuses the roster connection (a chat run hands it
     // back), so a switch back from a chat skips the handshake.
     let mut roster_link: Option<pa_tui::agents_view::AgentsViewLink> = None;
-    let mut frames: Vec<(
-        pa_tui::agents_view::AgentsViewScope,
-        Option<SessionSelection>,
-    )> = Vec::new();
+    let mut nav: NavStack<(InteractiveOptions, SelectionOrigin)> = NavStack::default();
     let mut query: Option<String> = None;
     // A dismissal survives the next view run.
     let mut incident_notice_state: Option<pa_tui::incident_notices::IncidentNoticeState> = None;
@@ -264,9 +261,12 @@ async fn run_agents_view_flow(
         // The session runs chained by handoffs, each with the options it ran
         // with; the origin is the requesting session (its options re-targeted
         // at its live runtime) and the page leaving the requested session
-        // reopens.
-        let mut origin: Option<(InteractiveOptions, SelectionOrigin)> = None;
+        // reopens. Origins never outlive their handoff chain.
+        nav.clear_origins();
         while let Some((ran_with, outcome)) = handoff.take() {
+            // A chat that switched sessions in place (F6/F7) left the scoped
+            // subtree it was opened from: its scope frames are stale.
+            nav.note_session_left(&outcome.active_session_id);
             if !outcome.session_id.is_empty() {
                 anchor = Some(outcome.session_id.clone());
             }
@@ -283,18 +283,14 @@ async fn run_agents_view_flow(
             if let Some(scope) = outcome.agents_view_scope {
                 // Push a frame with the session as the return chat and clear the
                 // query — a filter typed to find the session would hide the subtree.
-                frames.retain(|(frame, _)| frame.session_id != scope.session_id);
-                frames.push((
-                    scope,
-                    Some(SessionSelection::Attach(outcome.active_session_id.clone())),
-                ));
+                nav.push_scope(scope);
                 query = None;
             } else if let Some(selection) = outcome.selection_request {
-                origin = outcome.selection_origin.map(|page| {
+                if let Some(page) = outcome.selection_origin {
                     let mut requester = ran_with;
                     requester.session = SessionSelection::Attach(outcome.active_session_id);
-                    (requester, page)
-                });
+                    nav.push_origin((requester, page));
+                }
                 let mut next = base.clone();
                 if let SessionSelection::Resume(path) | SessionSelection::ResumeWith { path, .. } =
                     &selection
@@ -314,7 +310,7 @@ async fn run_agents_view_flow(
                 let outcome =
                     pa_tui::interactive::run_interactive(next.clone(), UiMode::Terminal).await?;
                 handoff = Some((next, outcome));
-            } else if let Some((requester, page)) = origin.take() {
+            } else if let Some((requester, page)) = nav.pop_origin() {
                 let outcome = pa_tui::interactive::run_interactive_origin_open(
                     requester.clone(),
                     UiMode::Terminal,
@@ -331,7 +327,7 @@ async fn run_agents_view_flow(
             theme: base.theme.clone(),
             version: base.version.clone(),
             anchor_session_id: anchor.clone(),
-            scope: frames.last().map(|(scope, _)| scope.clone()),
+            scope: nav.current_scope().cloned(),
             query: query.clone(),
             expanded_ancestors: expanded_ancestors.clone(),
             selected_row_identity: selected_row_identity.clone(),
@@ -369,7 +365,7 @@ async fn run_agents_view_flow(
         // both clear the query.
         let scope_frame_popped = view.scope_dropped || view.scope_popped;
         if scope_frame_popped {
-            frames.pop();
+            nav.pop_scope();
         }
         let Some(selection) = view.selection else {
             let _ = tokio::time::timeout(
@@ -386,6 +382,7 @@ async fn run_agents_view_flow(
         status_message = view.status_message.clone();
         incident_notice_state = Some(view.incident_notice_state);
         query = if scope_frame_popped { None } else { view.query };
+        nav.note_opened(&selection);
         let mut session_options = base.clone();
         session_options.session = selection;
         session_options.session_rlm_depth = view.opened_rlm_depth;
@@ -409,6 +406,197 @@ async fn run_agents_view_flow(
         base.initial_message = None;
         session_options.initial_message = None;
         handoff = Some((session_options, outcome));
+    }
+}
+
+/// One level of the agents-view flow's back path.
+#[derive(Debug, Clone)]
+enum NavEntry<Origin> {
+    /// A scoped agents view.
+    Scope(pa_tui::agents_view::AgentsViewScope),
+    /// The requesting session (and its page) a session-open hand-off returns to.
+    Origin(Origin),
+}
+
+/// The agents-view flow's one back stack: scoped agents-view frames and the
+/// session-open origins, popped one level per `←` / `Esc`.
+#[derive(Debug, Clone)]
+struct NavStack<Origin> {
+    entries: Vec<NavEntry<Origin>>,
+    /// The live session the scoped view opened last, while a scope frame is up.
+    opened_from_scope: Option<String>,
+}
+
+impl<Origin> Default for NavStack<Origin> {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            opened_from_scope: None,
+        }
+    }
+}
+
+impl<Origin> NavStack<Origin> {
+    /// Push a scope frame; a frame already open on the same session moves to the top.
+    fn push_scope(&mut self, scope: pa_tui::agents_view::AgentsViewScope) {
+        self.entries.retain(|entry| {
+            !matches!(entry, NavEntry::Scope(frame) if frame.session_id == scope.session_id)
+        });
+        self.entries.push(NavEntry::Scope(scope));
+    }
+
+    /// The innermost scope frame, the one the agents view opens on.
+    fn current_scope(&self) -> Option<&pa_tui::agents_view::AgentsViewScope> {
+        self.entries.iter().rev().find_map(|entry| match entry {
+            NavEntry::Scope(scope) => Some(scope),
+            NavEntry::Origin(_) => None,
+        })
+    }
+
+    /// Pop the innermost scope frame.
+    fn pop_scope(&mut self) {
+        if let Some(index) = self
+            .entries
+            .iter()
+            .rposition(|entry| matches!(entry, NavEntry::Scope(_)))
+        {
+            self.entries.remove(index);
+        }
+        if self.current_scope().is_none() {
+            self.opened_from_scope = None;
+        }
+    }
+
+    /// Record the requesting session a session open returns to (one at a
+    /// time: a newer request replaces the older origin).
+    fn push_origin(&mut self, origin: Origin) {
+        self.clear_origins();
+        self.entries.push(NavEntry::Origin(origin));
+    }
+
+    /// Take the innermost origin.
+    fn pop_origin(&mut self) -> Option<Origin> {
+        let index = self
+            .entries
+            .iter()
+            .rposition(|entry| matches!(entry, NavEntry::Origin(_)))?;
+        match self.entries.remove(index) {
+            NavEntry::Origin(origin) => Some(origin),
+            NavEntry::Scope(_) => None,
+        }
+    }
+
+    fn clear_origins(&mut self) {
+        self.entries
+            .retain(|entry| matches!(entry, NavEntry::Scope(_)));
+    }
+
+    /// The agents view opened `selection`: while a scope frame is up, the
+    /// live session it names is the one its chat run should come back as.
+    fn note_opened(&mut self, selection: &SessionSelection) {
+        self.opened_from_scope = match selection {
+            SessionSelection::Attach(id) if self.current_scope().is_some() => Some(id.clone()),
+            _ => None,
+        };
+    }
+
+    /// A chat run ended on `active_session_id`: when it is not the session
+    /// the scoped view opened, the chat switched sessions in place and every
+    /// scope frame is stale.
+    fn note_session_left(&mut self, active_session_id: &str) {
+        let Some(opened) = self.opened_from_scope.take() else {
+            return;
+        };
+        if !active_session_id.is_empty() && opened != active_session_id {
+            self.entries
+                .retain(|entry| !matches!(entry, NavEntry::Scope(_)));
+        }
+    }
+}
+
+#[cfg(test)]
+mod nav_stack_tests {
+    use super::{NavStack, SessionSelection};
+    use pa_tui::agents_view::AgentsViewScope;
+
+    fn scope(session: &str) -> AgentsViewScope {
+        AgentsViewScope {
+            session_id: Some(session.to_string()),
+            active_session_id: Some(format!("active-{session}")),
+            session_name: None,
+        }
+    }
+
+    fn current(nav: &NavStack<&'static str>) -> Option<String> {
+        nav.current_scope()
+            .and_then(|scope| scope.session_id.clone())
+    }
+
+    #[test]
+    fn scope_frames_pop_one_level_at_a_time() {
+        let mut nav: NavStack<&'static str> = NavStack::default();
+        nav.push_scope(scope("a"));
+        nav.push_scope(scope("b"));
+        assert_eq!(current(&nav).as_deref(), Some("b"));
+        nav.pop_scope();
+        assert_eq!(current(&nav).as_deref(), Some("a"));
+        nav.pop_scope();
+        assert_eq!(current(&nav), None);
+        nav.pop_scope();
+        assert_eq!(current(&nav), None);
+    }
+
+    #[test]
+    fn a_reopened_scope_moves_to_the_top_without_duplicating() {
+        let mut nav: NavStack<&'static str> = NavStack::default();
+        nav.push_scope(scope("a"));
+        nav.push_scope(scope("b"));
+        nav.push_scope(scope("a"));
+        assert_eq!(current(&nav).as_deref(), Some("a"));
+        nav.pop_scope();
+        assert_eq!(current(&nav).as_deref(), Some("b"));
+        nav.pop_scope();
+        assert_eq!(current(&nav), None);
+    }
+
+    #[test]
+    fn origins_pop_once_and_never_disturb_the_scope_frames() {
+        let mut nav: NavStack<&'static str> = NavStack::default();
+        nav.push_scope(scope("a"));
+        nav.push_origin("first");
+        nav.push_origin("second");
+        assert_eq!(nav.pop_origin(), Some("second"));
+        assert_eq!(nav.pop_origin(), None);
+        nav.push_origin("third");
+        nav.clear_origins();
+        assert_eq!(nav.pop_origin(), None);
+        assert_eq!(current(&nav).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn an_in_place_session_switch_clears_the_stale_scope_frames() {
+        let mut nav: NavStack<&'static str> = NavStack::default();
+        nav.push_scope(scope("a"));
+        nav.note_opened(&SessionSelection::Attach("child".into()));
+        nav.note_session_left("child");
+        assert_eq!(
+            current(&nav).as_deref(),
+            Some("a"),
+            "same session keeps scope"
+        );
+
+        nav.note_opened(&SessionSelection::Attach("child".into()));
+        nav.note_session_left("other-crew-thread");
+        assert_eq!(current(&nav), None, "an F7 switch leaves the scope");
+    }
+
+    #[test]
+    fn opening_without_a_scope_tracks_nothing() {
+        let mut nav: NavStack<&'static str> = NavStack::default();
+        nav.note_opened(&SessionSelection::Attach("chat".into()));
+        nav.push_scope(scope("a"));
+        nav.note_session_left("elsewhere");
+        assert_eq!(current(&nav).as_deref(), Some("a"));
     }
 }
 

@@ -284,13 +284,16 @@ impl AssistantMessageEventStreamHandle {
     ///
     /// Panics if the `closed` or `result` mutex is poisoned.
     pub fn end(&self, result: Option<AssistantMessage>) {
-        *self.shared.closed.lock().unwrap() = true;
+        // The result lands before `closed`: a consumer on another thread
+        // that reads `closed` then finds the result, never a false
+        // "ended without a terminal event".
         if let Some(message) = result {
             let mut result_slot = self.shared.result.lock().unwrap();
             if result_slot.is_none() {
                 *result_slot = Some(message);
             }
         }
+        *self.shared.closed.lock().unwrap() = true;
         self.shared.notify.notify_waiters();
     }
 }
@@ -336,19 +339,19 @@ impl ModelStream for AssistantMessageEventStream {
     fn result(&mut self) -> crate::BoxFut<'_, anyhow::Result<AssistantMessage>> {
         Box::pin(async {
             loop {
+                // Register the wake before the checks: an `end` between the
+                // checks and the await still wakes this wait.
+                let notified = self.shared.notify.notified();
                 if let Some(message) = self.shared.result.lock().unwrap().clone() {
                     return Ok(message);
                 }
                 if *self.shared.closed.lock().unwrap() {
-                    // Stream ended without a terminal event; unlike TS (which
-                    // hangs forever), surface an error.
+                    // `end` stores the result before `closed`, so a closed
+                    // stream without one ended without a terminal event;
+                    // unlike TS (which hangs forever), surface an error.
                     return Err(anyhow::anyhow!(
                         "Assistant message event stream ended without a terminal done/error event"
                     ));
-                }
-                let notified = self.shared.notify.notified();
-                if let Some(message) = self.shared.result.lock().unwrap().clone() {
-                    return Ok(message);
                 }
                 notified.await;
             }

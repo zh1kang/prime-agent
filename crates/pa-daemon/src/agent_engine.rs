@@ -48,6 +48,9 @@ pub(crate) use tests::FAUX_TEST_LOCK;
 
 mod goalcore;
 mod lifecycle;
+#[cfg(test)]
+#[cfg(test)]
+pub(crate) use lifecycle::factory_resume_cell;
 mod turn_types;
 
 use turn_types::{
@@ -172,6 +175,9 @@ pub struct AgentSessionEngine {
     /// (must not lose its kernel). `None` keeps the release open.
     pub(crate) registered_jobs_probe:
         std::sync::Mutex<Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>>,
+    /// Factory host cells running on this session's kernel (`factory_activity`
+    /// `host`): each owns a live run's loop, so the kernel must stay resident.
+    pub(crate) factory_host_cells: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// The worker-owned session file (conversation-log path), set at create.
     session_file: std::sync::Mutex<Option<std::path::PathBuf>>,
     /// The authoritative model selection: the process fallback, re-bound when

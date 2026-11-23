@@ -309,6 +309,7 @@ fn restore_test_engine(
     provider: Option<&str>,
     model: Option<&str>,
 ) -> AgentSessionEngine {
+    crate::test_support::hermetic_env();
     AgentSessionEngine::new(AgentEngineConfig {
         cwd: dir.to_path_buf(),
         agent_dir: dir.join("agent"),
