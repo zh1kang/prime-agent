@@ -83,6 +83,9 @@ struct RawRun {
     max_children: Option<i64>,
     max_transitions: Option<i64>,
     failure_policy: Option<String>,
+    repair_wait_ms: Option<i64>,
+    budget_tokens: Option<i64>,
+    budget_usd: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -510,6 +513,24 @@ fn build_run(raw: RawRun, problems: &mut Vec<Diagnostic>) -> RunSettings {
         failure_policy: raw
             .failure_policy
             .and_then(|text| policy(&text, "run.failure_policy", problems)),
+        repair_wait_ms: raw
+            .repair_wait_ms
+            .and_then(|value| bounded(value, 1, i64::MAX, "run.repair_wait_ms", problems)),
+        budget_tokens: raw
+            .budget_tokens
+            .and_then(|value| bounded(value, 1, i64::MAX, "run.budget_tokens", problems)),
+        budget_usd: raw.budget_usd.and_then(|value| {
+            if value.is_finite() && value > 0.0 {
+                Some(value)
+            } else {
+                problems.push(Diagnostic::new(
+                    MACHINE_FILE,
+                    "run.budget_usd",
+                    format!("must be a positive number, got {value}"),
+                ));
+                None
+            }
+        }),
     }
 }
 

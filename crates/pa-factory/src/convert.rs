@@ -425,10 +425,19 @@ fn machine_toml(meta: &MachineMeta, run: &Map<String, Value>, states: &[StateOut
     {
         run_lines.push(format!("budget = {}", quote(&words)));
     }
-    for key in ["max_parallel", "max_children", "max_transitions"] {
+    for key in [
+        "max_parallel",
+        "max_children",
+        "max_transitions",
+        "repair_wait_ms",
+        "budget_tokens",
+    ] {
         if let Some(value) = run.get(key).and_then(Value::as_u64) {
             run_lines.push(format!("{key} = {value}"));
         }
+    }
+    if let Some(value) = run.get("budget_usd").and_then(Value::as_f64) {
+        run_lines.push(format!("budget_usd = {value:?}"));
     }
     if let Some(policy) = run.get("failure_policy").and_then(Value::as_str) {
         run_lines.push(format!("failure_policy = {}", quote(policy)));

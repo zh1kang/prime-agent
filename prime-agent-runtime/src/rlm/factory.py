@@ -295,6 +295,15 @@ def _validate_run_fields(run: Any, errors: list[str]) -> int | None:
         _is_positive_int(max_children) and max_children <= MAX_CHILDREN_CAP
     ):
         errors.append(f"run max_children must be a positive integer no greater than {MAX_CHILDREN_CAP}")
+    if "repair_wait_ms" in run and not _is_positive_int(run.get("repair_wait_ms")):
+        errors.append("run repair_wait_ms must be a positive integer")
+    if "budget_tokens" in run and not _is_positive_int(run.get("budget_tokens")):
+        errors.append("run budget_tokens must be a positive integer")
+    budget_usd = run.get("budget_usd")
+    if "budget_usd" in run and not (
+        _is_number(budget_usd) and math.isfinite(budget_usd) and budget_usd > 0
+    ):
+        errors.append("run budget_usd must be a positive number")
     return run_budget
 
 
@@ -960,8 +969,9 @@ def _canonicalize_machine(machine: dict[str, Any]) -> dict[str, Any]:
         ),
         "max_children": run_in.get("max_children", RUN_MAX_CHILDREN_DEFAULT),
     }
-    if "budget_ms" in run_in:
-        run["budget_ms"] = run_in["budget_ms"]
+    for key in RUN_OPTIONAL_KEYS:
+        if key in run_in:
+            run[key] = run_in[key]
     states_out: list[dict[str, Any]] = []
     for state in machine["states"]:
         state_out: dict[str, Any] = {
@@ -1254,6 +1264,71 @@ FACTORY_OUTPUTS_FILE = "factory-outputs.json"
 """A factory child's accepted outputs, beside its session file: the
 child's ``factory.emit`` host request writes it, the executor reads it."""
 
+CLI_BACKED_MODEL_PREFIXES = ("antigravity/", "antigravity-cli/", "cursor/", "cursor-cli/", "claude-cli/")
+"""Model prefixes whose children run inside an external CLI with no Python
+REPL, so they cannot call ``rlm.factory.emit``."""
+
+EMITS_DIR_NAME = "emits"
+"""Under the runs dir: one JSON file per CLI-backed attempt, the outputs
+that attempt may write instead of a fenced ``factory-outputs`` block."""
+
+_FACTORY_OUTPUTS_BLOCK_RE = re.compile(r"```factory[-_]outputs[ \t]*\r?\n(.*?)```", re.DOTALL)
+
+
+def _is_cli_backed_model(model: str | None) -> bool:
+    return isinstance(model, str) and model.lower().startswith(CLI_BACKED_MODEL_PREFIXES)
+
+
+def _emit_file_path(run_id: str, state_id: str, entry_index: int, instance_index: int, attempt: int) -> Path | None:
+    directory = _runs_dir()
+    if directory is None:
+        return None
+    return directory / EMITS_DIR_NAME / f"{run_id}-{state_id}-{entry_index}-{instance_index}-{attempt}.json"
+
+
+def _outputs_from_text(answer: str, ports: "set[str]", cli_backed: bool) -> dict[str, Any] | None:
+    """The last fenced ``factory-outputs`` JSON object in an answer; for a
+    CLI-backed child, else the last ``json`` block whose keys are all
+    declared ports. Native children's plain ``json`` blocks never bind."""
+    for body in reversed(_FACTORY_OUTPUTS_BLOCK_RE.findall(answer)):
+        try:
+            parsed = json.loads(body)
+        except ValueError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    if not cli_backed:
+        return None
+    for body in reversed(_FENCED_JSON_RE.findall(answer)):
+        try:
+            parsed = json.loads(body)
+        except ValueError:
+            continue
+        if isinstance(parsed, dict) and parsed and set(parsed) <= ports:
+            return parsed
+    return None
+
+
+def _cli_outputs_example(declared: "list[dict[str, Any]]") -> str:
+    return json.dumps({out["name"]: "..." for out in declared})
+
+
+def _cli_outputs_section(declared: "list[dict[str, Any]]", emit_file: Path | None) -> str:
+    """The outputs instruction for a CLI-backed child, which has no REPL."""
+    ports = "\n".join(f"- `{out['name']}`: {out.get('type')}" for out in declared)
+    file_line = (
+        f"\n\nOr write that same JSON object to `{emit_file}`." if emit_file is not None else ""
+    )
+    return (
+        "## Outputs (this session has no Python REPL)\n\n"
+        "`rlm.factory.emit` is not available here; ignore any instruction to call it. "
+        "End your final response with a fenced block labeled `factory-outputs` holding "
+        "one JSON object with every output:\n\n"
+        f"```factory-outputs\n{_cli_outputs_example(declared)}\n```{file_line}\n\n"
+        "Each value must be JSON of its port's type (a type ending in `?` is optional):\n"
+        f"{ports}"
+    )
+
 RUNS_DIR_NAME = "factory-runs"
 #: The append-only tombstone ledger: one line per terminal run (the
 #: registry's durable post-mortem record — see _retire_run_files).
@@ -1322,6 +1397,117 @@ message, to emit them before its entry fails with ``missing_output``."""
 
 REPAIR_POLL_SECONDS = 5.0
 """How often a repairing child's outputs file is re-read."""
+
+REPAIR_WAIT_ENV = "PA_FACTORY_REPAIR_WAIT_SECONDS"
+"""Operator/test override of the repair wait; a run's ``repair_wait_ms`` wins."""
+
+RUN_OPTIONAL_KEYS = ("budget_ms", "repair_wait_ms", "budget_tokens", "budget_usd")
+"""Optional run-block keys carried verbatim through compile and canonicalization."""
+
+RETRY_CONTEXT_CAP = 1500
+"""Characters of the previous failed attempt's error a retry's prompt carries."""
+
+REPEAT_ERROR_LIMIT = 2
+"""Consecutive failed attempts with one normalized error signature before the
+run pauses as ``stuck_repeat_error`` instead of spending more retries."""
+
+_ERROR_NOISE_PATTERNS = (
+    (re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?"), "<ts>"),
+    (re.compile(r"\b\d{1,2}:\d{2}:\d{2}(?:\.\d+)?\b"), "<time>"),
+    (re.compile(r"0x[0-9a-fA-F]+"), "<addr>"),
+    (re.compile(r"(?:/private)?/(?:tmp|var/folders)/\S+"), "<tmp>"),
+    (re.compile(r"\b[0-9a-f]{12,}\b"), "<hex>"),
+    (re.compile(r"\b\d+(?:\.\d+)?\s*(?:ms|s)\b"), "<dur>"),
+)
+
+
+def _error_signature(error: str) -> str:
+    """A stable digest of an error with timestamps, addresses, temp paths,
+    durations, and whitespace noise removed: two attempts that hit the same
+    failure hash alike even when their incidental details differ."""
+    text = error
+    for pattern, replacement in _ERROR_NOISE_PATTERNS:
+        text = pattern.sub(replacement, text)
+    text = re.sub(r"\s+", " ", text).strip().lower()
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _retry_context(error: str) -> str:
+    """The failed attempt's error, trimmed for a retry prompt: blank lines
+    and repeated lines drop, and an overlong error keeps its tail (the
+    final lines usually name the failure)."""
+    lines: list[str] = []
+    for raw in error.splitlines():
+        line = raw.rstrip()
+        if line.strip() and (not lines or lines[-1] != line):
+            lines.append(line)
+    text = "\n".join(lines)
+    if len(text) > RETRY_CONTEXT_CAP:
+        text = "..." + text[-(RETRY_CONTEXT_CAP - 3):]
+    return text
+
+
+def _attempt_prompt(instance: "_NodeInstance") -> str:
+    """The prompt one admission sends: the rendered prompt, plus the
+    previous failure and the latest reviewer note when present. Neither
+    is ever folded into ``instance.prompt``, so repeated retries and
+    resumes carry exactly one of each."""
+    parts = [instance.prompt]
+    if instance.retry_context:
+        parts.append(
+            "Your previous attempt at this task failed with:\n"
+            f"{instance.retry_context}\n"
+            "Do not repeat that mistake."
+        )
+    if instance.resume_note:
+        parts.append(f"Reviewer note for this retry: {instance.resume_note}")
+    return "\n\n".join(parts)
+
+
+def _run_block(run: "FactoryRun") -> dict[str, Any]:
+    block = run.machine.get("run") if isinstance(run.machine, dict) else None
+    return block if isinstance(block, dict) else {}
+
+
+def _repair_wait_seconds(run: "FactoryRun") -> float:
+    """The run's ``repair_wait_ms``, else the env override, else the default."""
+    wait_ms = _run_block(run).get("repair_wait_ms")
+    if _is_positive_int(wait_ms):
+        return wait_ms / 1000.0
+    try:
+        override = float(os.environ.get(REPAIR_WAIT_ENV, ""))
+    except ValueError:
+        override = None
+    if override is not None and math.isfinite(override) and override > 0:
+        return override
+    return REPAIR_WAIT_SECONDS
+
+
+def _add_result_usage(run: "FactoryRun", result: Any) -> None:
+    """Fold a settle's ``total_tokens`` / ``cost_usd`` into the run totals
+    when the host reports them."""
+    tokens = getattr(result, "total_tokens", None)
+    if _is_int(tokens) and tokens > 0:
+        run.token_total += tokens
+    cost = getattr(result, "cost_usd", None)
+    if _is_number(cost) and math.isfinite(cost) and cost > 0:
+        run.cost_usd_total += float(cost)
+
+
+def _state_role(state: "_StateRun") -> str | None:
+    subagent = state.spec.get("subagent")
+    role = subagent.get("role") if isinstance(subagent, dict) else None
+    return role if isinstance(role, str) else None
+
+
+def _instance_display_name(
+    run_name: str | None, state: "_StateRun", entry: "_StateEntry", instance: "_NodeInstance"
+) -> str:
+    """A human-readable instance label for status surfaces. Display only:
+    the supervisor's sibling name stays ``child_name`` (unique, ASCII,
+    capped at 64 characters)."""
+    label = f"{state.state_id} #{entry.index}.{instance.attempt}"
+    return f"{run_name} › {label}" if run_name else label
 
 
 class FactoryEmitError(ValueError):
@@ -1886,12 +2072,19 @@ class _NodeInstance:
     session_dir: str | None = None  # the child's session dir: its emitted outputs live there
     child_name: str | None = None  # the child's session name (the repair message's receiver)
     repair_sent: bool = False  # the one "you still owe ..." message went to this child
+    text_outputs_checked: str | None = None  # the last answer/emit-file outputs
+    # sent to factory.check, so an unchanged candidate is not re-checked each poll
+    text_outputs_error: str | None = None  # why factory.check refused that candidate
     awaiting_outputs_until: float | None = None  # repairing: the child is re-polled
     # for its emitted outputs until this deadline
     ownership_change_in_progress: bool = False  # an admission or deletion owns the actor slot
     factory_task_activity: str | None = None  # busy, idle, or unverified for factory children
     process: "_PythonProcess | None" = None  # a python state's running call
     deadline: float | None = None  # a python call's time limit (seconds on the injected clock)
+    resume_note: str | None = None  # the latest reviewer note; replaced, never accumulated
+    retry_context: str | None = None  # the previous failed attempt's trimmed error
+    repeat_error_sig: str | None = None  # normalized signature of the last failure
+    repeat_error_count: int = 0  # consecutive failures sharing repeat_error_sig
 
 
 @dataclass
@@ -2012,6 +2205,11 @@ class FactoryRun:
     settle_count: int = 0
     transitions_fired: int = 0
     tool_use_total: int = 0
+    # Settled children's reported usage (absent from a host that does not
+    # report it); run.budget_tokens / run.budget_usd cap these.
+    token_total: int = 0
+    cost_usd_total: float = 0.0
+    usage_budget_reported: bool = False
     task: "Any | None" = None
     # The control loop's generation: resume() bumps it so a pause-path task
     # that is still winding down (an in-flight milestone await) can never
@@ -2174,6 +2372,10 @@ def _instance_json(instance: _NodeInstance) -> dict[str, Any]:
         "repair_sent": instance.repair_sent,
         "awaiting_outputs_until": instance.awaiting_outputs_until,
         "deadline": instance.deadline,
+        "resume_note": instance.resume_note,
+        "retry_context": instance.retry_context,
+        "repeat_error_sig": instance.repeat_error_sig,
+        "repeat_error_count": instance.repeat_error_count,
     }
 
 
@@ -2184,9 +2386,11 @@ def _instance_from_json(data: dict[str, Any]) -> _NodeInstance:
         "rate_limit_streak", "child_id", "spawned_at", "duration_ms", "answer",
         "provisional", "error", "tool_uses", "inputs", "session_dir",
         "child_name", "factory_task_activity", "repair_sent", "awaiting_outputs_until", "deadline",
+        "resume_note", "retry_context", "repeat_error_sig",
     ):
         setattr(instance, field, data.get(field))
     instance.attempt = data.get("attempt") or 0
+    instance.repeat_error_count = data.get("repeat_error_count") or 0
     instance.tool_uses = data.get("tool_uses") or 0
     if instance.child_id is not None and instance.status != "running" and instance.factory_task_activity is None:
         instance.factory_task_activity = "unverified"
@@ -2361,6 +2565,9 @@ def _run_json(run: FactoryRun, clock: dict[str, float] | None = None) -> dict[st
         "settle_count": run.settle_count,
         "transitions_fired": run.transitions_fired,
         "tool_use_total": run.tool_use_total,
+        "token_total": run.token_total,
+        "cost_usd_total": run.cost_usd_total,
+        "usage_budget_reported": run.usage_budget_reported,
         "loop_generation": run.loop_generation,
         "admission_backoff_until": run.admission_backoff_until,
         "paused_ms": run.paused_ms,
@@ -2388,8 +2595,10 @@ def _run_from_json(data: dict[str, Any]) -> FactoryRun:
         "max_transitions_reported", "max_children_reported",
         "budget_reported", "spawn_count", "settle_count",
         "transitions_fired", "tool_use_total", "loop_generation", "revision",
+        "token_total", "usage_budget_reported",
     ):
         setattr(run, field, data.get(field) or 0)
+    run.cost_usd_total = float(data.get("cost_usd_total") or 0.0)
     # A budget rides verbatim: JSON null is no budget (a 0 default is the
     # canonical machine's own zero, not this loader's).
     run.run_budget_ms = data.get("run_budget_ms")
@@ -3355,7 +3564,7 @@ class FactoryExecutor:
             if retired is not None:
                 return retired
             raise ValueError(f"unknown factory run {run_id!r}")
-        nodes = [self._state_report(run.states[state_id]) for state_id in run.order]
+        nodes = [self._state_report(run.states[state_id], run_name=run.name) for state_id in run.order]
         for event in run.events:
             if event["stage"] in ("recorded", "arrived"):
                 event["stage"] = "delivered"
@@ -3420,8 +3629,9 @@ class FactoryExecutor:
     async def resume(self, run_id: str, note: str | None = None) -> dict[str, Any]:
         """Resume a paused run (escalate, budget, or max_transitions pause).
 
-        ``note`` is reviewer guidance for an escalate pause: it is appended
-        to the prompt of every re-admitted instance. ``notes_applied`` in the
+        ``note`` is reviewer guidance for an escalate pause: every
+        re-admitted instance carries it (the latest note only) on its
+        next prompt. ``notes_applied`` in the
         result counts those instances, so a caller can tell when a budget or
         max_transitions pause had no failed attempt to carry the note.
 
@@ -3497,8 +3707,9 @@ class FactoryExecutor:
         re-binds through the readiness pass, and a still-broken upstream
         settles it into the same pause again.
 
-        A ``note`` is appended to each re-admitted instance's prompt as
-        reviewer guidance. Returns how many instances received it.
+        A ``note`` becomes each re-admitted instance's ``resume_note``
+        (replacing any earlier one) and rides the next admission's prompt
+        as reviewer guidance. Returns how many instances received it.
         """
         applied = 0
         for state_id in run.order:
@@ -3521,8 +3732,10 @@ class FactoryExecutor:
                     instance.rate_limit_streak = 0
                     instance.retry_base = instance.attempt
                     instance.infra_respawned = False
+                    instance.repeat_error_sig = None
+                    instance.repeat_error_count = 0
                     if note:
-                        instance.prompt = f"{instance.prompt}\n\nReviewer note for this retry: {note}"
+                        instance.resume_note = note
                         applied += 1
                 self._event(
                     run,
@@ -3540,7 +3753,7 @@ class FactoryExecutor:
     # -- graph, watch, host activity ------------------------------------------
 
     def _state_report(
-        self, state: _StateRun, *, include_answer: bool = True
+        self, state: _StateRun, *, include_answer: bool = True, run_name: str | None = None
     ) -> dict[str, Any]:
         """One state's live report, the exact ``status()`` node shape.
 
@@ -3576,6 +3789,10 @@ class FactoryExecutor:
                     "child": instance.child_id,
                     "duration_ms": instance.duration_ms,
                     "error": instance.error,
+                    "child_name": instance.child_name,
+                    "display_name": _instance_display_name(run_name, state, entry, instance),
+                    "session_dir": instance.session_dir,
+                    "spawned_at": instance.spawned_at,
                     **(
                         {"factory_task_activity": instance.factory_task_activity}
                         if instance.factory_task_activity is not None
@@ -3598,6 +3815,9 @@ class FactoryExecutor:
                 if instance.status == "pending"
             ),
         }
+        for key, value in (("model", state.model), ("thinking", state.thinking), ("role", _state_role(state))):
+            if value is not None:
+                report[key] = value
         if include_answer:
             latest = state.latest_settle()
             if latest is not None and latest.answer:
@@ -3668,7 +3888,7 @@ class FactoryExecutor:
                 "name": run.name,
                 "template": template,
                 "template_truncated": template_truncated,
-                "state": self._state_report(state, include_answer=False),
+                "state": self._state_report(state, include_answer=False, run_name=run.name),
                 "entry": None,
                 "instance": None,
             }
@@ -3690,7 +3910,7 @@ class FactoryExecutor:
                 )
         else:
             instance = instances[-1] if instances else None
-        prompt = (instance.prompt if instance is not None else None) or ""
+        prompt = (_attempt_prompt(instance) if instance is not None else None) or ""
         prompt_truncated = len(prompt.encode("utf-8")) > NODE_PROMPT_CAP
         if prompt_truncated:
             prompt = prompt.encode("utf-8")[:NODE_PROMPT_CAP].decode(
@@ -3746,7 +3966,7 @@ class FactoryExecutor:
             "name": run.name,
             "template": template,
             "template_truncated": template_truncated,
-            "state": self._state_report(state, include_answer=False),
+            "state": self._state_report(state, include_answer=False, run_name=run.name),
             "entry": {
                 "index": entry.index,
                 "status": entry.status,
@@ -3768,6 +3988,8 @@ class FactoryExecutor:
             "max_children": run.max_children,
             "running": self._running_instance_count(run),
             "transitions_fired": run.transitions_fired,
+            "tokens": run.token_total,
+            "cost_usd": run.cost_usd_total,
         }
 
     def _last_fired(self, run: FactoryRun) -> list[dict[str, Any]]:
@@ -3828,7 +4050,7 @@ class FactoryExecutor:
                 },
             ),
             "nodes": [
-                self._state_report(run.states[state_id], include_answer=not compact)
+                self._state_report(run.states[state_id], include_answer=not compact, run_name=run.name)
                 for state_id in run.order
             ],
             # Activity is children-shaped, not entry-shaped alone: a
@@ -4729,6 +4951,9 @@ class FactoryExecutor:
             if self._run_budget_exceeded(run):
                 await self._pause_for_budget(run)
                 break
+            if self._usage_budget_exceeded(run) is not None:
+                await self._pause_for_usage_budget(run)
+                break
             if run.admission_backoff_until is not None and self._now_fn() < run.admission_backoff_until:
                 break  # the loop waits out the deadline in bounded slices
             if self._running_instance_count(run) >= run.max_parallel:
@@ -4793,6 +5018,36 @@ class FactoryExecutor:
             "budget_exceeded",
             f"run budget_ms {run.run_budget_ms} exceeded after {int(elapsed_ms)}ms; no new spawns; "
             f"resume with await rlm.factory.resume('{run.run_id}')",
+        )
+
+    def _usage_budget_exceeded(self, run: FactoryRun) -> str | None:
+        """The crossed ``budget_tokens`` / ``budget_usd`` cap, described,
+        or None. Like the time budget, it fires once per run: resuming past
+        it is the operator's decision."""
+        if run.usage_budget_reported:
+            return None
+        usage = self._usage_report(run)
+        block = _run_block(run)
+        budget_tokens = block.get("budget_tokens")
+        if _is_positive_int(budget_tokens) and usage["tokens"] >= budget_tokens:
+            return f"budget_tokens {budget_tokens} reached ({usage['tokens']} tokens used)"
+        budget_usd = block.get("budget_usd")
+        if _is_number(budget_usd) and budget_usd > 0 and usage["cost_usd"] >= budget_usd:
+            return f"budget_usd {budget_usd:g} reached (${usage['cost_usd']:.4f} spent)"
+        return None
+
+    async def _pause_for_usage_budget(self, run: FactoryRun) -> None:
+        """Pause the run at a token/USD cap. Children in flight keep running."""
+        detail = self._usage_budget_exceeded(run) or "usage budget reached"
+        run.state = "paused"
+        self._mark_paused(run)
+        run.pause_reason = "budget_exceeded"
+        run.last_error = detail
+        run.usage_budget_reported = True
+        await self._milestone(
+            run,
+            "budget_exceeded",
+            f"{detail}; no new spawns; resume with await rlm.factory.resume('{run.run_id}')",
         )
 
     def _children_budget_exceeded(self, run: FactoryRun) -> bool:
@@ -5133,8 +5388,21 @@ class FactoryExecutor:
         instance.ownership_change_in_progress = True
         try:
             contract = state.spec.get("emit")
+            prompt = _attempt_prompt(instance)
+            if contract is not None and contract.get("outputs") and _is_cli_backed_model(state.model):
+                emit_file = _emit_file_path(
+                    run.run_id, state.state_id, entry.index, instance.index, instance.attempt
+                )
+                if emit_file is not None:
+                    try:
+                        emit_file.parent.mkdir(parents=True, exist_ok=True)
+                    except OSError:
+                        emit_file = None
+                prompt = f"{prompt}\n\n{_cli_outputs_section(contract['outputs'], emit_file)}"
+            instance.text_outputs_checked = None
+            instance.text_outputs_error = None
             handle = await _spawn(
-                instance.prompt,
+                prompt,
                 name=child_name,
                 model=state.model,
                 thinking=state.thinking,
@@ -5428,6 +5696,7 @@ class FactoryExecutor:
         instance.tool_uses = result.tool_use_count or 0
         run.settle_count += 1
         run.tool_use_total += instance.tool_uses
+        _add_result_usage(run, result)
         child_reason: str | None = None
         if result.status == "error":
             child_reason = result.error or f"child settled with status {result.status!r}"
@@ -5620,6 +5889,7 @@ class FactoryExecutor:
         instance.tool_uses = result.tool_use_count or 0
         run.settle_count += 1
         run.tool_use_total += instance.tool_uses
+        _add_result_usage(run, result)
         instance.infra_respawned = True
         instance.retry_base += 1
         instance.status = "pending"
@@ -5707,6 +5977,16 @@ class FactoryExecutor:
         entry with ``missing_output``, without a retry.
         """
         owed = self._emitted_outputs(state, entry)
+        if owed:
+            recovered = False
+            for instance in entry.instances:
+                missing = owed.get(instance.index)
+                if missing is not None and await self._bind_text_outputs(run, state, entry, instance, instance.answer):
+                    recovered = True
+            if entry.status in TERMINAL_ENTRY_STATUSES:
+                return
+            if recovered:
+                owed = self._emitted_outputs(state, entry)
         if not owed:
             entry.status = "done"
             self._queue_settle(run, state, entry)
@@ -5730,6 +6010,83 @@ class FactoryExecutor:
                 await self._apply_instance_failure(run, state, entry, instance, reason, retry=False)
                 return
 
+    async def _bind_text_outputs(
+        self,
+        run: FactoryRun,
+        state: _StateRun,
+        entry: _StateEntry,
+        instance: _NodeInstance,
+        answer: str | None,
+    ) -> bool:
+        """Bind outputs a child handed back without ``rlm.factory.emit``: a
+        CLI-backed child's emit file, else a fenced ``factory-outputs`` block
+        in its answer. The values pass the same ``factory.check`` as an emit
+        and land in the same outputs file; ``True`` when they were bound."""
+        if instance.session_dir is None:
+            return False
+        declared = state.spec["emit"].get("outputs") or []
+        ports = {out["name"] for out in declared}
+        cli_backed = _is_cli_backed_model(state.model)
+        candidate: dict[str, Any] | None = None
+        source = "answer"
+        if cli_backed:
+            emit_file = _emit_file_path(run.run_id, state.state_id, entry.index, instance.index, instance.attempt)
+            if emit_file is not None:
+                try:
+                    loaded = json.loads(emit_file.read_text("utf-8"))
+                except (OSError, ValueError):
+                    loaded = None
+                if isinstance(loaded, dict) and loaded:
+                    candidate, source = loaded, "emit_file"
+        if candidate is None and answer:
+            candidate = _outputs_from_text(answer, ports, cli_backed)
+        if not candidate:
+            return False
+        outputs_file = Path(instance.session_dir) / FACTORY_OUTPUTS_FILE
+        try:
+            existing = json.loads(outputs_file.read_text("utf-8"))
+        except (OSError, ValueError):
+            existing = {}
+        merged = {**(existing if isinstance(existing, dict) else {}), **candidate}
+        signature = json.dumps(merged, sort_keys=True, default=str)
+        if signature == instance.text_outputs_checked:
+            return False
+        instance.text_outputs_checked = signature
+        from . import host_request
+
+        try:
+            await host_request("factory.check", {"contract": state.spec["emit"], "outputs": merged})
+        except RuntimeError as error:
+            instance.text_outputs_error = str(error)
+            self._event(
+                run,
+                "outputs_rejected",
+                node=state.state_id,
+                entry=entry.index,
+                instance=instance.index,
+                detail=f"{source}: {error}",
+            )
+            return False
+        if entry.status in TERMINAL_ENTRY_STATUSES:
+            return False
+        try:
+            staged = outputs_file.with_name(f"{FACTORY_OUTPUTS_FILE}.tmp")
+            staged.write_text(json.dumps(merged), encoding="utf-8")
+            os.replace(staged, outputs_file)
+        except OSError as error:
+            instance.text_outputs_error = f"the outputs file could not be written: {error}"
+            return False
+        instance.text_outputs_error = None
+        self._event(
+            run,
+            "outputs_extracted",
+            node=state.state_id,
+            entry=entry.index,
+            instance=instance.index,
+            detail=f"{source}: {', '.join(sorted(candidate))}",
+        )
+        return True
+
     async def _request_repair(
         self,
         run: FactoryRun,
@@ -5742,12 +6099,29 @@ class FactoryExecutor:
         the message went out, else the failure reason."""
         from . import host_request
 
-        calls = ", ".join(f"{name}=..." for name in missing)
-        message = (
-            f"You ended your turn without handing back {', '.join(missing)}. "
-            f"Call `await rlm.factory.emit({calls})` from your Python REPL now; "
-            "the call checks each value and names any field to fix."
-        )
+        if _is_cli_backed_model(state.model):
+            declared = state.spec["emit"].get("outputs") or []
+            emit_file = _emit_file_path(run.run_id, state.state_id, entry.index, instance.index, instance.attempt)
+            rejected = (
+                f" Your last outputs were refused: {instance.text_outputs_error}."
+                if instance.text_outputs_error
+                else ""
+            )
+            file_line = f" (or write that JSON object to `{emit_file}`)" if emit_file is not None else ""
+            message = (
+                f"You ended your turn without handing back {', '.join(missing)}.{rejected} "
+                "This session has no Python REPL, so do not call `rlm.factory.emit`. "
+                "Reply now ending with a fenced block labeled `factory-outputs` holding one JSON "
+                f"object with every output{file_line}:\n\n"
+                f"```factory-outputs\n{_cli_outputs_example(declared)}\n```"
+            )
+        else:
+            calls = ", ".join(f"{name}=..." for name in missing)
+            message = (
+                f"You ended your turn without handing back {', '.join(missing)}. "
+                f"Call `await rlm.factory.emit({calls})` from your Python REPL now; "
+                "the call checks each value and names any field to fix."
+            )
         child_id = instance.child_id
         try:
             await host_request(
@@ -5770,7 +6144,7 @@ class FactoryExecutor:
             return None
         instance.repair_sent = True
         instance.status = "running"
-        instance.awaiting_outputs_until = self._now_fn() + REPAIR_WAIT_SECONDS
+        instance.awaiting_outputs_until = self._now_fn() + _repair_wait_seconds(run)
         self._event(
             run,
             "repair_requested",
@@ -5814,6 +6188,7 @@ class FactoryExecutor:
         task_busy: bool | None,
         status: str | None = None,
         settled: bool = False,
+        answer: str | None = None,
     ) -> None:
         """Re-read a repairing child's outputs, failing only after it is idle."""
         if (
@@ -5827,6 +6202,10 @@ class FactoryExecutor:
             "busy" if task_busy is True else "idle" if task_busy is False else "unverified"
         )
         owed = self._emitted_outputs(state, entry).get(instance.index)
+        if owed is not None and await self._bind_text_outputs(run, state, entry, instance, answer):
+            if instance.status != "running" or instance.awaiting_outputs_until is None:
+                return
+            owed = self._emitted_outputs(state, entry).get(instance.index)
         if owed is None:
             instance.awaiting_outputs_until = None
             instance.status = "done"
@@ -6010,6 +6389,13 @@ class FactoryExecutor:
             error=reason,
             duration_ms=instance.duration_ms,
         )
+        signature = _error_signature(reason)
+        if signature == instance.repeat_error_sig:
+            instance.repeat_error_count += 1
+        else:
+            instance.repeat_error_sig = signature
+            instance.repeat_error_count = 1
+        instance.retry_context = _retry_context(reason)
         retries = state.spec.get("retries", NODE_RETRIES_DEFAULT)
         # A retry is only queued when the entry can re-admit it: a foreach
         # sibling failing with retries left after its entry already went
@@ -6028,6 +6414,11 @@ class FactoryExecutor:
             and instance.attempt - instance.retry_base <= retries
             and entry.status == "running"
         ):
+            if instance.repeat_error_count >= REPEAT_ERROR_LIMIT:
+                # The same failure twice in a row: another identical retry
+                # would only spend tokens. Hold the entry for the operator.
+                await self._apply_entry_failure_policy(run, state, entry, reason, stuck=True)
+                return
             instance.status = "pending"
             instance.error = None
             self._event(
@@ -6048,8 +6439,11 @@ class FactoryExecutor:
         await self._apply_entry_failure_policy(run, state, entry, reason)
 
     async def _apply_entry_failure_policy(
-        self, run: FactoryRun, state: _StateRun, entry: _StateEntry, reason: str
+        self, run: FactoryRun, state: _StateRun, entry: _StateEntry, reason: str, *, stuck: bool = False
     ) -> None:
+        """Fail the entry under its state's policy. ``stuck`` (one error
+        repeated across consecutive attempts) always escalates: the entry
+        is held and the run pauses as ``stuck_repeat_error``."""
         # The verify mark is oversight, not failure-policy bookkeeping: a
         # later foreach sibling can exit with a provisional answer AFTER
         # the entry already went terminal (a sibling failed it first), so
@@ -6089,11 +6483,17 @@ class FactoryExecutor:
             self._event(run, "needs_verify", node=state.state_id, entry=entry.index, detail=detail)
         if entry.status in TERMINAL_ENTRY_STATUSES:
             return  # the policy already ran for this entry
-        policy = state.spec.get("failure_policy", RUN_FAILURE_POLICY_DEFAULT)
+        policy = "escalate" if stuck else state.spec.get("failure_policy", RUN_FAILURE_POLICY_DEFAULT)
         entry.status = "error"
         entry.error = reason
         state.error = reason
-        run.last_error = f"state {state.state_id!r} failed: {reason}"
+        if stuck:
+            run.last_error = (
+                f"state {state.state_id!r} failed {REPEAT_ERROR_LIMIT} consecutive attempts with the "
+                f"same error; remaining retries skipped: {_retry_context(reason)}"
+            )
+        else:
+            run.last_error = f"state {state.state_id!r} failed: {reason}"
         self._event(run, "node_error", node=state.state_id, entry=entry.index, error=reason, detail=f"failure_policy {policy}")
         # The entry is terminal: its prepared-but-never-admitted instances
         # (a foreach queue behind max_parallel, or a rate-limit deferral)
@@ -6156,11 +6556,11 @@ class FactoryExecutor:
         else:  # escalate (default)
             run.state = "paused"
             self._mark_paused(run)
-            run.pause_reason = reason
+            run.pause_reason = "stuck_repeat_error" if stuck else reason
             await self._milestone(
                 run,
                 "paused",
-                f"state {state.state_id} failed: {reason}; resume with await rlm.factory.resume('{run.run_id}') "
+                f"{run.last_error if stuck else f'state {state.state_id} failed: {reason}'}; resume with await rlm.factory.resume('{run.run_id}') "
                 "to re-admit the failed entry as a fresh attempt",
                 node=state.state_id,
             )
@@ -6609,6 +7009,7 @@ class FactoryExecutor:
                     task_busy=None if result is None else result.factory_task_busy,
                     status=None if result is None else result.status,
                     settled=False if result is None else bool(result.settled),
+                    answer=None if result is None else (result.answer_text or None),
                 )
             for state, entry, instance in python_calls:
                 if run.loop_generation != generation:
@@ -6631,6 +7032,9 @@ class FactoryExecutor:
                 return
             if self._run_budget_exceeded(run):
                 await self._pause_for_budget(run)
+                return
+            if self._usage_budget_exceeded(run) is not None:
+                await self._pause_for_usage_budget(run)
                 return
             started = await self._spawn_ready(run, generation=generation, allow_backoff=True)
             if not self._loop_alive(run, generation):
@@ -7111,8 +7515,9 @@ def _machine_structure(
         "failure_policy": run_block.get("failure_policy", RUN_FAILURE_POLICY_DEFAULT),
         "max_children": run_block.get("max_children", RUN_MAX_CHILDREN_DEFAULT),
     }
-    if "budget_ms" in run_block:
-        run_out["budget_ms"] = run_block["budget_ms"]
+    for key in RUN_OPTIONAL_KEYS:
+        if key in run_block:
+            run_out[key] = run_block[key]
     states_out: list[dict[str, Any]] = []
     for state in machine["states"]:
         row: dict[str, Any] = {
@@ -8645,7 +9050,15 @@ def cli_dispatch(payload: Any) -> "dict[str, Any]":
             {"source": source, "path": str(directory)}
             for source, directory in machine_library_dirs()
         ]
-        return {"ok": True, "machines": machines, "warnings": warnings, "levels": levels}
+        # The shared factory modules ship beside the bundled machines in this package.
+        modules_dir = str(Path(__file__).resolve().parent / "modules")
+        return {
+            "ok": True,
+            "machines": machines,
+            "warnings": warnings,
+            "levels": levels,
+            "modules_dir": modules_dir,
+        }
     if op == "read":
         path, name = payload.get("path"), payload.get("name")
         try:

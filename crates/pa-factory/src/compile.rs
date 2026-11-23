@@ -118,11 +118,16 @@ fn compile_run(machine: &Machine) -> Value {
         ("max_parallel", run.max_parallel),
         ("max_children", run.max_children),
         ("max_transitions", run.max_transitions),
+        ("repair_wait_ms", run.repair_wait_ms),
+        ("budget_tokens", run.budget_tokens),
     ];
     for (key, value) in fields {
         if let Some(value) = value {
             out.insert(key.to_string(), json!(value));
         }
+    }
+    if let Some(budget_usd) = run.budget_usd {
+        out.insert("budget_usd".to_string(), json!(budget_usd));
     }
     if let Some(policy) = run.failure_policy {
         out.insert("failure_policy".to_string(), json!(policy.as_str()));

@@ -126,6 +126,30 @@ class RLMChildResult:
     tool_use_count: int | None = None
     replied_since_task: bool | None = None
     factory_task_busy: bool | None = None
+    total_tokens: int = 0
+    cost_usd: float = 0.0
+
+
+def _usage_number(payload: dict[str, Any], paths: tuple[tuple[str, ...], ...]) -> float | None:
+    """The first non-negative number found at one of `paths`, or None."""
+    for path in paths:
+        value: Any = payload
+        for key in path:
+            value = value.get(key) if isinstance(value, dict) else None
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+            return value
+    return None
+
+
+def _child_usage(payload: dict[str, Any]) -> tuple[int, float]:
+    tokens = _usage_number(
+        payload, (("usage", "total_tokens"), ("usage", "totalTokens"), ("total_tokens",))
+    )
+    cost = _usage_number(
+        payload,
+        (("usage", "cost_usd"), ("usage", "costUsd"), ("usage", "cost", "total"), ("cost_usd",)),
+    )
+    return int(tokens or 0), float(cost or 0.0)
 
 
 @dataclass(frozen=True)
@@ -492,6 +516,7 @@ def _child_result_from_payload(payload: Any) -> RLMChildResult:
     factory_task_busy = payload.get("factory_task_busy")
     if factory_task_busy is not None and not isinstance(factory_task_busy, bool):
         raise RuntimeError("rlm.collect entry has invalid factory_task_busy")
+    total_tokens, cost_usd = _child_usage(payload)
     return RLMChildResult(
         rlm_child_id=child_id,
         session_name=_optional_str("session_name"),
@@ -505,6 +530,8 @@ def _child_result_from_payload(payload: Any) -> RLMChildResult:
         tool_use_count=_optional_int("tool_use_count"),
         replied_since_task=replied,
         factory_task_busy=factory_task_busy,
+        total_tokens=total_tokens,
+        cost_usd=cost_usd,
     )
 
 

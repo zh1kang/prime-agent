@@ -658,3 +658,40 @@ fn an_unresolvable_asset_is_a_load_error_with_its_path() {
         "{found:?}"
     );
 }
+
+#[test]
+fn run_repair_wait_and_usage_budgets_load_and_compile() {
+    let dir = tempfile::tempdir().unwrap();
+    let machine = MACHINE.replacen(
+        "max_parallel = 3\n",
+        "max_parallel = 3\nrepair_wait_ms = 1500\nbudget_tokens = 200000\nbudget_usd = 2.5\n",
+        1,
+    );
+    write_dir(dir.path(), &machine, FILES);
+    let loaded = load_machine_dir(dir.path()).unwrap();
+    let mut params = Map::new();
+    params.insert("task".to_string(), json!("t"));
+    let spec = compile(&loaded, &params).unwrap();
+    assert_eq!(
+        spec["run"],
+        json!({
+            "budget_ms": 7_200_000, "max_parallel": 3, "repair_wait_ms": 1500,
+            "budget_tokens": 200_000, "budget_usd": 2.5,
+        })
+    );
+    let found = problems(
+        &[(
+            "max_parallel = 3\n",
+            "max_parallel = 3\nbudget_usd = -1.0\nrepair_wait_ms = 0\n",
+        )],
+        &[],
+    );
+    assert!(
+        found.iter().any(|line| line.contains("run.budget_usd")),
+        "{found:?}"
+    );
+    assert!(
+        found.iter().any(|line| line.contains("run.repair_wait_ms")),
+        "{found:?}"
+    );
+}

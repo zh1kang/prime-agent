@@ -52,13 +52,19 @@ pub struct Param {
 }
 
 /// Machine-wide bounds; absent fields take the executor's defaults.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct RunSettings {
     pub budget_ms: Option<u64>,
     pub max_parallel: Option<u64>,
     pub max_children: Option<u64>,
     pub max_transitions: Option<u64>,
     pub failure_policy: Option<FailurePolicy>,
+    /// How long a child owing outputs has after the repair message.
+    pub repair_wait_ms: Option<u64>,
+    /// Total tokens the run's children may spend before it pauses.
+    pub budget_tokens: Option<u64>,
+    /// Total USD the run's children may spend before it pauses.
+    pub budget_usd: Option<f64>,
 }
 
 /// What a failed entry does to its live machine.

@@ -58,7 +58,7 @@ pub(in crate::kernel::bootstrap) fn require_runtime_source_dir() -> anyhow::Resu
     )
 }
 
-/// Hash the manifest, Python sources, and packaged machine library so any
+/// Hash the manifest, Python sources, and packaged machine and module libraries so any
 /// runtime change invalidates an existing venv.
 pub(in crate::kernel::bootstrap) fn hash_runtime_source(
     source_dir: &Path,
@@ -67,7 +67,9 @@ pub(in crate::kernel::bootstrap) fn hash_runtime_source(
     let mut files = vec![source_dir.join("pyproject.toml")];
     collect_python_files(&rlm_dir, &mut files)?;
     collect_package_data_files(&rlm_dir.join("machines"), &mut files)?;
+    collect_package_data_files(&rlm_dir.join("modules"), &mut files)?;
     files.sort();
+    files.dedup();
     let mut hasher = sha2::Sha256::new();
     for file in &files {
         let relative = file.strip_prefix(source_dir)?;
@@ -92,12 +94,13 @@ pub(super) fn collect_python_files(dir: &Path, files: &mut Vec<PathBuf>) -> anyh
     Ok(())
 }
 
-/// Collect every file under the packaged machine library (`src/rlm/machines`,
-/// any extension: the wheel ships the MACHINE.md files as package data), so
-/// machine changes invalidate an existing venv exactly like a `.py` change.
+/// Collect every file under a packaged data library (`src/rlm/machines` or
+/// `src/rlm/modules`, any extension: the wheel ships MACHINE.md, module.toml, and
+/// prompt files as package data), so those changes invalidate an existing venv
+/// exactly like a `.py` change.
 fn collect_package_data_files(dir: &Path, files: &mut Vec<PathBuf>) -> anyhow::Result<()> {
     if !dir.is_dir() {
-        return Ok(()); // a runtime payload without a machine library is legal
+        return Ok(()); // a runtime payload without this library is legal
     }
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -222,6 +225,36 @@ version: 2
         std::fs::remove_dir_all(temp.path().join("src").join("rlm").join("machines"))?;
         let bare = hash_runtime_source(temp.path())?;
         assert_ne!(bare, after);
+        Ok(())
+    }
+
+    #[test]
+    fn module_library_changes_invalidate_the_runtime_identity() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        runtime_fixture(temp.path(), "machine")?;
+        let module = temp.path().join("src/rlm/modules/validate");
+        std::fs::create_dir_all(module.join("prompts"))?;
+        std::fs::write(
+            module.join("module.toml"),
+            "name = 'validate'\nversion = 1\n",
+        )?;
+        std::fs::write(module.join("prompts/check.md"), "Check.")?;
+        let before = hash_runtime_source(temp.path())?;
+        std::fs::write(
+            module.join("module.toml"),
+            "name = 'validate'\nversion = 2\n",
+        )?;
+        let after_manifest = hash_runtime_source(temp.path())?;
+        assert_ne!(
+            before, after_manifest,
+            "a module.toml change is a runtime change"
+        );
+        std::fs::write(module.join("prompts/check.md"), "Check twice.")?;
+        assert_ne!(
+            after_manifest,
+            hash_runtime_source(temp.path())?,
+            "a module prompt change is a runtime change"
+        );
         Ok(())
     }
 }

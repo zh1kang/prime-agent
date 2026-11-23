@@ -1,0 +1,17 @@
+name = "sanitize-diff"
+version = 1
+description = "Drop binary hunks and secret-like lines from a diff and cap its size."
+entry = ["sanitize"]
+exit = "sanitize"
+
+[wire]
+diff = { description = "The state.port with the diff text." }
+next = { description = "The state after the clean diff.", optional = true }
+
+[states.sanitize]
+max_entries = 4
+kind = "python"
+run = "nodes/sanitize.py:sanitize"
+inputs = { diff = "@diff" }
+outputs = { diff = "text" }
+next = "@next"

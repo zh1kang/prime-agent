@@ -4750,7 +4750,9 @@ class FactoryExecutorTest(_ExecutorTestCase):
 
     @async_test
     async def test_retries_respawn_until_attempts_exhausted(self) -> None:
-        self.host.outcomes["a"] = {"status": "error", "error": "boom"}
+        # Distinct errors: an identical repeat trips the stuck_repeat_error breaker.
+        for number in (1, 2, 3):
+            self.host.child_outcomes[f"child-{number}"] = {"status": "error", "error": f"boom {number}"}
         self.store_factory(
             {
                 "run": {"failure_policy": "continue"},
@@ -4764,6 +4766,125 @@ class FactoryExecutorTest(_ExecutorTestCase):
         self.assertEqual(self.node_status(status, "a")["attempts"], 3)
         self.assertEqual(self.node_status(status, "a")["status"], "error")
         self.assertEqual(status["state"], "failed")
+
+    @async_test
+    async def test_identical_errors_pause_as_stuck_repeat_error(self) -> None:
+        self.host.child_outcomes["child-1"] = {"status": "error", "error": "boom at 0x7f00aa in /tmp/x1 after 12ms"}
+        self.host.child_outcomes["child-2"] = {"status": "error", "error": "boom at 0x7f00bb in /tmp/x2 after 40ms"}
+        self.store_factory(
+            {
+                "run": {"failure_policy": "continue"},
+                "nodes": [{"id": "a", "subagent": {"prompt": "Do it."}, "retries": 5}],
+            }
+        )
+        result = await self.start()
+        status = await self.settle(result)
+        self.assertEqual(len(self.host.spawn_calls("a")), 2)
+        self.assertEqual(status["state"], "paused")
+        run = self.executor._runs[result["run_id"]]
+        self.assertEqual(run.pause_reason, "stuck_repeat_error")
+        self.assertIn("2 consecutive attempts with the same error", run.last_error)
+        prompts = [call["prompt"] for call in self.host.spawn_calls("a")]
+        self.assertEqual(prompts[0], "Do it.")
+        self.assertEqual(prompts[1].count("Your previous attempt at this task failed"), 1)
+        self.assertIn("0x7f00aa", prompts[1])
+        # Resume re-admits the held entry with a fresh breaker and one context block.
+        self.host.child_outcomes["child-3"] = {"status": "done", "answer": "ok"}
+        await rlm_module.rlm.factory.resume(result["run_id"])
+        final = await self.settle(result)
+        self.assertEqual(final["state"], "done")
+        third = self.host.spawn_calls("a")[2]["prompt"]
+        self.assertEqual(third.count("Your previous attempt at this task failed"), 1)
+        self.assertIn("0x7f00bb", third)
+        self.assertEqual(run.states["a"].entries[0].instances[0].prompt, "Do it.")
+
+    @async_test
+    async def test_repeated_resume_notes_replace_instead_of_piling_up(self) -> None:
+        self.host.child_outcomes["child-1"] = {"status": "error", "error": "first failure"}
+        self.host.child_outcomes["child-2"] = {"status": "error", "error": "second failure"}
+        self.host.child_outcomes["child-3"] = {"status": "done", "answer": "ok"}
+        self.store_factory({"nodes": [{"id": "work", "subagent": {"prompt": "Build it."}, "retries": 0}]})
+        result = await self.start()
+        await self.settle(result)
+        await rlm_module.rlm.factory.resume(result["run_id"], note="Try A.")
+        await self.settle(result)
+        await rlm_module.rlm.factory.resume(result["run_id"], note="Try B.")
+        final = await self.settle(result)
+        self.assertEqual(final["state"], "done")
+        last = self.host.spawn_calls("work")[2]["prompt"]
+        self.assertEqual(last.count("Reviewer note for this retry"), 1)
+        self.assertIn("Try B.", last)
+        self.assertNotIn("Try A.", last)
+        self.assertIn("second failure", last)
+        self.assertNotIn("first failure", last)
+        run = self.executor._runs[result["run_id"]]
+        instance = run.states["work"].entries[0].instances[0]
+        self.assertEqual(instance.prompt, "Build it.")
+        self.assertEqual(instance.resume_note, "Try B.")
+
+    @async_test
+    async def test_status_instances_carry_live_metadata(self) -> None:
+        self.host.outcomes["work"] = {"status": "running"}
+        self.store_factory(
+            {"nodes": [{"id": "work", "subagent": {"prompt": "Go.", "model": "m/x", "thinking": "high"}}]}
+        )
+        result = await self.start()
+        status = await rlm_module.rlm.factory.status(result["run_id"])
+        node = self.node_status(status, "work")
+        self.assertEqual(node["model"], "m/x")
+        self.assertEqual(node["thinking"], "high")
+        self.assertNotIn("role", node)
+        [row] = node["instances"]
+        self.assertEqual(row["child_name"], self.host.children["child-1"]["name"])
+        self.assertEqual(row["session_dir"], "/tmp/child-1")
+        self.assertIsNotNone(row["spawned_at"])
+        self.assertTrue(row["display_name"].endswith("work #0.1"), row["display_name"])
+        await rlm_module.rlm.factory.stop(result["run_id"])
+
+    @async_test
+    async def test_token_budget_pauses_before_the_next_admission_and_resumes(self) -> None:
+        self.store_factory(
+            {
+                "run": {"budget_tokens": 100},
+                "nodes": [{"id": "a", "subagent": "worker"}, {"id": "b", "subagent": "worker", "depends_on": ["a"]}],
+            }
+        )
+
+        def charge(run: Any, result: Any) -> None:
+            run.token_total += 150
+
+        with patch.object(factory_module, "_add_result_usage", charge):
+            result = await self.start()
+            status = await self.settle(result)
+            self.assertEqual(status["state"], "paused")
+            run = self.executor._runs[result["run_id"]]
+            self.assertEqual(run.pause_reason, "budget_exceeded")
+            self.assertIn("budget_tokens 100", run.last_error)
+            self.assertEqual(status["usage"]["tokens"], 150)
+            self.assertEqual(self.host.spawn_calls("b"), [])
+            await rlm_module.rlm.factory.resume(result["run_id"])
+            final = await self.settle(result)
+        self.assertEqual(final["state"], "done")
+        self.assertEqual(len(self.host.spawn_calls("b")), 1)
+
+    @async_test
+    async def test_usd_budget_pauses_the_run(self) -> None:
+        self.store_factory(
+            {
+                "run": {"budget_usd": 0.5},
+                "nodes": [{"id": "a", "subagent": "worker"}, {"id": "b", "subagent": "worker", "depends_on": ["a"]}],
+            }
+        )
+
+        def charge(run: Any, result: Any) -> None:
+            run.cost_usd_total += 0.75
+
+        with patch.object(factory_module, "_add_result_usage", charge):
+            result = await self.start()
+            status = await self.settle(result)
+        self.assertEqual(status["state"], "paused")
+        self.assertEqual(self.executor._runs[result["run_id"]].pause_reason, "budget_exceeded")
+        self.assertEqual(status["usage"]["cost_usd"], 0.75)
 
     # -- worker deaths (infra) --------------------------------------------------------
 
@@ -4968,7 +5089,14 @@ class FactoryExecutorTest(_ExecutorTestCase):
         final = await self.settle(result)
         self.assertEqual(final["state"], "done")
         prompts = [call["prompt"] for call in self.host.spawn_calls("work")]
-        self.assertEqual(prompts, ["Build it.", "Build it.\n\nReviewer note for this retry: Use approach B."])
+        self.assertEqual(
+            prompts,
+            [
+                "Build it.",
+                "Build it.\n\nYour previous attempt at this task failed with:\nboom\n"
+                "Do not repeat that mistake.\n\nReviewer note for this retry: Use approach B.",
+            ],
+        )
 
     # -- budgets ----------------------------------------------------------------------
 
@@ -8422,6 +8550,225 @@ class FactoryEmitTest(_ExecutorTestCase):
                 os.environ.pop("RLM_DAEMONLESS", None)
             else:
                 os.environ["RLM_DAEMONLESS"] = previous
+
+
+class FactoryCliOutputsTest(_ExecutorTestCase):
+    """CLI-backed children (antigravity/, cursor/, claude-cli/) have no
+    Python REPL: they hand back outputs in a fenced ``factory-outputs``
+    block or an emit file, checked like an emit and bound without repair."""
+
+    MODEL = "antigravity/gemini-4-argon"
+    EMIT = {
+        "outputs": [
+            {"name": "summary", "type": "text"},
+            {"name": "approve", "type": "bool"},
+            {"name": "risk", "type": "enum(low, high)"},
+        ],
+        "records": {},
+    }
+    VALID = {"summary": "all good", "approve": True, "risk": "low"}
+
+    def setUp(self) -> None:
+        super().setUp()
+        root = TemporaryDirectory()
+        self.addCleanup(root.cleanup)
+        self.host.session_root = Path(root.name) / "sessions"
+        self.host.session_root.mkdir()
+        previous = os.environ.get("RLM_SESSION_DIR")
+        os.environ["RLM_SESSION_DIR"] = root.name
+        self.runs_dir = Path(root.name) / factory_module.RUNS_DIR_NAME
+
+        def restore() -> None:
+            if previous is None:
+                os.environ.pop("RLM_SESSION_DIR", None)
+            else:
+                os.environ["RLM_SESSION_DIR"] = previous
+
+        self.addCleanup(restore)
+        self.store_cli_machine(self.MODEL)
+        self.host.outcomes["build"] = {"status": "done", "answer": "built"}
+
+    def store_cli_machine(self, model: str, spec_id: str = "sw") -> None:
+        self.store_machine(
+            {
+                "states": [
+                    {
+                        "id": "review",
+                        "entry": True,
+                        "subagent": {"prompt": "Review.", "model": model},
+                        "outputs": [
+                            {"name": "summary", "type": "text"},
+                            {"name": "approve", "type": "json"},
+                            {"name": "risk", "type": "json"},
+                        ],
+                        "emit": self.EMIT,
+                    },
+                    state(
+                        "build",
+                        inputs=[
+                            {"name": "summary", "type": "text", "from": "review.summary"},
+                            {"name": "approve", "type": "json", "from": "review.approve"},
+                        ],
+                    ),
+                ],
+                "transitions": [{"from": "review", "to": "build"}],
+            },
+            spec_id=spec_id,
+        )
+
+    @staticmethod
+    def block(outputs: dict[str, Any]) -> str:
+        return f"Reviewed it.\n\n```factory-outputs\n{json.dumps(outputs)}\n```"
+
+    async def finish(self, spec_id: str = "sw") -> dict[str, Any]:
+        result = await self.start(spec_id)
+        await self.executor._runs[result["run_id"]].task
+        return await rlm_module.rlm.factory.status(result["run_id"])
+
+    def review_outputs(self, status: dict[str, Any]) -> dict[str, Any]:
+        return self.executor._runs[status["run_id"]].states["review"].entries[0].outputs
+
+    def test_cli_backed_model_detection(self) -> None:
+        for model in (
+            "antigravity/gemini-4-argon",
+            "Antigravity/gemini-4-neon",
+            "antigravity-cli/x",
+            "cursor/composer",
+            "cursor-cli/x",
+            "claude-cli/opus",
+        ):
+            self.assertTrue(factory_module._is_cli_backed_model(model), model)
+        for model in (None, "", "anthropic/claude-opus", "openai/gpt-5", "cursorish/x"):
+            self.assertFalse(factory_module._is_cli_backed_model(model), model)
+
+    @async_test
+    async def test_fenced_block_binds_typed_ports_without_repair(self) -> None:
+        self.host.outcomes["review"] = {"status": "done", "answer": self.block(self.VALID)}
+        status = await self.finish()
+
+        self.assertEqual(status["state"], "done", status.get("last_error"))
+        [spawn] = self.host.spawn_calls("review")
+        self.assertIn("```factory-outputs", spawn["prompt"])
+        self.assertIn("ignore any instruction to call it", spawn["prompt"])
+        self.assertIn(str(self.runs_dir / factory_module.EMITS_DIR_NAME), spawn["prompt"])
+        self.assertEqual(self.review_outputs(status), self.VALID)
+        self.assertEqual(self.host.calls_of("agent_message.send"), [])
+        stored = json.loads((self.host.session_root / "child-1" / FACTORY_OUTPUTS_FILE).read_text("utf-8"))
+        self.assertEqual(stored, self.VALID)
+        [check] = self.host.calls_of("factory.check")
+        self.assertEqual(check["outputs"], self.VALID)
+        self.assertIn("outputs_extracted", [event["kind"] for event in status["events"]])
+        self.assertEqual(len(self.host.spawn_calls("build")), 1)
+
+    @async_test
+    async def test_emit_file_binds_without_a_fenced_block(self) -> None:
+        self.host.outcomes["review"] = {"status": "done", "answer": "Done, outputs are in the file."}
+        first_collect = self.host.gate("rlm.collect", 1)
+        started = await self.start()
+        run = self.executor._runs[started["run_id"]]
+        await asyncio.wait_for(self.host.gate_entered("rlm.collect", 1).wait(), 1)
+        emit_file = factory_module._emit_file_path(run.run_id, "review", 0, 0, 1)
+        self.assertTrue(emit_file.parent.is_dir())
+        emit_file.write_text(json.dumps(self.VALID), encoding="utf-8")
+        first_collect.set()
+        await run.task
+        status = await rlm_module.rlm.factory.status(started["run_id"])
+
+        self.assertEqual(status["state"], "done", status.get("last_error"))
+        self.assertIn(str(emit_file), self.host.spawn_calls("review")[0]["prompt"])
+        self.assertEqual(self.review_outputs(status), self.VALID)
+        self.assertEqual(self.host.calls_of("agent_message.send"), [])
+
+    @async_test
+    async def test_missing_port_gets_a_cli_repair_and_settles(self) -> None:
+        partial = {"summary": "all good", "approve": True}
+        self.host.check_errors[json.dumps(partial, sort_keys=True)] = "risk: missing"
+        self.host.outcomes["review"] = {"status": "done", "answer": self.block(partial)}
+
+        def repair(payload: dict[str, Any]) -> None:
+            self.host.outcomes["review"] = {"status": "done", "answer": self.block(self.VALID)}
+
+        self.host.on_message = repair
+        status = await self.finish()
+
+        self.assertEqual(status["state"], "done", status.get("last_error"))
+        [message] = self.host.calls_of("agent_message.send")
+        self.assertIn("```factory-outputs", message["message"])
+        self.assertIn("do not call `rlm.factory.emit`", message["message"])
+        self.assertNotIn("from your Python REPL now", message["message"])
+        self.assertIn("risk: missing", message["message"])
+        self.assertEqual(len(self.host.spawn_calls("review")), 1)
+        self.assertEqual(self.review_outputs(status), self.VALID)
+        kinds = [event["kind"] for event in status["events"]]
+        self.assertIn("repair_requested", kinds)
+        self.assertIn("repaired", kinds)
+
+    @async_test
+    async def test_type_mismatch_is_rejected_and_repaired(self) -> None:
+        bad = {**self.VALID, "approve": "maybe"}
+        self.host.check_errors[json.dumps(bad, sort_keys=True)] = "approve: 'maybe' is not a bool"
+        self.host.outcomes["review"] = {"status": "done", "answer": self.block(bad)}
+
+        def repair(payload: dict[str, Any]) -> None:
+            self.host.outcomes["review"] = {"status": "done", "answer": self.block(self.VALID)}
+
+        self.host.on_message = repair
+        status = await self.finish()
+
+        self.assertEqual(status["state"], "done", status.get("last_error"))
+        [message] = self.host.calls_of("agent_message.send")
+        self.assertIn("approve: 'maybe' is not a bool", message["message"])
+        self.assertEqual(self.review_outputs(status), self.VALID)
+        kinds = [event["kind"] for event in status["events"]]
+        self.assertIn("outputs_rejected", kinds)
+
+    @async_test
+    async def test_type_mismatch_never_binds_when_repair_does_not_fix_it(self) -> None:
+        bad = {**self.VALID, "approve": "maybe"}
+        self.host.check_errors[json.dumps(bad, sort_keys=True)] = "approve: 'maybe' is not a bool"
+        self.host.outcomes["review"] = {"status": "done", "answer": self.block(bad)}
+        status = await self.finish()
+
+        self.assertEqual(status["state"], "paused")
+        self.assertIn("missing_output", status["last_error"])
+        self.assertFalse((self.host.session_root / "child-1" / FACTORY_OUTPUTS_FILE).exists())
+        self.assertEqual(self.host.spawn_calls("build"), [])
+
+    @async_test
+    async def test_cli_child_trailing_json_block_with_port_keys_binds(self) -> None:
+        self.host.outcomes["review"] = {
+            "status": "done",
+            "answer": f"Done.\n```json\n{json.dumps(self.VALID)}\n```",
+        }
+        status = await self.finish()
+
+        self.assertEqual(status["state"], "done", status.get("last_error"))
+        self.assertEqual(self.review_outputs(status), self.VALID)
+
+    @async_test
+    async def test_native_child_keeps_emit_instructions_and_ignores_plain_json(self) -> None:
+        self.store_cli_machine("anthropic/claude-opus", spec_id="native")
+        self.host.outcomes["review"] = {
+            "status": "done",
+            "answer": f"Done.\n```json\n{json.dumps(self.VALID)}\n```",
+        }
+        status = await self.finish("native")
+
+        self.assertEqual(status["state"], "paused")
+        self.assertNotIn("factory-outputs", self.host.spawn_calls("review")[0]["prompt"])
+        [message] = self.host.calls_of("agent_message.send")
+        self.assertIn("await rlm.factory.emit(summary=..., approve=..., risk=...)", message["message"])
+        self.assertEqual(self.host.calls_of("factory.check"), [])
+
+    @async_test
+    async def test_native_child_factory_outputs_block_binds(self) -> None:
+        self.store_cli_machine("anthropic/claude-opus", spec_id="native")
+        self.host.outcomes["review"] = {"status": "done", "answer": self.block(self.VALID)}
+        status = await self.finish("native")
+
+        self.assertEqual(status["state"], "done", status.get("last_error"))
+        self.assertEqual(self.review_outputs(status), self.VALID)
+        self.assertEqual(self.host.calls_of("agent_message.send"), [])
 
 
 class FactoryKernelRestartTest(_ExecutorTestCase):
@@ -14909,6 +15256,54 @@ class FactoryPrintDurabilityTest(_ExecutorTestCase):
         os.environ["RLM_DAEMONLESS"] = ""
         with self.assertRaisesRegex(ValueError, "unknown factory run 'never-started'"):
             await rlm_module.rlm.factory.resume("never-started")
+
+
+class RunTuningKnobsTest(unittest.TestCase):
+    """repair_wait_ms, budget_tokens / budget_usd, and the retry helpers."""
+
+    def test_validator_accepts_and_checks_the_optional_run_keys(self) -> None:
+        good = {"run": {"repair_wait_ms": 1500, "budget_tokens": 10, "budget_usd": 2.5}, "nodes": [node("a")]}
+        self.assertEqual(validate_factory_spec(good), [])
+        bad = {"run": {"repair_wait_ms": 0, "budget_tokens": True, "budget_usd": -1}, "nodes": [node("a")]}
+        self.assertEqual(
+            validate_factory_spec(bad),
+            [
+                "run repair_wait_ms must be a positive integer",
+                "run budget_tokens must be a positive integer",
+                "run budget_usd must be a positive number",
+            ],
+        )
+
+    def test_canonicalization_carries_the_optional_run_keys(self) -> None:
+        canonical = factory_module.canonicalize_factory_spec(
+            {"run": {"repair_wait_ms": 1500, "budget_tokens": 10, "budget_usd": 2.5}, "nodes": [node("a")]}
+        )
+        for key, value in (("repair_wait_ms", 1500), ("budget_tokens", 10), ("budget_usd", 2.5)):
+            self.assertEqual(canonical["run"][key], value)
+
+    def test_repair_wait_prefers_the_run_then_the_env_then_the_default(self) -> None:
+        run = factory_module.FactoryRun(run_id="r", spec_id="s", name=None, machine={"run": {"repair_wait_ms": 1500}})
+        bare = factory_module.FactoryRun(run_id="r", spec_id="s", name=None, machine={"run": {}})
+        with patch.dict(os.environ, {factory_module.REPAIR_WAIT_ENV: "2"}):
+            self.assertEqual(factory_module._repair_wait_seconds(run), 1.5)
+            self.assertEqual(factory_module._repair_wait_seconds(bare), 2.0)
+        with patch.dict(os.environ, {factory_module.REPAIR_WAIT_ENV: "nope"}):
+            self.assertEqual(factory_module._repair_wait_seconds(bare), factory_module.REPAIR_WAIT_SECONDS)
+
+    def test_error_signature_ignores_incidental_noise(self) -> None:
+        signature = factory_module._error_signature
+        self.assertEqual(
+            signature("2026-11-23T01:02:03Z failed at 0xdeadbeef in /tmp/abc/x.py after 12ms"),
+            signature("2026-11-24T09:09:09Z  failed at 0x1234 in /tmp/zzz/y.py after 900ms\n"),
+        )
+        self.assertNotEqual(signature("assertion failed: 1 != 2"), signature("import error: no module x"))
+
+    def test_retry_context_dedupes_and_keeps_the_tail(self) -> None:
+        self.assertEqual(factory_module._retry_context("a\n\na\nb\n"), "a\nb")
+        long = "\n".join(f"line {number}" for number in range(1000))
+        trimmed = factory_module._retry_context(long)
+        self.assertEqual(len(trimmed), factory_module.RETRY_CONTEXT_CAP)
+        self.assertTrue(trimmed.endswith("line 999"))
 
 
 if __name__ == "__main__":

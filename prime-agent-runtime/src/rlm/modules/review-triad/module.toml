@@ -1,0 +1,46 @@
+name = "review-triad"
+version = 1
+description = "Three reviewers in parallel (correctness, bugs, robustness), then one verdict: approve or rework."
+entry = ["correctness", "bugs", "robustness"]
+exit = "verdict"
+
+[wire]
+subject = { description = "The state.port with the work to review." }
+approve = { description = "The state after an approve verdict." }
+rework = { description = "The state after a rework verdict." }
+
+# Three model families so the reviewers don't share blind spots.
+[roles]
+reviewer-correctness = { model = "anthropic/claude-opus-5-5", thinking = "high" }
+reviewer-bugs = { model = "openai-codex/gpt-5.3-codex", thinking = "high" }
+reviewer-robustness = { model = "antigravity/gemini-4-neon", thinking = "high" }
+
+[states.correctness]
+max_entries = 4
+agent = { role = "reviewer-correctness", prompt = "prompts/correctness.md" }
+inputs = { subject = "@subject" }
+outputs = { approve = "bool", findings = "text" }
+next = "verdict"
+
+[states.bugs]
+max_entries = 4
+agent = { role = "reviewer-bugs", prompt = "prompts/bugs.md" }
+inputs = { subject = "@subject" }
+outputs = { approve = "bool", findings = "text" }
+next = "verdict"
+
+[states.robustness]
+max_entries = 4
+agent = { role = "reviewer-robustness", prompt = "prompts/robustness.md" }
+inputs = { subject = "@subject" }
+outputs = { approve = "bool", findings = "text" }
+next = "verdict"
+
+[states.verdict]
+max_entries = 4
+kind = "python"
+run = "nodes/verdict.py:merge"
+join = ["correctness", "bugs", "robustness"]
+inputs = { correctness = "correctness.approve", correctness_findings = "correctness.findings", bugs = "bugs.approve", bugs_findings = "bugs.findings", robustness = "robustness.approve", robustness_findings = "robustness.findings" }
+outputs = { verdict = "enum(approve, rework)", findings = "text" }
+route = { on = "verdict", approve = "@approve", rework = "@rework" }

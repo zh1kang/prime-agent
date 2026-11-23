@@ -1,0 +1,21 @@
+name = "validate"
+version = 1
+description = "Run the project's checks with the validate_command param and route on the result."
+entry = ["run"]
+exit = "run"
+
+[wire]
+pass = { description = "The state after the checks pass." }
+fail = { description = "The state after the checks fail." }
+
+[params]
+# The command runs with shell=True. Approval covers the factory files, not this param's value.
+validate_command = { type = "text", default = "", description = "Shell command that runs the project's checks (approval does not cover it)" }
+
+[states.run]
+max_entries = 6
+budget = "30m"
+kind = "python"
+run = "nodes/validate.py:run"
+outputs = { passed = "bool", log = "text" }
+route = { on = "passed", true = "@pass", false = "@fail" }
