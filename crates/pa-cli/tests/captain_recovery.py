@@ -1,6 +1,6 @@
 """Exercise the installed CLI boundary with isolated projects and scripted providers."""
 
-import json, os, pathlib, sqlite3, subprocess, sys, time
+import atexit, json, os, pathlib, sqlite3, subprocess, sys, time
 from concurrent.futures import ThreadPoolExecutor
 
 P = pathlib.Path
@@ -30,12 +30,16 @@ if "crash-check" in body:
 print(json.dumps({"type":"result","session_id":"fa16e11d-0a87-47ae-a8d1-f6e3a12b806f","result":"done in linked checkout","is_error":False}))
 """)
 script.chmod(0o755)
+# Prime turns run on this daemon; the macOS socket path limit is 104 bytes.
+SOCK = f"/tmp/pa-crc-{os.getpid()}.sock"
+atexit.register(subprocess.run, ["pkill", "-f", SOCK], check=False)
 env = dict(
     os.environ,
     PA_CAPTAIN_HOME=str(hub),
     PRIME_AGENT_CODING_AGENT_DIR=str(hub),
     PA_CAPTAIN_NATIVE_HOME=str(native),
     PRIME_AGENT_DAEMON_SOCKET=str(temp / "socket"),
+    PA_CAPTAIN_NATIVE_SOCKET=SOCK,
     PRIME_AGENT_FAUX_SCRIPT=json.dumps({"responses": ["Captain received the report."]}),
     DO_NOT_TRACK="1",
     CAPTURE=str(temp / "capture"),

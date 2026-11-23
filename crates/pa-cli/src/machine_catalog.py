@@ -1,3 +1,4 @@
+import functools
 import json
 import os
 from pathlib import Path
@@ -9,11 +10,22 @@ def personal_machines(agent=None):
     return (Path(agent).expanduser() if agent else Path.home() / ".prime/agent") / "machines"
 
 
+def factory_listing(pa, agent=None):
+    """The `pa factory list --json` reply. `agent` selects the agent home."""
+    env = {**os.environ, "PRIME_AGENT_CODING_AGENT_DIR": str(agent)} if agent else None
+    return json.loads(subprocess.check_output([pa, "factory", "list", "--json"], text=True, env=env))
+
+
+@functools.lru_cache(maxsize=1)
+def bundled_modules_dir(pa):
+    """The factory module library that the runtime package ships; it does not move while pa runs."""
+    value = factory_listing(pa).get("modules_dir")
+    return Path(value) if isinstance(value, str) and value else None
+
+
 def machine_catalog(pa, agent=None):
     """Installed machines by name. `agent` selects the agent home that owns them."""
-    env = {**os.environ, "PRIME_AGENT_CODING_AGENT_DIR": str(agent)} if agent else None
-    reply = subprocess.check_output([pa, "factory", "list", "--json"], text=True, env=env)
-    entries = json.loads(reply)["machines"]
+    entries = factory_listing(pa, agent)["machines"]
     roots = {row["source"]: Path(row["path"]).parent.parent for row in entries}
     roots.setdefault("user", personal_machines(agent))
     if os.getenv("PRIME_AGENT_MACHINES_DIR"):

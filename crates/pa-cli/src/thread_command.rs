@@ -7,8 +7,9 @@ use uuid::Uuid;
 
 const HELP: &str =
     "pa thread history [search text]
+pa thread absorb [--focus <text>] [--json] [--no-llm] <provider> <path|id> [<provider> <path|id>...]
 pa thread captain [status|act <operation>|stop|resume|delete]
-pa thread providers | models <antigravity> | connect <claude|codex|antigravity> | list | new <prime|claude|codex|antigravity> | import <provider> <native-log> [--context-only]
+pa thread providers | models <antigravity|cursor> | connect <claude|codex|antigravity|cursor> | list | new <prime|claude|codex|antigravity|cursor> | import <provider> <native-log> [--context-only]
 pa thread <id> send <message> | history | info | context | pin <note>
 pa thread <id> switch <provider> | model [model|default] | thinking [level|default] | child [provider] | children | recover
 pa thread <id> worktree list | move <existing-root> | create <path> <branch>
@@ -100,10 +101,34 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         ensure!(status.success(), "Factory picker exited with {status}");
         return Ok(());
     }
-    if let ["factory-host", cell, session] = words.as_slice() {
-        // The Captain job worker owns this process; see captain_jobs.py.
-        let cell = std::fs::read_to_string(cell).context("Missing factory host cell")?;
-        let args = ["-p", "--resume", session].map(str::to_owned);
+    if let ["factory-host", cell, session, options @ ..] = words.as_slice() {
+        // The Captain job worker owns this process; see captain_jobs.py. `--model` and
+        // `--thinking` set the host session, whose model the steps that name none inherit.
+        let cell_path = Path::new(cell);
+        let cell = std::fs::read_to_string(cell_path).context("Missing factory host cell")?;
+        if let Some(socket) = std::env::var_os("PRIME_AGENT_DAEMON_SOCKET") {
+            return crate::thread_runtime::factory_host_on_daemon(
+                Path::new(&socket),
+                cell_path,
+                cell,
+                Path::new(session),
+                options,
+            );
+        }
+        let mut args = vec![
+            "-p".to_owned(),
+            "--resume".to_owned(),
+            (*session).to_owned(),
+        ];
+        let mut rest = options.iter();
+        while let Some(flag) = rest.next() {
+            ensure!(
+                matches!(*flag, "--model" | "--thinking"),
+                "Unknown factory host option {flag}"
+            );
+            let value = rest.next().context("Missing factory host option value")?;
+            args.extend([(*flag).to_owned(), (*value).to_owned()]);
+        }
         let code = crate::print_runtime::run_factory_host(&args, cell);
         ensure!(code == 0, "Factory host exited with {code}");
         return Ok(());
@@ -138,6 +163,9 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         )?;
         return Ok(());
     }
+    if let ["absorb", rest @ ..] = words.as_slice() {
+        return absorb(rest);
+    }
     if let ["history", query @ ..] = words.as_slice() {
         let status = std::process::Command::new("python3")
             .args(["-I", "-c", include_str!("thread_history.py")])
@@ -163,7 +191,13 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
                 }
                 return Ok(());
             }
-            _ => bail!("Use `pa model list` for prime/claude/codex or `pa thread models antigravity` for antigravity"),
+            "cursor" => {
+                for (id, label, efforts) in super::thread_runtime::cursor_models()? {
+                    println!("{id}\t{label}\t{}", efforts.join(","));
+                }
+                return Ok(());
+            }
+            _ => bail!("Use `pa model list` for prime/claude/codex or `pa thread models <antigravity|cursor>`"),
         }
     }
     if let ["connect", provider] = words.as_slice() {
@@ -211,6 +245,13 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
                 command.args(["acp", "--login"]);
                 command
             }
+            "cursor" => {
+                let bin = super::thread_runtime::cursor_bin()
+                    .context("Cursor CLI (cursor-agent) is not installed")?;
+                let mut command = std::process::Command::new(bin);
+                command.arg("login");
+                command
+            }
             "prime" => bail!("Open Prime Agent and run /login to connect a Prime model provider"),
             _ => bail!("Unknown provider {provider}"),
         };
@@ -237,6 +278,56 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         ),
         [] => unreachable!(),
     }
+}
+
+/// `pa thread absorb`: print the `[absorbed-context]` packet (or the outcome
+/// as JSON) for scripts and CLI-provider threads. It never calls a model: a
+/// digest a pa chat already distilled is reused from the cache, otherwise the
+/// chat is absorbed verbatim, by its own compaction summary, or as the
+/// offline card. `--no-llm` states that explicitly.
+fn absorb(args: &[&str]) -> Result<()> {
+    let mut focus = None;
+    let mut json = false;
+    let mut sources = Vec::new();
+    let mut rest = args.iter();
+    while let Some(&arg) = rest.next() {
+        match arg {
+            "--focus" => focus = Some((*rest.next().context("--focus needs a value")?).to_owned()),
+            "--json" => json = true,
+            "--no-llm" => {}
+            provider => sources.push(pa_core::absorb::SourceRef {
+                provider: provider.to_owned(),
+                location: (*rest
+                    .next()
+                    .with_context(|| format!("Name the {provider} chat's path or id"))?)
+                .to_owned(),
+            }),
+        }
+    }
+    ensure!(!sources.is_empty(), "{HELP}");
+    let agent_dir = crate::config::get_agent_dir();
+    let cwd = std::env::current_dir()?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis() as u64;
+    let outcome = pa_core::absorb::absorb(
+        &pa_core::absorb::AbsorbRequest {
+            agent_dir: &agent_dir,
+            cwd: &cwd,
+            sources,
+            focus,
+            budget_tokens: pa_core::absorb::DEFAULT_BUDGET_TOKENS,
+            now_ms,
+        },
+        None,
+    )?;
+    if json {
+        serde_json::to_writer(io::stdout().lock(), &outcome)?;
+        println!();
+    } else {
+        println!("{}", outcome.content);
+    }
+    Ok(())
 }
 
 fn ensure_thread(id: Uuid, provider: &str) -> Result<()> {
@@ -285,9 +376,19 @@ fn run_captain(args: &[&str]) -> Result<()> {
                 "\n",
                 include_str!("machine_catalog.py"),
                 "\n",
+                include_str!("captain_snapshots.py"),
+                "\n",
+                include_str!("captain_runs.py"),
+                "\n",
+                include_str!("captain_wake.py"),
+                "\n",
+                include_str!("captain_schedules.py"),
+                "\n",
                 include_str!("captain_jobs.py"),
                 "\n",
                 include_str!("captain_factories.py"),
+                "\n",
+                include_str!("captain_modules.py"),
                 "\n",
                 include_str!("captain_main.py")
             ),
@@ -392,7 +493,12 @@ fn command(store: &Store, id: Uuid, args: &[String]) -> Result<()> {
             ensure!(t.pending.is_some(), "No interrupted turn");
             t.pending = None;
             t.job = None;
-            t.native = None;
+            // A Prime session file stays the chat pa opens; the daemon continues it.
+            let keeps_session = t.provider == "prime"
+                && t.native.as_deref().is_some_and(|n| Path::new(n).is_absolute() && Path::new(n).is_file());
+            if !keeps_session {
+                t.native = None;
+            }
         }
         ["review", ..] => return super::thread_workspace::review(&t.cwd, &args[1..]),
         _ if t.pending.is_some() => bail!("An interrupted turn may have performed work. Inspect info and review status before running recover. Recovery starts a fresh native session."),
@@ -458,7 +564,7 @@ fn send(store: &Store, t: &mut Thread, msg: String, hidden_context: Option<&str>
     };
     t.pending = Some(msg.clone());
     store.save(t)?;
-    let (native, reply) = super::thread_runtime::turn(
+    let turn = super::thread_runtime::turn(
         t.id,
         &t.provider,
         t.native.as_deref(),
@@ -469,7 +575,21 @@ fn send(store: &Store, t: &mut Thread, msg: String, hidden_context: Option<&str>
         },
         t.model.as_deref(),
         t.thinking.as_deref(),
-    )?;
+    );
+    let (native, reply) = match turn {
+        Ok(done) => done,
+        Err(error) => {
+            // The daemon ended the turn (stopped, failed, or no reply): nothing still runs.
+            if error
+                .downcast_ref::<super::thread_runtime::TurnSettled>()
+                .is_some()
+            {
+                t.pending = None;
+                store.save(t)?;
+            }
+            return Err(error);
+        }
+    };
     t.native = Some(native);
     t.pending = None;
     t.messages.push(("user".into(), msg));

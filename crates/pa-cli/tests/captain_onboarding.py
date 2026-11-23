@@ -4,7 +4,7 @@ A scripted `claude` executable plays both the Captain and its crew. As the
 Captain it calls the `act` command from its prompt, like a real model would.
 """
 
-import json, os, pathlib, sqlite3, subprocess, sys, time
+import atexit, json, os, pathlib, sqlite3, subprocess, sys, time
 
 P = pathlib.Path
 binary = str(P(sys.argv[1]).resolve())
@@ -77,12 +77,16 @@ print(json.dumps({"type": "result", "session_id": session, "result": reply, "is_
 """
 )
 script.chmod(0o755)
+# Prime turns run on this daemon; the macOS socket path limit is 104 bytes.
+SOCK = f"/tmp/pa-cob-{os.getpid()}.sock"
+atexit.register(subprocess.run, ["pkill", "-f", SOCK], check=False)
 env = dict(
     os.environ,
     PA_CAPTAIN_HOME=str(hub),
     PRIME_AGENT_CODING_AGENT_DIR=str(hub),
     PA_CAPTAIN_NATIVE_HOME=str(native),
     PRIME_AGENT_DAEMON_SOCKET=str(temp / "socket"),
+    PA_CAPTAIN_NATIVE_SOCKET=SOCK,
     DO_NOT_TRACK="1",
     CAPTURE=str(temp / "capture"),
     PATH=str(mock) + ":" + os.environ["PATH"],

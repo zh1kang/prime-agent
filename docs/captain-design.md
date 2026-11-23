@@ -68,6 +68,12 @@ That cell runs the normal executor, writes the live graph to the run's control f
 The executor journal (`runs.jsonl`) reports progress to the Captain as before.
 Runs started from chat with `/fsm` or the F6 factory view keep their chat kernel.
 
+Prime lead and crew turns run as sessions of the user's daemon, the same daemon pa uses.
+The job worker drives the turn through an ACP client (`--mode acp`); the daemon holds the session file, so pa can open the chat while the turn runs and shows its text, tool cells, and subagents live.
+A stop signals the worker; the turn client sends `session/cancel`, which aborts the turn and its subagents, and the job settles when the turn has ended.
+A message typed in the Captain chat during a turn waits in the job queue and runs as the next Captain turn.
+Claude, Codex, and Antigravity crew turns run their CLIs; their chat shows the transcript and a working line until the turn ends.
+
 | State | Meaning | Set by |
 | --- | --- | --- |
 | queued | Job and crew row recorded, worker not started | `delegate` |
@@ -96,9 +102,13 @@ A Captain-started writer run needs one of two things:
 
 The backend reads the turn type from the lead's running job, not from anything the Captain passes, so crew output cannot approve a writer run or create a grant.
 The Captain can grant or revoke only in a turn that answers a user message, and each change is recorded in `edits` with field `grants`.
-Crew turns and factory hosts run with `PA_CAPTAIN_ACTOR=crew:<project>`; from them, `grant`, `factory-approve`, `factory-delete`, and every other change is refused, and only `factory-validate` and `factory-show` work.
+Crew turns and factory hosts run with `PA_CAPTAIN_ACTOR=crew:<project>`; from them, `grant`, `factory-approve`, `factory-delete`, and every other change is refused, and only the read ops `factory-validate`, `factory-show`, `factory-modules`, `specialist-list`, and `specialist-show` work.
 These checks stop mistakes and crew output on the normal path.
-They are not a sandbox: the Captain and crew threads have a shell, so they could bypass any local check on purpose, for example by calling the command without that variable. A Prime crew turn that runs in the shared daemon gets its tool environment from the daemon, not from this variable.
+The actor is the stricter of `PA_CAPTAIN_ACTOR` and the actor of the session that runs the command.
+The daemon sets `RLM_SESSION_ID` for each session's tools; the backend maps it to the Captain lead session, a crew session, or a session that one of them spawned.
+So a turn keeps its actor when the daemon runs it in a worker that a pa chat started without that variable.
+A daemon never inherits a Captain identity from the process that started it.
+They are not a sandbox: the Captain and crew threads have a shell, so they could bypass any local check on purpose.
 
 ## Project factories
 
@@ -135,7 +145,16 @@ Each lead turn records the factory digests it starts with, and a Captain approva
 On the review page, `a` sends the digest from the user's last explicit load (`F` or `r`); when a refresh brings a different digest, the page shows "Changed - press r to review again" and `a` waits for `r`.
 Only the user deletes a project factory, and never while a run of it is queued or running.
 
-Operations: `factory-validate(name)` returns the state and errors, `factory-show(name)` adds the compiled graph and `live`, `factory-approve(name, digest)`, `factory-delete(name)`, and `factory-design(text?)`.
+Operations: `factory-validate(name)` returns the state and errors, `factory-show(name)` adds the compiled graph and `live`, `factory-approve(name, digest)`, `factory-delete(name)`, `factory-design(text?)`, and `factory-set-model(name, state, model, thinking, role?, edit_role?)`, which only the user runs from the review page.
+Factory models: setup asks how a designed factory picks models (same as the Captain, one model for every step, or the Captain chooses per step) and stores the choice on the project (`factory_models`).
+The first two make the design turn write one `default` role with that model and use it in every agent step; the third lets the Captain pick a role per step from `pa model list`.
+A step with no model or role runs on the run's host model, which is the project's chosen model or else the Captain's model, never pa's global default when the user chose one; `delegate` with `machine` takes `model` and `thinking` to override it for one run.
+Diagrams show such a step as `inherit (<model>)`.
+The review page shows the default model, and `M` sets the factory's `default` role (`factory-set-default-model(name, model, thinking)`, user only); like any edit, the factory then needs approval again.
+Module and specialist operations: `factory-modules` lists the shared modules; `factory-add-module(name, module, alias?, wire, after?)` and `factory-update-module(name, alias)` vendor one into a factory; `factory-use-specialist(name, specialist, states)` and `factory-update-specialist(name, specialist)` put a project specialist into agent states; `specialist-list`, `specialist-show(id)`, `specialist-write(id, name, description, model, thinking, prompt)`, and `specialist-delete(id)` manage `<project>/.prime/agents/<id>.md`.
+`modules.lock` in the factory folder records what each module alias added (states, roles, params, and the states wired into its entry) and each specialist's digest; an update removes those parts and adds the new version again, and every such edit makes the factory a draft.
+Modules can declare params; the `validate` module runs its `validate_command` param in a shell, and approval covers the factory files, not the param values a run gets.
+`crew-model(member, model, thinking)` changes the model and thinking of a crew thread for its next turns.
 `factory-design` queues a Captain turn with purpose `design`: the Captain writes a factory from the objective, plan, and rules, validates it, and reports.
 A design turn cannot start a run.
 The runtime refuses `rlm.factory.run` on any machine directory inside a `<dir>/.prime/machines/` tree ("Project factories run through the Captain after approval."), so no chat or design turn can run a draft directly; Captain runs use the approved copy in the run's control folder, outside that tree.
@@ -156,6 +175,7 @@ Lists (models, thinking levels, machines, worker limit, threads to add) use the 
 | m | message the Captain or a crew thread; on a paused run, answer it |
 | n, p | new Captain, or promote this chat |
 | e, a, d, u | edit a field, add a thread, assign work, release a thread |
+| M, S | crew thread model, project specialists |
 | f, c, v, x | factory, consensus, git review, rules and plan |
 | F | project factories: review a draft, or request a design |
 | s, R, D | stop, resume, delete |
@@ -167,7 +187,7 @@ F7 or `/crew` opens the chat switcher; Shift+F7 or `/captain chat` opens the Cap
 A project factory that is a draft or changed since approval shows under the project as needs you.
 `F` lists the project factories and "Design a factory for this project".
 The review page draws the compiled machine with the factory page diagram, without live state, and shows the state, the short digest, and any validation errors.
-Its keys are a approve, e edit `machine.toml` in `$EDITOR`, m send a change request to the Captain, D delete (with a confirm), and Esc back.
+Its keys are a approve, m model of the selected state, M default model of the factory's roles, c send a change request to the Captain, e open the factory in pa's machine editor, u update a drifted module or specialist, Enter the selected state's files, r review again, D delete (with a confirm), and Esc back.
 
 A provider CLI thread (claude, codex, antigravity) has no native session, so it opens read-and-reply inside the panel; replies go through the Captain's `reply` job.
 
@@ -180,15 +200,18 @@ Adopted provider CLI threads keep working through their CLIs.
 
 ### One turn per session
 
-A Captain job runs a Prime turn in its own process, which holds the session's runtime lease.
-When an open pa chat already holds the lease, the job sends its turn through that chat's daemon (`--mode acp`) instead.
-The open chat then shows the Captain's turn live, and a message typed in the chat queues behind it.
-Opening a chat while a job holds its lease shows that the Captain is running a turn there.
+A Captain job always sends a Prime turn through the daemon pa uses (`--mode acp`, on the socket of the pa that started the job, else pa's default socket); the job process never holds the session's runtime lease.
+A thread with only a session ID, or no session yet (after `import`, `promote`, or `recover`), gets its session file resolved or created first, so it takes the same route.
+An open chat shows the Captain's turn live, and a message typed in the chat queues behind it.
+Opening a chat that another process still holds shows that the Captain is running a turn there, and pa opens it once that turn ends.
+A turn the daemon ends (Esc in pa, an error, or no reply) leaves the thread ready for its next message; only a worker that dies mid-turn leaves it to `recover`, which keeps the session file.
 A message typed in the Captain's own chat is a Captain turn: pa queues it as a `lead` job, so it runs through the same route, counts as a user message for approvals and grants, and gets the Captain's context.
 The transcript shows only what the user typed, or a short line for other turns (`Brief: …`, `Crew update: 2 reports`).
-The Captain's instructions, rules, plan, digest, crew reports, and the `act` command are hidden context: in its own process the turn adds them to the system prompt, and in the daemon route they ride the prompt's `_meta` and the daemon writes them as a `display: false` custom row before the user message.
+The Captain's instructions, rules, plan, digest, crew reports, and the `act` command are hidden context: they ride the prompt's `_meta` and the daemon writes them as a `display: false` custom row before the user message.
 A crew turn works the same way: the transcript shows the assigned task, and the crew rules are hidden context.
-In both routes the Captain's instructions give it the command `env … PA_CAPTAIN_ACTOR=<project> pa thread captain act`, so its `act` calls carry the Captain scope; a model that runs `act` without that command loses the scope, which the permission note above already allows for.
+The actor of an `act` call comes from the session that runs it: the daemon sets `RLM_SESSION_ID` for a session's tools, and the backend maps it, or the session of the RLM subagent's parent, to the Captain or the crew from the live project records.
+A session's daemon worker never carries `PA_CAPTAIN_ACTOR`, `PA_CAPTAIN_SESSION`, or `PA_CAPTAIN_SELECTION`, and the daemon process carries no `PA_CAPTAIN_*` variable, so a released or deleted chat counts as the user's at once; a `PA_CAPTAIN_ACTOR` that names another project than the session is refused.
+A user `/fork` of a Captain or crew chat is a normal chat, and a factory run watched from a user's chat does not make that chat crew.
 
 ### Stop, resume, and delete
 

@@ -204,6 +204,84 @@ emit("result", result={"conversation_id": cid, "status": "SUCCESS", "response": 
     assert!(captured2.iter().any(|a| a == "-p=second turn"));
 }
 
+#[test]
+fn cursor_provider_handles_models_thinking_and_chat_resume() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let script = root.join("fake-cursor-agent");
+    fs::write(
+        &script,
+        r#"#!/usr/bin/env python3
+import json, os, pathlib, sys
+args = sys.argv[1:]
+if args == ["--version"]:
+    print("2026.11.01")
+    sys.exit(0)
+if args == ["--list-models"]:
+    print("\x1b[1mAvailable models\x1b[0m")
+    print("composer-3 - Composer 3")
+    print("gpt-6-low - GPT-6 Low")
+    print("gpt-6-high - GPT-6 High\u200b")
+    print("gpt-6-high - GPT-6 High")
+    sys.exit(0)
+pathlib.Path(os.environ["CAPTURE"]).write_text(json.dumps(args))
+assert args[:6] == ["--print", "--output-format", "json", "--force", "--trust", "--workspace"], args
+print(json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                  "result": "cursor reply\n", "session_id": "chat-123"}))
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    let invoke = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_prime-agent"))
+            .arg("thread")
+            .args(args)
+            .current_dir(root)
+            .env("PRIME_AGENT_CODING_AGENT_DIR", root.join("config"))
+            .env("PA_CURSOR_BIN", &script)
+            .env("CAPTURE", root.join("args.json"))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "args={args:?} stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    let captured = || -> Vec<String> {
+        serde_json::from_str(&fs::read_to_string(root.join("args.json")).unwrap()).unwrap()
+    };
+
+    let providers = invoke(&["providers"]);
+    assert!(providers.contains("cursor\tavailable"), "{providers}");
+    let models = invoke(&["models", "cursor"]);
+    assert!(models.contains("composer-3\tComposer 3\t"), "{models}");
+    assert!(models.contains("gpt-6\tGPT-6\tlow,high"), "{models}");
+    assert_eq!(models.matches("gpt-6\t").count(), 1, "{models}");
+
+    let id = invoke(&["new", "cursor"]);
+    invoke(&[&id, "model", "gpt-6"]);
+    invoke(&[&id, "thinking", "high"]);
+    assert_eq!(invoke(&[&id, "send", "first turn"]), "cursor reply");
+    let first = captured();
+    assert!(
+        first.windows(2).any(|w| w == ["--model", "gpt-6-high"]),
+        "{first:?}"
+    );
+    assert!(!first.iter().any(|a| a == "--resume"), "{first:?}");
+    let prompt = &first[first.iter().position(|a| a == "--").unwrap() + 1];
+    assert!(prompt.starts_with("[Thread tool note:") && prompt.ends_with("first turn"));
+
+    assert_eq!(invoke(&[&id, "send", "-- second turn"]), "cursor reply");
+    let second = captured();
+    assert!(
+        second.windows(2).any(|w| w == ["--resume", "chat-123"]),
+        "{second:?}"
+    );
+    assert_eq!(second.last().map(String::as_str), Some("-- second turn"));
+}
+
 /// The JSON commands behind pa's native history, machine editor, and review pages.
 #[test]
 fn workspace_pages_json_commands() {
