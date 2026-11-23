@@ -195,6 +195,7 @@ impl EnvCredentialSource for ProcessEnvCredentials {
         match provider {
             pa_ai::claude_cli::ANTHROPIC_PROVIDER => pa_ai::claude_cli::is_available(),
             pa_ai::antigravity::ANTIGRAVITY_PROVIDER => pa_ai::antigravity::is_available(),
+            pa_ai::cursor_cli::CURSOR_PROVIDER => pa_ai::cursor_cli::is_available(),
             _ => false,
         }
     }

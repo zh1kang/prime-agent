@@ -95,7 +95,7 @@ pub struct ModelRegistry {
     /// The process-shared live catalog chain (`catalog_chain::catalog_for`);
     /// `resolve()` sources built-ins from it.
     catalog: std::sync::Arc<pa_models::ModelCatalog>,
-    /// Local CLI providers (claude, agy) found once at construction through
+    /// Local CLI providers (claude, agy, cursor-agent) found once at construction through
     /// the auth storage's environment source; hermetic storage finds none.
     local_cli: LocalCliProviders,
 }
@@ -105,6 +105,7 @@ pub struct ModelRegistry {
 struct LocalCliProviders {
     claude: bool,
     antigravity: bool,
+    cursor: bool,
 }
 
 /// Under a stored xAI subscription the provider's models switch onto the
@@ -185,6 +186,7 @@ impl ModelRegistry {
             LocalCliProviders {
                 claude: auth.local_cli_available(pa_ai::claude_cli::ANTHROPIC_PROVIDER),
                 antigravity: auth.local_cli_available(pa_ai::antigravity::ANTIGRAVITY_PROVIDER),
+                cursor: auth.local_cli_available(pa_ai::cursor_cli::CURSOR_PROVIDER),
             }
         } else {
             LocalCliProviders::default()
@@ -294,6 +296,9 @@ impl ModelRegistry {
         {
             return true;
         }
+        if model.provider == pa_ai::cursor_cli::CURSOR_PROVIDER && self.local_cli.cursor {
+            return true;
+        }
         if model.provider == pa_ai::claude_cli::ANTHROPIC_PROVIDER
             && self.anthropic_uses_claude_cli()
         {
@@ -307,6 +312,13 @@ impl ModelRegistry {
     /// classifying unauthenticated vs stale providers read this instead of
     /// probing for keys.
     pub fn get_provider_auth_status(&self, provider: &str) -> crate::auth::types::AuthStatus {
+        if provider == pa_ai::cursor_cli::CURSOR_PROVIDER && self.local_cli.cursor {
+            return crate::auth::types::AuthStatus {
+                configured: true,
+                source: Some(crate::auth::types::AuthSource::Environment),
+                label: Some("Cursor CLI".to_string()),
+            };
+        }
         if provider == pa_ai::antigravity::ANTIGRAVITY_PROVIDER && self.local_cli.antigravity {
             return crate::auth::types::AuthStatus {
                 configured: true,
@@ -483,9 +495,16 @@ impl ModelRegistry {
             &content,
             &|provider| {
                 provider == pa_ai::antigravity::ANTIGRAVITY_PROVIDER
+                    || provider == pa_ai::cursor_cli::CURSOR_PROVIDER
                     || !pa_ai::models_generated::get_models(provider).is_empty()
             },
             &|provider| {
+                if provider == pa_ai::cursor_cli::CURSOR_PROVIDER {
+                    return Some((
+                        pa_ai::cursor_cli::CURSOR_CLI_API.to_string(),
+                        pa_ai::cursor_cli::CURSOR_BASE_URL.to_string(),
+                    ));
+                }
                 if provider == pa_ai::antigravity::ANTIGRAVITY_PROVIDER {
                     return Some((
                         pa_ai::antigravity::ANTIGRAVITY_API.to_string(),
@@ -582,6 +601,16 @@ impl ModelRegistry {
                 }
             }
         }
+        if self.local_cli.cursor {
+            for cursor_model in pa_ai::cursor_cli::models() {
+                if !resolved
+                    .iter()
+                    .any(|m| m.provider == cursor_model.provider && m.id == cursor_model.id)
+                {
+                    resolved.push(cursor_model);
+                }
+            }
+        }
         resolved
             .into_iter()
             .map(|mut model| {
@@ -656,6 +685,10 @@ impl ModelRegistry {
             let _ = tokio::task::spawn_blocking(move || pa_ai::antigravity::refresh_models(force))
                 .await;
         }
+        if self.local_cli.cursor {
+            let _ =
+                tokio::task::spawn_blocking(move || pa_ai::cursor_cli::refresh_models(force)).await;
+        }
         self.load_models();
         self.get_available().into_iter().cloned().collect()
     }
@@ -668,6 +701,7 @@ impl ModelRegistry {
     ) -> ResolvedRequestAuth {
         if model.api == pa_ai::claude_cli::CLAUDE_CLI_API
             || model.api == pa_ai::antigravity::ANTIGRAVITY_API
+            || model.api == pa_ai::cursor_cli::CURSOR_CLI_API
         {
             return ResolvedRequestAuth {
                 ok: true,

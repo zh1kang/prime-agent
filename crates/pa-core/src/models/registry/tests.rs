@@ -752,6 +752,33 @@ fn antigravity_models_surface_when_cli_is_available() {
 }
 
 #[test]
+fn cursor_models_surface_when_cli_is_available() {
+    let dir = tempfile::tempdir().unwrap();
+    let models_path = dir.path().join("models.json");
+    let auth = auth_with_local_clis(&serde_json::json!({}), &["cursor"]);
+    let mut registry = ModelRegistry::create(auth, &models_path);
+    let opus = registry
+        .get_available()
+        .into_iter()
+        .find(|m| m.provider == "cursor" && m.id == "claude-opus-5-5")
+        .expect("cursor/claude-opus-5-5 should be available when cursor-agent is installed")
+        .clone();
+    assert_eq!(opus.api, pa_ai::cursor_cli::CURSOR_CLI_API);
+    assert!(registry
+        .get_available()
+        .iter()
+        .any(|m| m.provider == "cursor" && m.id == "claude-opus-5-5-fast"));
+    assert!(registry.has_configured_auth(&opus));
+    assert!(registry.get_provider_auth_status("cursor").configured);
+    assert!(registry
+        .resolve_set_model_selection("cursor", "claude-opus-5-5")
+        .is_ok());
+    let resolved = registry.get_api_key_and_headers(&opus, None);
+    assert!(resolved.ok);
+    assert!(resolved.error.is_none());
+}
+
+#[test]
 fn anthropic_routes_through_claude_cli_without_real_api_key() {
     if std::env::var("ANTHROPIC_API_KEY")
         .is_ok_and(|k| !k.trim().is_empty() && !k.contains("sk-ant-oat"))

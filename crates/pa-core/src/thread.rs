@@ -98,7 +98,7 @@ fn clip(s: &str, n: usize) -> String {
     format!("{}…", &s[..end])
 }
 
-pub const PROVIDERS: &[&str] = &["prime", "claude", "codex", "antigravity"];
+pub const PROVIDERS: &[&str] = &["prime", "claude", "codex", "antigravity", "cursor"];
 pub const THINKING_LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 /// # Errors
@@ -106,7 +106,7 @@ pub const THINKING_LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high"
 pub fn check_provider(p: &str) -> Result<()> {
     ensure!(
         PROVIDERS.contains(&p),
-        "Unknown provider {p}. Choose prime, claude, codex, or antigravity."
+        "Unknown provider {p}. Choose prime, claude, codex, antigravity, or cursor."
     );
     Ok(())
 }

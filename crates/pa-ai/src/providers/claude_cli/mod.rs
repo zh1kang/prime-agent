@@ -4,7 +4,7 @@
 //! instead of spoofing Claude Code headers against the Messages API with an
 //! OAuth subscription token.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
@@ -16,6 +16,7 @@ use tokio::process::Command;
 use crate::event_stream::{
     create_assistant_message_event_stream, AssistantMessageEventStream, AssistantMessageEventWriter,
 };
+use crate::providers::antigravity::tool_progress_line;
 use crate::registry::Provider;
 use crate::types::{
     AssistantContent, AssistantMessage, AssistantMessageEvent, Context, DoneStopReason,
@@ -211,6 +212,31 @@ fn message_to_prompt_line(message: &Message) -> Option<String> {
     }
 }
 
+/// The prompt delta for a native resume: everything after the cached turn
+/// must be that turn's assistant reply followed only by user rows (the new
+/// prompt, plus any user-role context such as `/absorb` appended before
+/// it), joined by blank lines.
+fn resume_prompt_delta(messages: &[Message], cached_count: usize) -> Option<String> {
+    let (reply, appended) = messages.get(cached_count..)?.split_first()?;
+    if !matches!(reply, Message::Assistant(_)) || appended.is_empty() {
+        return None;
+    }
+    let texts = appended
+        .iter()
+        .map(|message| match message {
+            Message::User(user) => Some(user_content_to_text(&user.content)),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(
+        texts
+            .into_iter()
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+    )
+}
+
 fn build_prompt_and_resume(
     context: &Context,
     model_id: &str,
@@ -221,12 +247,15 @@ fn build_prompt_and_resume(
         _ => None,
     });
 
-    if let (Some(sid), Some(user_text)) = (session_id, &latest_user) {
+    if let (Some(sid), Some(_)) = (session_id, &latest_user) {
         if let Ok(guard) = sessions().lock() {
             if let Some(cached) = guard.get(sid) {
-                if cached.model_id == model_id && context.messages.len() == cached.message_count + 2
-                {
-                    return (user_text.clone(), Some(cached.claude_session_id.clone()));
+                if cached.model_id == model_id {
+                    if let Some(delta) =
+                        resume_prompt_delta(&context.messages, cached.message_count)
+                    {
+                        return (delta, Some(cached.claude_session_id.clone()));
+                    }
                 }
             }
         }
@@ -328,6 +357,41 @@ fn push_error(
         error: partial.clone(),
     });
     writer.end(Some(partial));
+}
+
+fn push_thinking(
+    chunk: &str,
+    thinking_index: &mut Option<u64>,
+    partial: &mut AssistantMessage,
+    writer: &AssistantMessageEventWriter,
+) {
+    let idx = if let Some(idx) = *thinking_index {
+        idx
+    } else {
+        let idx = partial.content.len() as u64;
+        partial
+            .content
+            .push(AssistantContent::Thinking(ThinkingContent {
+                thinking: String::new(),
+                thinking_signature: None,
+                redacted: None,
+                rest: Map::default(),
+            }));
+        writer.push(AssistantMessageEvent::ThinkingStart {
+            content_index: idx,
+            partial: partial.clone(),
+        });
+        *thinking_index = Some(idx);
+        idx
+    };
+    if let Some(AssistantContent::Thinking(content)) = partial.content.get_mut(idx as usize) {
+        content.thinking.push_str(chunk);
+    }
+    writer.push(AssistantMessageEvent::ThinkingDelta {
+        content_index: idx,
+        delta: chunk.to_string(),
+        partial: partial.clone(),
+    });
 }
 
 pub(crate) async fn run_stream(
@@ -453,6 +517,9 @@ async fn run_stream_with_bin(
     let mut claude_session_id: Option<String> = resume_id;
     let mut result_text: Option<String> = None;
     let mut result_error: Option<String> = None;
+    // Streamed `tool_use` blocks by content index: (id, name, partial input JSON).
+    let mut pending_tools: HashMap<String, (String, String, String)> = HashMap::new();
+    let mut seen_tool_ids: HashSet<String> = HashSet::new();
 
     let close_thinking = |thinking_index: &mut Option<u64>,
                           partial: &mut AssistantMessage,
@@ -546,36 +613,21 @@ async fn run_stream_with_bin(
                                 if let Some(chunk) =
                                     delta["thinking"].as_str().filter(|s| !s.is_empty())
                                 {
-                                    let idx = match thinking_index {
-                                        Some(idx) => idx,
-                                        None => {
-                                            let idx = partial.content.len() as u64;
-                                            partial.content.push(AssistantContent::Thinking(
-                                                ThinkingContent {
-                                                    thinking: String::new(),
-                                                    thinking_signature: None,
-                                                    redacted: None,
-                                                    rest: Map::default(),
-                                                },
-                                            ));
-                                            writer.push(AssistantMessageEvent::ThinkingStart {
-                                                content_index: idx,
-                                                partial: partial.clone(),
-                                            });
-                                            thinking_index = Some(idx);
-                                            idx
-                                        }
-                                    };
-                                    if let Some(AssistantContent::Thinking(content)) =
-                                        partial.content.get_mut(idx as usize)
-                                    {
-                                        content.thinking.push_str(chunk);
-                                    }
-                                    writer.push(AssistantMessageEvent::ThinkingDelta {
-                                        content_index: idx,
-                                        delta: chunk.to_string(),
-                                        partial: partial.clone(),
-                                    });
+                                    push_thinking(
+                                        chunk,
+                                        &mut thinking_index,
+                                        &mut partial,
+                                        &writer,
+                                    );
+                                }
+                            }
+                            Some("input_json_delta") => {
+                                if let Some(pending) =
+                                    pending_tools.get_mut(&inner["index"].to_string())
+                                {
+                                    pending.2.push_str(
+                                        delta["partial_json"].as_str().unwrap_or_default(),
+                                    );
                                 }
                             }
                             Some("text_delta") => {
@@ -617,6 +669,35 @@ async fn run_stream_with_bin(
                             _ => {}
                         }
                     }
+                    Some("content_block_start") => {
+                        let block = &inner["content_block"];
+                        if block["type"].as_str() == Some("tool_use") {
+                            pending_tools.insert(
+                                inner["index"].to_string(),
+                                (
+                                    block["id"].as_str().unwrap_or_default().to_string(),
+                                    block["name"].as_str().unwrap_or("tool").to_string(),
+                                    String::new(),
+                                ),
+                            );
+                        }
+                    }
+                    Some("content_block_stop") => {
+                        if let Some((id, name, raw_input)) =
+                            pending_tools.remove(&inner["index"].to_string())
+                        {
+                            if id.is_empty() || seen_tool_ids.insert(id) {
+                                let input = serde_json::from_str::<Value>(&raw_input)
+                                    .unwrap_or(Value::Null);
+                                push_thinking(
+                                    &tool_progress_line(&name, &input),
+                                    &mut thinking_index,
+                                    &mut partial,
+                                    &writer,
+                                );
+                            }
+                        }
+                    }
                     Some("message_delta") => {
                         if inner["usage"].is_object() {
                             apply_usage(&mut partial.usage, &inner["usage"]);
@@ -634,6 +715,23 @@ async fn run_stream_with_bin(
                     apply_usage(&mut partial.usage, &msg["usage"]);
                 }
                 if let Some(blocks) = msg["content"].as_array() {
+                    for block in blocks {
+                        if block["type"].as_str() != Some("tool_use") {
+                            continue;
+                        }
+                        let id = block["id"].as_str().unwrap_or_default();
+                        if id.is_empty() || seen_tool_ids.insert(id.to_string()) {
+                            push_thinking(
+                                &tool_progress_line(
+                                    block["name"].as_str().unwrap_or("tool"),
+                                    &block["input"],
+                                ),
+                                &mut thinking_index,
+                                &mut partial,
+                                &writer,
+                            );
+                        }
+                    }
                     let combined: String = blocks
                         .iter()
                         .filter_map(|b| {
@@ -821,6 +919,66 @@ impl Provider for ClaudeCliProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn absorbed_context_between_turns_keeps_native_resume() {
+        let text_user = |text: &str| {
+            Message::User(pa_types::ai::UserMessage {
+                content: UserMessageContent::Text(text.to_string()),
+                timestamp: now_ms(),
+                rest: Map::default(),
+            })
+        };
+        let reply = Message::Assistant(AssistantMessage {
+            content: Vec::new(),
+            api: String::new(),
+            provider: String::new(),
+            model: "resume-model".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            stop_reason_raw: None,
+            error_message: None,
+            timestamp: now_ms(),
+            rest: Map::default(),
+        });
+        let sid = "test-session-claude_cli-absorb-resume";
+        sessions().lock().unwrap().insert(
+            sid.to_string(),
+            CachedConversation {
+                claude_session_id: "native-conv-1".into(),
+                model_id: "resume-model".into(),
+                message_count: 1,
+            },
+        );
+        let context = Context {
+            messages: vec![
+                text_user("turn one"),
+                reply.clone(),
+                text_user("[absorbed-context]"),
+                text_user("turn two"),
+            ],
+            ..Default::default()
+        };
+        let (prompt, resume) = build_prompt_and_resume(&context, "resume-model", Some(sid));
+        assert_eq!(resume.as_deref(), Some("native-conv-1"));
+        assert_eq!(prompt, "[absorbed-context]\n\nturn two");
+
+        let interleaved = Context {
+            messages: vec![
+                text_user("turn one"),
+                reply.clone(),
+                reply,
+                text_user("turn two"),
+            ],
+            ..Default::default()
+        };
+        let (_, resume) = build_prompt_and_resume(&interleaved, "resume-model", Some(sid));
+        assert_eq!(resume, None, "an extra assistant row breaks the resume");
+        sessions().lock().unwrap().remove(sid);
+    }
     use crate::types::{zero_model_cost, ModelInput, UserMessage};
 
     fn opus_model() -> Model {
@@ -870,6 +1028,11 @@ mod tests {
             "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\ncat > \"{}\"\n\
              printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"cc-sess-1\",\"model\":\"claude-opus-5-5\"}}'\n\
              printf '%s\\n' '{{\"type\":\"stream_event\",\"event\":{{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"thinking_delta\",\"thinking\":\"Plan: \"}}}}}}'\n\
+             printf '%s\\n' '{{\"type\":\"stream_event\",\"event\":{{\"type\":\"content_block_start\",\"index\":1,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"Bash\",\"input\":{{}}}}}}}}'\n\
+             printf '%s\\n' '{{\"type\":\"stream_event\",\"event\":{{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{{\\\"command\\\":\\\"cargo \"}}}}}}'\n\
+             printf '%s\\n' '{{\"type\":\"stream_event\",\"event\":{{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"test\\\"}}\"}}}}}}'\n\
+             printf '%s\\n' '{{\"type\":\"stream_event\",\"event\":{{\"type\":\"content_block_stop\",\"index\":1}}}}'\n\
+             printf '%s\\n' '{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"Bash\",\"input\":{{\"command\":\"cargo test\"}}}},{{\"type\":\"tool_use\",\"id\":\"toolu_2\",\"name\":\"Read\",\"input\":{{\"file_path\":\"/tmp/a.rs\"}}}}]}}}}'\n\
              printf '%s\\n' '{{\"type\":\"stream_event\",\"event\":{{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{{\"type\":\"text_delta\",\"text\":\"Hello \"}}}}}}'\n\
              printf '%s\\n' '{{\"type\":\"stream_event\",\"event\":{{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{{\"type\":\"text_delta\",\"text\":\"Claude!\"}}}}}}'\n\
              printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"cc-sess-1\",\"result\":\"Hello Claude!\",\"usage\":{{\"input_tokens\":20,\"output_tokens\":5,\"cache_read_input_tokens\":10,\"cache_creation_input_tokens\":3}}}}'\n",
@@ -915,7 +1078,10 @@ mod tests {
         let message = stream.result().await;
         handle.await.unwrap();
 
-        assert_eq!(thinking_deltas, vec!["Plan: "]);
+        assert_eq!(
+            thinking_deltas,
+            vec!["Plan: ", "\n▸ Bash cargo test\n", "\n▸ Read /tmp/a.rs\n"]
+        );
         assert_eq!(text_deltas, vec!["Hello ", "Claude!"]);
         assert_eq!(message.stop_reason, StopReason::Stop);
         assert_eq!(message.response_id.as_deref(), Some("cc-sess-1"));

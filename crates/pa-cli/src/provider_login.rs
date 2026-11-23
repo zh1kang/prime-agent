@@ -78,7 +78,9 @@ fn is_api_key_login_provider(
     provider_id: &str,
     built_in_provider_ids: &std::collections::HashSet<String>,
 ) -> bool {
-    if provider_id == pa_ai::antigravity::ANTIGRAVITY_PROVIDER {
+    if provider_id == pa_ai::antigravity::ANTIGRAVITY_PROVIDER
+        || provider_id == pa_ai::cursor_cli::CURSOR_PROVIDER
+    {
         return false;
     }
     if BUILT_IN_PROVIDER_DISPLAY_NAMES

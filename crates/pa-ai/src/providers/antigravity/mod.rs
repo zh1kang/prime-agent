@@ -5,7 +5,7 @@
 //! streams completions through the local Antigravity CLI (`agy` or T3 Code's
 //! managed `antigravity` binary).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
@@ -13,8 +13,9 @@ use std::time::{Duration, Instant};
 
 use pa_types::JsNumber;
 use serde_json::{Map, Value};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
-use tokio::process::Command;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::process::{ChildStdin, ChildStdout, Command};
+use tokio_util::sync::CancellationToken;
 
 use crate::event_stream::{
     create_assistant_message_event_stream, AssistantMessageEventStream, AssistantMessageEventWriter,
@@ -23,10 +24,189 @@ use crate::registry::Provider;
 use crate::types::{
     AssistantContent, AssistantMessage, AssistantMessageEvent, Context, DoneStopReason,
     ErrorStopReason, Message, Model, ModelCost, ModelInput, ModelThinkingLevel,
-    SimpleStreamOptions, StopReason, StreamOptions, TextContent, ThinkingLevelMap,
+    SimpleStreamOptions, StopReason, StreamOptions, TextContent, ThinkingContent, ThinkingLevelMap,
     ToolResultMessage, Usage, UsageCost, UserMessageContent,
 };
 use crate::utils_inner::diagnostics::now_ms;
+
+const ACP_INIT_TIMEOUT: Duration = Duration::from_secs(20);
+
+const TOOL_ARG_KEYS: &[&str] = &[
+    "CommandLine",
+    "command",
+    "cmd",
+    "AbsolutePath",
+    "TargetFile",
+    "Path",
+    "path",
+    "file_path",
+    "filePath",
+    "target_file",
+    "DirectoryPath",
+    "directory",
+    "Query",
+    "query",
+    "Pattern",
+    "pattern",
+    "glob_pattern",
+    "globPattern",
+    "SearchPath",
+    "Url",
+    "url",
+    "prompt",
+    "description",
+];
+
+/// One-line `▸ <tool> <arg>` progress marker streamed into the thinking block
+/// while a CLI agent runs a tool.
+pub(crate) fn tool_progress_line(name: &str, args: &Value) -> String {
+    let arg = match args {
+        Value::String(text) => Some(text.clone()),
+        Value::Object(map) => TOOL_ARG_KEYS.iter().find_map(|key| match map.get(*key) {
+            Some(Value::String(text)) if !text.trim().is_empty() => Some(text.clone()),
+            Some(Value::Array(items)) if !items.is_empty() => Some(
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            ),
+            _ => None,
+        }),
+        _ => None,
+    };
+    let arg = arg
+        .as_deref()
+        .and_then(|text| text.lines().map(str::trim).find(|line| !line.is_empty()))
+        .map(|line| {
+            if line.chars().count() > 160 {
+                format!("{}…", line.chars().take(160).collect::<String>())
+            } else {
+                line.to_string()
+            }
+        });
+    match arg {
+        Some(arg) => format!("\n▸ {name} {arg}\n"),
+        None => format!("\n▸ {name}\n"),
+    }
+}
+
+/// Open thinking/text blocks while reading one Antigravity stream.
+#[derive(Default)]
+struct BlockState {
+    thinking_index: Option<u64>,
+    text_index: Option<u64>,
+    any_text: bool,
+}
+
+impl BlockState {
+    fn close_thinking(&mut self, partial: &AssistantMessage, writer: &AssistantMessageEventWriter) {
+        if let Some(idx) = self.thinking_index.take() {
+            if let Some(AssistantContent::Thinking(content)) = partial.content.get(idx as usize) {
+                writer.push(AssistantMessageEvent::ThinkingEnd {
+                    content_index: idx,
+                    content: content.thinking.clone(),
+                    partial: partial.clone(),
+                });
+            }
+        }
+    }
+
+    fn close_text(&mut self, partial: &mut AssistantMessage, writer: &AssistantMessageEventWriter) {
+        if let Some(idx) = self.text_index.take() {
+            if let Some(AssistantContent::Text(content)) = partial.content.get_mut(idx as usize) {
+                let trimmed = content.text.trim_end_matches('\n').to_string();
+                content.text.clone_from(&trimmed);
+                writer.push(AssistantMessageEvent::TextEnd {
+                    content_index: idx,
+                    content: trimmed,
+                    partial: partial.clone(),
+                });
+            }
+        }
+    }
+
+    fn close_all(&mut self, partial: &mut AssistantMessage, writer: &AssistantMessageEventWriter) {
+        self.close_thinking(partial, writer);
+        self.close_text(partial, writer);
+    }
+
+    fn push_thinking(
+        &mut self,
+        chunk: &str,
+        partial: &mut AssistantMessage,
+        writer: &AssistantMessageEventWriter,
+    ) {
+        if chunk.is_empty() {
+            return;
+        }
+        self.close_text(partial, writer);
+        let idx = if let Some(idx) = self.thinking_index {
+            idx
+        } else {
+            let idx = partial.content.len() as u64;
+            partial
+                .content
+                .push(AssistantContent::Thinking(ThinkingContent {
+                    thinking: String::new(),
+                    thinking_signature: None,
+                    redacted: None,
+                    rest: Map::default(),
+                }));
+            writer.push(AssistantMessageEvent::ThinkingStart {
+                content_index: idx,
+                partial: partial.clone(),
+            });
+            self.thinking_index = Some(idx);
+            idx
+        };
+        if let Some(AssistantContent::Thinking(content)) = partial.content.get_mut(idx as usize) {
+            content.thinking.push_str(chunk);
+        }
+        writer.push(AssistantMessageEvent::ThinkingDelta {
+            content_index: idx,
+            delta: chunk.to_string(),
+            partial: partial.clone(),
+        });
+    }
+
+    fn push_text(
+        &mut self,
+        chunk: &str,
+        partial: &mut AssistantMessage,
+        writer: &AssistantMessageEventWriter,
+    ) {
+        if chunk.is_empty() {
+            return;
+        }
+        self.close_thinking(partial, writer);
+        let idx = if let Some(idx) = self.text_index {
+            idx
+        } else {
+            let idx = partial.content.len() as u64;
+            partial.content.push(AssistantContent::Text(TextContent {
+                text: String::new(),
+                text_signature: None,
+                rest: Map::default(),
+            }));
+            writer.push(AssistantMessageEvent::TextStart {
+                content_index: idx,
+                partial: partial.clone(),
+            });
+            self.text_index = Some(idx);
+            idx
+        };
+        if let Some(AssistantContent::Text(content)) = partial.content.get_mut(idx as usize) {
+            content.text.push_str(chunk);
+        }
+        self.any_text = true;
+        writer.push(AssistantMessageEvent::TextDelta {
+            content_index: idx,
+            delta: chunk.to_string(),
+            partial: partial.clone(),
+        });
+    }
+}
 
 /// Wire API identifier for Antigravity CLI models in `ModelRegistry`.
 pub const ANTIGRAVITY_API: &str = "antigravity-cli";
@@ -540,6 +720,31 @@ fn message_to_prompt_line(message: &Message) -> Option<String> {
     }
 }
 
+/// The prompt delta for a native resume: everything after the cached turn
+/// must be that turn's assistant reply followed only by user rows (the new
+/// prompt, plus any user-role context such as `/absorb` appended before
+/// it), joined by blank lines.
+fn resume_prompt_delta(messages: &[Message], cached_count: usize) -> Option<String> {
+    let (reply, appended) = messages.get(cached_count..)?.split_first()?;
+    if !matches!(reply, Message::Assistant(_)) || appended.is_empty() {
+        return None;
+    }
+    let texts = appended
+        .iter()
+        .map(|message| match message {
+            Message::User(user) => Some(user_content_to_text(&user.content)),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(
+        texts
+            .into_iter()
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+    )
+}
+
 fn build_prompt_and_resume(
     context: &Context,
     model_id: &str,
@@ -550,12 +755,15 @@ fn build_prompt_and_resume(
         _ => None,
     });
 
-    if let (Some(sid), Some(user_text)) = (session_id, &latest_user) {
+    if let (Some(sid), Some(_)) = (session_id, &latest_user) {
         if let Ok(guard) = sessions().lock() {
             if let Some(cached) = guard.get(sid) {
-                if cached.model_id == model_id && context.messages.len() == cached.message_count + 2
-                {
-                    return (user_text.clone(), Some(cached.conversation_id.clone()));
+                if cached.model_id == model_id {
+                    if let Some(delta) =
+                        resume_prompt_delta(&context.messages, cached.message_count)
+                    {
+                        return (delta, Some(cached.conversation_id.clone()));
+                    }
                 }
             }
         }
@@ -706,6 +914,23 @@ async fn run_stream_with_bin(
     let (prompt, resume_id) = build_prompt_and_resume(&context, &model.id, session_id.as_deref());
     let effort = effort_for_level(&model, reasoning);
 
+    if acp_enabled() {
+        let request = AcpRequest {
+            bin: &bin,
+            cwd: &cwd,
+            model: &model,
+            context: &context,
+            signal: base.signal.as_ref(),
+            session_id: session_id.clone(),
+            prompt: &prompt,
+            resume_id: resume_id.clone(),
+            effort,
+        };
+        if run_acp(&writer, request).await {
+            return;
+        }
+    }
+
     let mut cmd = Command::new(&bin);
     cmd.args([
         "--output-format",
@@ -765,8 +990,8 @@ async fn run_stream_with_bin(
     });
 
     let mut lines = BufReader::new(stdout).lines();
-    let mut text_started = false;
-    let mut text_content_index: u64 = 0;
+    let mut blocks = BlockState::default();
+    let mut seen_tool_steps: HashSet<String> = HashSet::new();
     let mut conversation_id: Option<String> = resume_id;
     let mut result_text: Option<String> = None;
     let mut result_error: Option<String> = None;
@@ -829,35 +1054,32 @@ async fn run_stream_with_bin(
                     conversation_id = Some(cid.to_string());
                     partial.response_id = Some(cid.to_string());
                 }
-                if update["step_type"].as_str() == Some("agent_response") {
-                    if let Some(delta) = update["text_delta"].as_str().filter(|s| !s.is_empty()) {
-                        if !text_started {
-                            text_content_index = partial.content.len() as u64;
-                            partial.content.push(AssistantContent::Text(TextContent {
-                                text: String::new(),
-                                text_signature: None,
-                                rest: Map::default(),
-                            }));
-                            writer.push(AssistantMessageEvent::TextStart {
-                                content_index: text_content_index,
-                                partial: partial.clone(),
-                            });
-                            text_started = true;
-                        }
-                        if let Some(AssistantContent::Text(content)) =
-                            partial.content.get_mut(text_content_index as usize)
-                        {
-                            content.text.push_str(delta);
-                        }
-                        writer.push(AssistantMessageEvent::TextDelta {
-                            content_index: text_content_index,
-                            delta: delta.to_string(),
-                            partial: partial.clone(),
-                        });
+                for key in ["thinking_delta", "thought", "thinking"] {
+                    if let Some(chunk) = update[key].as_str() {
+                        blocks.push_thinking(chunk, &mut partial, &writer);
                     }
-                    if update["usage"].is_object() {
-                        apply_usage(&mut partial.usage, &update["usage"]);
+                }
+                match update["step_type"].as_str() {
+                    Some("agent_response") => {
+                        if let Some(delta) = update["text_delta"].as_str() {
+                            blocks.push_text(delta, &mut partial, &writer);
+                        }
+                        if update["usage"].is_object() {
+                            apply_usage(&mut partial.usage, &update["usage"]);
+                        }
                     }
+                    Some("tool") => {
+                        let step_key = update["step_index"].to_string();
+                        if seen_tool_steps.insert(step_key) {
+                            let name = update["tool_name"]
+                                .as_str()
+                                .or_else(|| update["tool_info"]["name"].as_str())
+                                .unwrap_or("tool");
+                            let line = tool_progress_line(name, &update["tool_info"]["parameters"]);
+                            blocks.push_thinking(&line, &mut partial, &writer);
+                        }
+                    }
+                    _ => {}
                 }
             }
             Some("result") => {
@@ -946,48 +1168,32 @@ async fn run_stream_with_bin(
         }
     }
 
-    if !text_started {
+    blocks.close_all(&mut partial, &writer);
+    if !blocks.any_text {
         if let Some(body) = result_text {
-            text_content_index = partial.content.len() as u64;
-            partial.content.push(AssistantContent::Text(TextContent {
-                text: body.clone(),
-                text_signature: None,
-                rest: Map::default(),
-            }));
-            writer.push(AssistantMessageEvent::TextStart {
-                content_index: text_content_index,
-                partial: partial.clone(),
-            });
-            writer.push(AssistantMessageEvent::TextDelta {
-                content_index: text_content_index,
-                delta: body.clone(),
-                partial: partial.clone(),
-            });
-            writer.push(AssistantMessageEvent::TextEnd {
-                content_index: text_content_index,
-                content: body,
-                partial: partial.clone(),
-            });
-        }
-    } else {
-        let final_text = if let Some(AssistantContent::Text(content)) =
-            partial.content.get_mut(text_content_index as usize)
-        {
-            let trimmed = content.text.trim_end_matches('\n').to_string();
-            content.text.clone_from(&trimmed);
-            Some(trimmed)
-        } else {
-            None
-        };
-        if let Some(final_text) = final_text {
-            writer.push(AssistantMessageEvent::TextEnd {
-                content_index: text_content_index,
-                content: final_text,
-                partial: partial.clone(),
-            });
+            blocks.push_text(&body, &mut partial, &writer);
+            blocks.close_text(&mut partial, &writer);
         }
     }
 
+    finish_stream(
+        &writer,
+        partial,
+        &model,
+        &context,
+        session_id,
+        conversation_id,
+    );
+}
+
+fn finish_stream(
+    writer: &AssistantMessageEventWriter,
+    mut partial: AssistantMessage,
+    model: &Model,
+    context: &Context,
+    session_id: Option<String>,
+    conversation_id: Option<String>,
+) {
     if let (Some(sid), Some(cid)) = (session_id, conversation_id) {
         if let Ok(mut guard) = sessions().lock() {
             guard.insert(
@@ -1001,13 +1207,459 @@ async fn run_stream_with_bin(
         }
     }
 
-    partial.stop_reason = StopReason::Stop;
+    let done_reason = if partial.stop_reason == StopReason::Length {
+        DoneStopReason::Length
+    } else {
+        partial.stop_reason = StopReason::Stop;
+        DoneStopReason::Stop
+    };
     partial.timestamp = now_ms();
     writer.push(AssistantMessageEvent::Done {
-        reason: DoneStopReason::Stop,
+        reason: done_reason,
         message: partial.clone(),
     });
     writer.end(Some(partial));
+}
+
+/// `PA_ANTIGRAVITY_ACP=0` forces the one-shot `--output-format stream-json` path.
+fn acp_enabled() -> bool {
+    std::env::var("PA_ANTIGRAVITY_ACP").map_or(true, |raw| {
+        let raw = raw.trim();
+        !(raw == "0" || raw.eq_ignore_ascii_case("false") || raw.eq_ignore_ascii_case("off"))
+    })
+}
+
+struct AcpRequest<'a> {
+    bin: &'a Path,
+    cwd: &'a Path,
+    model: &'a Model,
+    context: &'a Context,
+    signal: Option<&'a CancellationToken>,
+    session_id: Option<String>,
+    prompt: &'a str,
+    resume_id: Option<String>,
+    effort: Option<&'static str>,
+}
+
+enum AcpError {
+    Aborted,
+    Closed(String),
+    Rpc(String),
+}
+
+impl AcpError {
+    fn message(self) -> String {
+        match self {
+            Self::Aborted => "Request was aborted".to_string(),
+            Self::Closed(detail) | Self::Rpc(detail) => detail,
+        }
+    }
+}
+
+async fn wait_cancelled(signal: Option<&CancellationToken>) {
+    match signal {
+        Some(signal) => signal.cancelled().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Newline-delimited JSON-RPC 2.0 over the stdio of `agy acp`.
+struct AcpIo {
+    stdin: ChildStdin,
+    lines: Lines<BufReader<ChildStdout>>,
+    next_id: u64,
+}
+
+impl AcpIo {
+    async fn send(&mut self, message: &Value) -> Result<(), AcpError> {
+        let mut raw = message.to_string();
+        raw.push('\n');
+        let written = async {
+            self.stdin.write_all(raw.as_bytes()).await?;
+            self.stdin.flush().await
+        }
+        .await;
+        written.map_err(|error| AcpError::Closed(format!("Antigravity ACP write failed: {error}")))
+    }
+
+    async fn call(
+        &mut self,
+        method: &str,
+        params: Value,
+        signal: Option<&CancellationToken>,
+        on_update: &mut (dyn FnMut(&Value) + Send),
+    ) -> Result<Value, AcpError> {
+        self.next_id += 1;
+        let id = self.next_id;
+        self.send(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        }))
+        .await?;
+        loop {
+            let next = tokio::select! {
+                () = wait_cancelled(signal) => return Err(AcpError::Aborted),
+                line = self.lines.next_line() => line,
+            };
+            let line = match next {
+                Ok(Some(line)) => line,
+                Ok(None) => {
+                    return Err(AcpError::Closed(
+                        "Antigravity ACP server exited unexpectedly".to_string(),
+                    ))
+                }
+                Err(error) => {
+                    return Err(AcpError::Closed(format!(
+                        "Failed reading Antigravity ACP output: {error}"
+                    )))
+                }
+            };
+            let trimmed = line.trim();
+            if !trimmed.starts_with('{') {
+                continue;
+            }
+            let Ok(message) = serde_json::from_str::<Value>(trimmed) else {
+                continue;
+            };
+            if let Some(method) = message["method"].as_str() {
+                if message.get("id").is_some_and(|id| !id.is_null()) {
+                    let reply = acp_reply_to_request(method, &message);
+                    self.send(&reply).await?;
+                } else if method == "session/update" {
+                    on_update(&message["params"]["update"]);
+                }
+                continue;
+            }
+            if message["id"].as_u64() != Some(id) {
+                continue;
+            }
+            if let Some(error) = message.get("error").filter(|e| !e.is_null()) {
+                return Err(AcpError::Rpc(
+                    error["message"]
+                        .as_str()
+                        .filter(|s| !s.is_empty())
+                        .map_or_else(
+                            || format!("Antigravity ACP {method} failed"),
+                            str::to_string,
+                        ),
+                ));
+            }
+            return Ok(message["result"].clone());
+        }
+    }
+}
+
+/// Auto-approves `session/request_permission`; other agent→client requests are unsupported.
+fn acp_reply_to_request(method: &str, message: &Value) -> Value {
+    let id = message["id"].clone();
+    if method != "session/request_permission" {
+        return serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {"code": -32601, "message": format!("Method not supported: {method}")},
+        });
+    }
+    let options = message["params"]["options"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let chosen = ["allow_always", "allow_once"]
+        .iter()
+        .find_map(|kind| {
+            options
+                .iter()
+                .find(|option| option["kind"].as_str() == Some(kind))
+        })
+        .or_else(|| options.first())
+        .and_then(|option| option["optionId"].as_str());
+    let outcome = match chosen {
+        Some(option_id) => serde_json::json!({"outcome": "selected", "optionId": option_id}),
+        None => serde_json::json!({"outcome": "cancelled"}),
+    };
+    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"outcome": outcome}})
+}
+
+fn acp_text(update: &Value) -> Option<&str> {
+    update["content"]["text"]
+        .as_str()
+        .or_else(|| update["content"].as_str())
+}
+
+fn acp_tool_line(update: &Value) -> String {
+    let title = update["title"].as_str().filter(|s| !s.is_empty());
+    let name = update["name"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .or(title)
+        .or_else(|| update["kind"].as_str())
+        .unwrap_or("tool");
+    let args = if update["args"].is_object() {
+        &update["args"]
+    } else {
+        &update["rawInput"]
+    };
+    let line = tool_progress_line(name, args);
+    match title {
+        Some(title) if title != name && line == format!("\n▸ {name}\n") => {
+            tool_progress_line(name, &Value::String(title.to_string()))
+        }
+        _ => line,
+    }
+}
+
+fn apply_acp_update(
+    update: &Value,
+    partial: &mut AssistantMessage,
+    blocks: &mut BlockState,
+    seen_tools: &mut HashSet<String>,
+    writer: &AssistantMessageEventWriter,
+) {
+    match update["sessionUpdate"].as_str() {
+        Some("agent_thought_chunk") => {
+            if let Some(chunk) = acp_text(update) {
+                blocks.push_thinking(chunk, partial, writer);
+            }
+        }
+        Some("agent_message_chunk") => {
+            if let Some(chunk) = acp_text(update) {
+                blocks.push_text(chunk, partial, writer);
+            }
+        }
+        Some(kind @ ("tool_call" | "tool_call_update")) => {
+            let call_id = update["toolCallId"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            if seen_tools.insert(call_id) {
+                blocks.push_thinking(&acp_tool_line(update), partial, writer);
+            } else if kind == "tool_call_update" && update["status"].as_str() == Some("failed") {
+                let line = acp_tool_line(update);
+                let label = line.trim().trim_start_matches("▸ ");
+                blocks.push_thinking(&format!("\n✗ {label} failed\n"), partial, writer);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn apply_acp_usage(usage: &mut Usage, value: &Value) {
+    let input = value["inputTokens"].as_u64().unwrap_or(0);
+    let output = value["outputTokens"].as_u64().unwrap_or(0);
+    let cache_read = value["cachedReadTokens"].as_u64().unwrap_or(0);
+    let cache_write = value["cachedWriteTokens"].as_u64().unwrap_or(0);
+    *usage = Usage {
+        input,
+        output,
+        cache_read,
+        cache_write,
+        total_tokens: value["totalTokens"]
+            .as_u64()
+            .unwrap_or(input + output + cache_read + cache_write),
+        cost: UsageCost::default(),
+    };
+}
+
+/// Runs one turn through `agy acp`. Returns `false` (having pushed no events) when the
+/// ACP server never answers `initialize`, so the caller can fall back to `stream-json`.
+async fn run_acp(writer: &AssistantMessageEventWriter, request: AcpRequest<'_>) -> bool {
+    let mut cmd = Command::new(request.bin);
+    cmd.args(["acp", "--dangerously-skip-permissions"])
+        .current_dir(request.cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let Ok(mut child) = cmd.spawn() else {
+        return false;
+    };
+    let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+        let _ = child.kill().await;
+        return false;
+    };
+    let mut io = AcpIo {
+        stdin,
+        lines: BufReader::new(stdout).lines(),
+        next_id: 0,
+    };
+    let mut partial = empty_assistant_message(request.model);
+
+    let init = tokio::time::timeout(
+        ACP_INIT_TIMEOUT,
+        io.call(
+            "initialize",
+            serde_json::json!({
+                "protocolVersion": 1,
+                "clientCapabilities": {
+                    "fs": {"readTextFile": false, "writeTextFile": false},
+                    "terminal": false,
+                },
+            }),
+            request.signal,
+            &mut |_| {},
+        ),
+    )
+    .await;
+    match init {
+        Ok(Ok(_)) => {}
+        Ok(Err(AcpError::Aborted)) => {
+            let _ = child.kill().await;
+            push_error(
+                writer,
+                partial,
+                ErrorStopReason::Aborted,
+                AcpError::Aborted.message(),
+            );
+            return true;
+        }
+        Ok(Err(_)) | Err(_) => {
+            let _ = child.kill().await;
+            return false;
+        }
+    }
+
+    writer.push(AssistantMessageEvent::Start {
+        partial: partial.clone(),
+    });
+    let mut blocks = BlockState::default();
+    let turn = acp_turn(&mut io, &request, &mut partial, &mut blocks, writer).await;
+    drop(io);
+    let _ = child.kill().await;
+
+    match turn {
+        Ok(acp_session) => {
+            blocks.close_all(&mut partial, writer);
+            finish_stream(
+                writer,
+                partial,
+                request.model,
+                request.context,
+                request.session_id,
+                Some(acp_session),
+            );
+        }
+        Err(error) => {
+            let reason = if matches!(error, AcpError::Aborted) {
+                ErrorStopReason::Aborted
+            } else {
+                ErrorStopReason::Error
+            };
+            push_error(writer, partial, reason, error.message());
+        }
+    }
+    true
+}
+
+async fn acp_turn(
+    io: &mut AcpIo,
+    request: &AcpRequest<'_>,
+    partial: &mut AssistantMessage,
+    blocks: &mut BlockState,
+    writer: &AssistantMessageEventWriter,
+) -> Result<String, AcpError> {
+    let signal = request.signal;
+    let cwd = request.cwd.display().to_string();
+    let mut prompt = request.prompt.to_string();
+    let mut acp_session = None;
+
+    if let Some(resume) = &request.resume_id {
+        let loaded = io
+            .call(
+                "session/load",
+                serde_json::json!({"sessionId": resume, "cwd": cwd, "mcpServers": []}),
+                signal,
+                &mut |_| {},
+            )
+            .await;
+        match loaded {
+            Ok(_) => acp_session = Some(resume.clone()),
+            Err(AcpError::Aborted) => return Err(AcpError::Aborted),
+            Err(_) => {
+                prompt = build_prompt_and_resume(request.context, &request.model.id, None).0;
+            }
+        }
+    }
+    let acp_session = match acp_session {
+        Some(session) => session,
+        None => {
+            let created = io
+                .call(
+                    "session/new",
+                    serde_json::json!({"cwd": cwd, "mcpServers": []}),
+                    signal,
+                    &mut |_| {},
+                )
+                .await?;
+            created["sessionId"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    AcpError::Rpc("Antigravity ACP session/new returned no sessionId".to_string())
+                })?
+                .to_string()
+        }
+    };
+    partial.response_id = Some(acp_session.clone());
+
+    io.call(
+        "session/set_config_option",
+        serde_json::json!({"sessionId": acp_session, "configId": "model", "value": request.model.id}),
+        signal,
+        &mut |_| {},
+    )
+    .await?;
+    if let Some(effort) = request.effort {
+        let set = io
+            .call(
+                "session/set_config_option",
+                serde_json::json!({"sessionId": acp_session, "configId": "thought_level", "value": effort}),
+                signal,
+                &mut |_| {},
+            )
+            .await;
+        if let Err(AcpError::Aborted) = set {
+            return Err(AcpError::Aborted);
+        }
+    }
+
+    let mut seen_tools = HashSet::new();
+    let result = io
+        .call(
+            "session/prompt",
+            serde_json::json!({
+                "sessionId": acp_session,
+                "prompt": [{"type": "text", "text": prompt}],
+            }),
+            signal,
+            &mut |update| apply_acp_update(update, partial, blocks, &mut seen_tools, writer),
+        )
+        .await;
+    if let Err(AcpError::Aborted) = &result {
+        let _ = io
+            .send(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "session/cancel",
+                "params": {"sessionId": acp_session},
+            }))
+            .await;
+    }
+    let result = result?;
+    if result["usage"].is_object() {
+        apply_acp_usage(&mut partial.usage, &result["usage"]);
+    }
+    match result["stopReason"].as_str() {
+        Some("cancelled") => Err(AcpError::Aborted),
+        Some("refusal") => Err(AcpError::Rpc(
+            "Antigravity refused to answer this request".to_string(),
+        )),
+        Some(raw @ ("max_tokens" | "max_turn_requests")) => {
+            partial.stop_reason = StopReason::Length;
+            partial.stop_reason_raw = Some(raw.to_string());
+            Ok(acp_session)
+        }
+        _ => Ok(acp_session),
+    }
 }
 
 /// Streaming provider implementation backed by the local Antigravity CLI (`agy`).
@@ -1054,6 +1706,66 @@ impl Provider for AntigravityCliProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn absorbed_context_between_turns_keeps_native_resume() {
+        let text_user = |text: &str| {
+            Message::User(pa_types::ai::UserMessage {
+                content: UserMessageContent::Text(text.to_string()),
+                timestamp: now_ms(),
+                rest: Map::default(),
+            })
+        };
+        let reply = Message::Assistant(AssistantMessage {
+            content: Vec::new(),
+            api: String::new(),
+            provider: String::new(),
+            model: "resume-model".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            stop_reason_raw: None,
+            error_message: None,
+            timestamp: now_ms(),
+            rest: Map::default(),
+        });
+        let sid = "test-session-antigravity-absorb-resume";
+        sessions().lock().unwrap().insert(
+            sid.to_string(),
+            CachedConversation {
+                conversation_id: "native-conv-1".into(),
+                model_id: "resume-model".into(),
+                message_count: 1,
+            },
+        );
+        let context = Context {
+            messages: vec![
+                text_user("turn one"),
+                reply.clone(),
+                text_user("[absorbed-context]"),
+                text_user("turn two"),
+            ],
+            ..Default::default()
+        };
+        let (prompt, resume) = build_prompt_and_resume(&context, "resume-model", Some(sid));
+        assert_eq!(resume.as_deref(), Some("native-conv-1"));
+        assert_eq!(prompt, "[absorbed-context]\n\nturn two");
+
+        let interleaved = Context {
+            messages: vec![
+                text_user("turn one"),
+                reply.clone(),
+                reply,
+                text_user("turn two"),
+            ],
+            ..Default::default()
+        };
+        let (_, resume) = build_prompt_and_resume(&interleaved, "resume-model", Some(sid));
+        assert_eq!(resume, None, "an extra assistant row breaks the resume");
+        sessions().lock().unwrap().remove(sid);
+    }
     use crate::models::get_supported_thinking_levels;
 
     #[test]
@@ -1142,6 +1854,8 @@ gemini-pro-orchestrator-neon    Orchestrator (Neon)\n";
         let script = format!(
             "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\n\
              printf '%s\\n' '{{\"event\":\"init\",\"conversation_id\":\"conv-123\",\"init\":{{\"model\":\"gemini-4-neon-xhigh\"}}}}'\n\
+             printf '%s\\n' '{{\"event\":\"step_update\",\"step_update\":{{\"step_index\":2,\"step_type\":\"tool\",\"state\":\"ACTIVE\",\"tool_name\":\"run_command\",\"tool_info\":{{\"name\":\"run_command\",\"parameters\":{{\"CommandLine\":\"ls /tmp\"}}}}}}}}'\n\
+             printf '%s\\n' '{{\"event\":\"step_update\",\"step_update\":{{\"step_index\":2,\"step_type\":\"tool\",\"state\":\"DONE\",\"tool_name\":\"run_command\",\"tool_info\":{{\"name\":\"run_command\",\"parameters\":{{\"CommandLine\":\"ls /tmp\"}},\"output\":\"a\"}}}}}}'\n\
              printf '%s\\n' '{{\"event\":\"step_update\",\"step_update\":{{\"step_type\":\"agent_response\",\"state\":\"ACTIVE\",\"text_delta\":\"Hello \"}}}}'\n\
              printf '%s\\n' '{{\"event\":\"step_update\",\"step_update\":{{\"step_type\":\"agent_response\",\"state\":\"ACTIVE\",\"text_delta\":\"Neon!\"}}}}'\n\
              printf '%s\\n' '{{\"event\":\"result\",\"result\":{{\"conversation_id\":\"conv-123\",\"status\":\"SUCCESS\",\"response\":\"Hello Neon!\",\"usage\":{{\"input_tokens\":12,\"output_tokens\":4,\"cache_read_tokens\":2,\"total_tokens\":18}}}}}}'\n",
@@ -1179,16 +1893,29 @@ gemini-pro-orchestrator-neon    Orchestrator (Neon)\n";
         ));
 
         let mut deltas = Vec::new();
+        let mut thinking = Vec::new();
+        let mut thinking_before_text = false;
         let mut stream_iter = stream;
         while let Some(event) = stream_iter.next_event().await {
-            if let AssistantMessageEvent::TextDelta { delta, .. } = event {
-                deltas.push(delta);
+            match event {
+                AssistantMessageEvent::TextDelta { delta, .. } => deltas.push(delta),
+                AssistantMessageEvent::ThinkingDelta { delta, .. } => {
+                    thinking_before_text = deltas.is_empty();
+                    thinking.push(delta);
+                }
+                _ => {}
             }
         }
         let message = stream_iter.result().await;
         handle.await.unwrap();
 
+        assert_eq!(thinking, vec!["\n▸ run_command ls /tmp\n"]);
+        assert!(thinking_before_text);
         assert_eq!(deltas, vec!["Hello ", "Neon!"]);
+        assert!(matches!(
+            message.content.first(),
+            Some(AssistantContent::Thinking(content)) if content.thinking == "\n▸ run_command ls /tmp\n"
+        ));
         assert_eq!(message.stop_reason, StopReason::Stop);
         assert_eq!(message.response_id.as_deref(), Some("conv-123"));
         assert_eq!(
@@ -1207,5 +1934,217 @@ gemini-pro-orchestrator-neon    Orchestrator (Neon)\n";
         assert!(args.contains(&"-p=Say hi"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const FAKE_ACP_SCRIPT: &str = r#"#!/bin/sh
+dir=$(dirname "$0")
+printf '%s\n' "$@" > "$dir/acp-args.txt"
+u='{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"acp-sess-1","update":'
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$dir/acp-requests.txt"
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1}}\n' "$id" ;;
+    *'"method":"session/new"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"acp-sess-1"}}\n' "$id" ;;
+    *'"method":"session/load"'*)
+      printf '%s%s}}\n' "$u" '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"replayed history"}}'
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
+    *'"method":"session/set_config_option"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"configOptions":[]}}\n' "$id" ;;
+    *'"method":"session/prompt"'*)
+      printf '%s%s}}\n' "$u" '{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"Reading the file."}}'
+      printf '%s\n' '{"jsonrpc":"2.0","id":"perm-1","method":"session/request_permission","params":{"sessionId":"acp-sess-1","options":[{"optionId":"no","kind":"reject_once"},{"optionId":"yes-always","kind":"allow_always"}]}}'
+      IFS= read -r reply
+      printf '%s\n' "$reply" >> "$dir/acp-requests.txt"
+      printf '%s%s}}\n' "$u" '{"sessionUpdate":"tool_call","toolCallId":"t1","name":"view_file","args":{"AbsolutePath":"/tmp/a.rs"},"status":"in_progress"}'
+      printf '%s%s}}\n' "$u" '{"sessionUpdate":"tool_call_update","toolCallId":"t1","name":"view_file","status":"completed"}'
+      printf '%s%s}}\n' "$u" '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Hello "}}'
+      printf '%s%s}}\n' "$u" '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"ACP!"}}'
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn","usage":{"inputTokens":9,"outputTokens":3,"cachedReadTokens":1,"totalTokens":13}}}\n' "$id" ;;
+  esac
+done
+"#;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn acp_streams_thoughts_tools_text_and_resumes_session() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "pa-antigravity-acp-test-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script_path = dir.join("fake-agy-acp");
+        std::fs::write(&script_path, FAKE_ACP_SCRIPT).unwrap();
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).unwrap();
+
+        let neon = builtin_models()
+            .into_iter()
+            .find(|m| m.id == "gemini-4-neon")
+            .unwrap();
+        let user = |text: &str| {
+            Message::User(pa_types::ai::UserMessage {
+                content: UserMessageContent::Text(text.to_string()),
+                timestamp: now_ms(),
+                rest: Map::default(),
+            })
+        };
+        let run = |context: Context| {
+            let (writer, stream) = create_assistant_message_event_stream();
+            let handle = tokio::spawn(run_stream_with_bin(
+                writer,
+                neon.clone(),
+                context,
+                StreamOptions {
+                    session_id: Some("test-session-agy-acp".to_string()),
+                    ..Default::default()
+                },
+                Some(ModelThinkingLevel::High),
+                Some(script_path.clone()),
+            ));
+            (stream, handle)
+        };
+
+        let first_context = Context {
+            system_prompt: None,
+            messages: vec![user("Read a.rs")],
+            tools: None,
+        };
+        let (mut stream, handle) = run(first_context.clone());
+        let mut order = Vec::new();
+        while let Some(event) = stream.next_event().await {
+            match event {
+                AssistantMessageEvent::ThinkingStart { .. } => order.push("thinking_start".into()),
+                AssistantMessageEvent::ThinkingDelta { delta, .. } => {
+                    order.push(format!("thinking:{delta}"));
+                }
+                AssistantMessageEvent::ThinkingEnd { .. } => order.push("thinking_end".into()),
+                AssistantMessageEvent::TextDelta { delta, .. } => {
+                    order.push(format!("text:{delta}"))
+                }
+                AssistantMessageEvent::TextEnd { content, .. } => {
+                    order.push(format!("text_end:{content}"));
+                }
+                _ => {}
+            }
+        }
+        let message = stream.result().await;
+        handle.await.unwrap();
+
+        assert_eq!(
+            order,
+            vec![
+                "thinking_start".to_string(),
+                "thinking:Reading the file.".to_string(),
+                "thinking:\n▸ view_file /tmp/a.rs\n".to_string(),
+                "thinking_end".to_string(),
+                "text:Hello ".to_string(),
+                "text:ACP!".to_string(),
+                "text_end:Hello ACP!".to_string(),
+            ]
+        );
+        assert_eq!(message.stop_reason, StopReason::Stop);
+        assert_eq!(message.response_id.as_deref(), Some("acp-sess-1"));
+        assert_eq!(message.usage.input, 9);
+        assert_eq!(message.usage.output, 3);
+        assert_eq!(message.usage.cache_read, 1);
+        assert_eq!(message.usage.total_tokens, 13);
+
+        let args = std::fs::read_to_string(dir.join("acp-args.txt")).unwrap();
+        assert_eq!(
+            args.lines().collect::<Vec<_>>(),
+            ["acp", "--dangerously-skip-permissions"]
+        );
+        let requests: Vec<Value> = std::fs::read_to_string(dir.join("acp-requests.txt"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let config: Vec<(&str, &str)> = requests
+            .iter()
+            .filter(|r| r["method"] == "session/set_config_option")
+            .map(|r| {
+                (
+                    r["params"]["configId"].as_str().unwrap(),
+                    r["params"]["value"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            config,
+            [("model", "gemini-4-neon"), ("thought_level", "high")]
+        );
+        let permission = requests
+            .iter()
+            .find(|r| r["id"] == "perm-1")
+            .expect("permission reply");
+        assert_eq!(permission["result"]["outcome"]["optionId"], "yes-always");
+        let prompt = requests
+            .iter()
+            .find(|r| r["method"] == "session/prompt")
+            .unwrap();
+        assert_eq!(prompt["params"]["prompt"][0]["text"], "Read a.rs");
+
+        let mut second_context = first_context;
+        second_context
+            .messages
+            .push(Message::Assistant(message.clone()));
+        second_context.messages.push(user("again"));
+        let (mut stream, handle) = run(second_context);
+        let mut texts = Vec::new();
+        while let Some(event) = stream.next_event().await {
+            if let AssistantMessageEvent::TextDelta { delta, .. } = event {
+                texts.push(delta);
+            }
+        }
+        let second = stream.result().await;
+        handle.await.unwrap();
+        assert_eq!(second.stop_reason, StopReason::Stop);
+        assert_eq!(texts, vec!["Hello ", "ACP!"]);
+
+        let requests: Vec<Value> = std::fs::read_to_string(dir.join("acp-requests.txt"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let load = requests
+            .iter()
+            .find(|r| r["method"] == "session/load")
+            .expect("second turn resumes via session/load");
+        assert_eq!(load["params"]["sessionId"], "acp-sess-1");
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r["method"] == "session/new")
+                .count(),
+            1
+        );
+        let last_prompt = requests
+            .iter()
+            .rev()
+            .find(|r| r["method"] == "session/prompt")
+            .unwrap();
+        assert_eq!(last_prompt["params"]["prompt"][0]["text"], "again");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tool_progress_line_picks_primary_argument() {
+        assert_eq!(
+            tool_progress_line(
+                "run_command",
+                &serde_json::json!({"CommandLine": "cargo test\nmore", "Cwd": "/x"})
+            ),
+            "\n▸ run_command cargo test\n"
+        );
+        assert_eq!(
+            tool_progress_line("view_file", &serde_json::json!({"AbsolutePath": "/a/b.rs"})),
+            "\n▸ view_file /a/b.rs\n"
+        );
+        assert_eq!(tool_progress_line("finish", &Value::Null), "\n▸ finish\n");
     }
 }

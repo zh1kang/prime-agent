@@ -21,6 +21,7 @@ mod stream;
 pub use event_stream::{AssistantMessageEventExt, AssistantMessageEventStream};
 pub use providers::antigravity;
 pub use providers::claude_cli;
+pub use providers::cursor_cli;
 pub use providers::faux;
 
 /// Codex WebSocket session debugging and cleanup surface (TS

@@ -3,6 +3,8 @@
 Run `pa thread providers` to check which executables are installed.
 Run `pa thread connect codex`, `pa thread connect claude`, or `pa thread connect antigravity` to sign in with that executable.
 Run `pa thread models antigravity` to list Antigravity models discovered from `agy` (or T3 Code's managed Antigravity binary).
+Run `pa thread connect cursor` and `pa thread models cursor` for the Cursor CLI. pa looks for `PA_CURSOR_BIN` (`none` or `0` disables it), then `cursor-agent` on `PATH`, then `~/.local/bin/cursor-agent` and `~/.local/bin/agent`.
+A Cursor thread's model and thinking level select the matching `cursor-agent --list-models` variant (for example `gpt-6` with `high` runs `gpt-6-high`), and later turns pass `--resume` with the Cursor chat ID.
 Prime uses its own model configuration and credentials.
 
 ```sh
