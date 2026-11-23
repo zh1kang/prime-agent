@@ -558,9 +558,36 @@ impl super::SessionUi {
 
     /// F6 and `/captain [name|new|promote]`: open the native Captain panel.
     pub(crate) fn open_captain_panel(&mut self, view: &mut AgentView, query: &str) {
-        let mut panel = self
-            .captain_parked
-            .take()
+        // A Captain text step still holding the editor ends here: its panel parks (a setup
+        // keeps its answers as a draft) and the chat's draft comes back.
+        let composing = matches!(
+            self.captain_compose,
+            Some(CaptainCompose {
+                owner: ComposeOwner::Captain { .. },
+                ..
+            })
+        );
+        let mut composed = None;
+        if composing {
+            if let Some(compose) = self.captain_compose.take() {
+                let typed = view.editor.get_expanded_text();
+                view.editor.set_text(&compose.saved_draft);
+                if let ComposeOwner::Captain {
+                    purpose,
+                    panel: Some(mut panel),
+                } = compose.owner
+                {
+                    if purpose == ComposePurpose::Brief {
+                        panel.keep_brief_text(&typed);
+                    }
+                    panel.park();
+                    composed = Some(panel);
+                }
+                self.sync_captain_header(view);
+            }
+        }
+        let mut panel = composed
+            .or_else(|| self.captain_parked.take())
             .unwrap_or_else(|| CaptainView::new(picker_viewport_rows(view.terminal_rows()) + 8));
         let query = query.trim().to_owned();
         let action = match query.as_str() {
@@ -1060,7 +1087,9 @@ impl super::SessionUi {
         let Some(compose) = self.captain_compose.take() else {
             return false;
         };
-        let text = submit.then(|| view.editor.get_expanded_text());
+        // Read before the chat's draft comes back: a cancelled brief keeps what was typed.
+        let typed = view.editor.get_expanded_text();
+        let text = submit.then(|| typed.clone());
         view.editor.set_text(&compose.saved_draft);
         self.dirty = true;
         match compose.owner {
@@ -1068,6 +1097,9 @@ impl super::SessionUi {
                 let mut panel = panel.unwrap_or_else(|| {
                     CaptainView::new(view.terminal_rows().saturating_sub(4) as usize)
                 });
+                if cancel && purpose == ComposePurpose::Brief {
+                    panel.keep_brief_text(&typed);
+                }
                 let action = panel.compose_done(purpose, text);
                 view.overlay = Some(Overlay::Captain(panel));
                 self.sync_captain_header(view);
@@ -1192,7 +1224,11 @@ impl super::SessionUi {
                             return;
                         }
                         if matches!(op.as_str(), "init" | "promote") {
-                            // The new project is this checkout's: select it.
+                            // The new project is this checkout's: select it, and its
+                            // unfinished setup is done.
+                            if let Some(panel) = Self::panel_mut(view) {
+                                panel.clear_draft();
+                            }
                             self.captain_focus_query = Self::panel_mut(view)
                                 .map(|panel| panel.snapshot().current_root.clone());
                         }

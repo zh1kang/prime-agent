@@ -2602,3 +2602,264 @@ fn the_drive_lists_and_previews_reports_and_handoffs() {
         name: "c-fix.json".into()
     }));
 }
+
+/// A panel at a checkout with no Captain yet; `alpha` and `beta` stay in the rail.
+fn gamma_view() -> CaptainView {
+    let mut view = view(34);
+    let mut data = snapshot();
+    data["current_root"] = json!("/work/gamma");
+    data["current"] = Value::Null;
+    view.apply_snapshot(&data);
+    view
+}
+
+fn setup_choices() -> Value {
+    json!({
+        "models": [{"provider": "prime", "model": ""}],
+        "thinking": ["default", "low", "high"],
+        "machines": ["project-builder"],
+        "adopt": [],
+    })
+}
+
+/// `n`, the options, a brief, and a model: the form waits on the factory step.
+fn walk_to_factory(view: &mut CaptainView) {
+    assert!(matches!(
+        view.handle_key("n", &kb()),
+        CaptainAction::LoadChoices { .. }
+    ));
+    let CaptainAction::Compose { purpose, .. } = view.apply_choices(&setup_choices(), None) else {
+        panic!("the brief uses pa's editor")
+    };
+    view.compose_done(purpose, Some("Build Gamma end to end".into()));
+    view.apply_setup_model("antigravity/gemini-4-neon".into(), "high".into());
+    assert!(matches!(
+        &view.mode,
+        Mode::Pick(Picker { purpose: PickPurpose::Setup(s), .. }) if SETUP_STEPS[s.step] == "factory"
+    ));
+}
+
+fn resume_labels(view: &CaptainView) -> Vec<String> {
+    match &view.mode {
+        Mode::Pick(picker) if matches!(picker.purpose, PickPurpose::ResumeSetup { .. }) => {
+            picker.items.iter().map(|i| i.label.clone()).collect()
+        }
+        other => panic!("expected the resume prompt, got {other:?}"),
+    }
+}
+
+#[test]
+fn ctrl_c_saves_the_setup_and_n_offers_resume_or_fresh() {
+    let mut view = gamma_view();
+    walk_to_factory(&mut view);
+    view.focus = Focus::Crew;
+    assert_eq!(view.handle_key("ctrl+c", &kb()), CaptainAction::None);
+    assert!(matches!(view.mode, Mode::Browse));
+    assert!(view.pending_setup.is_none());
+    assert_eq!(view.focus, Focus::Projects, "n works right away");
+    assert_eq!(
+        view.notice.as_deref(),
+        Some("Setup saved. Press n to resume or start fresh.")
+    );
+    assert_eq!(view.handle_key("n", &kb()), CaptainAction::None);
+    let labels = resume_labels(&view);
+    assert_eq!(labels.len(), 2);
+    assert!(
+        labels[0].starts_with("Resume where you left off · step: factory")
+            && labels[0].contains("antigravity/gemini-4-neon")
+            && labels[0].contains("\"Build Gamma"),
+        "{labels:?}"
+    );
+    assert_eq!(labels[1], "Start fresh (redo from scratch)");
+    let screen = text(&view.render(&theme(), 110, &kb())).join("\n");
+    assert!(screen.contains("unfinished captain setup"), "{screen}");
+    // Esc keeps the draft.
+    view.handle_key("escape", &kb());
+    assert!(matches!(view.mode, Mode::Browse));
+    assert!(view.saved_draft().is_some());
+    view.notice = None;
+    let screen = text(&view.render(&theme(), 110, &kb())).join("\n");
+    assert!(
+        screen.contains("Unfinished Captain setup saved. Press n to resume or redo."),
+        "{screen}"
+    );
+}
+
+#[test]
+fn resume_restores_the_saved_step_and_answers_once_options_arrive() {
+    let mut view = gamma_view();
+    walk_to_factory(&mut view);
+    view.handle_key("down", &kb());
+    view.handle_key("down", &kb());
+    view.handle_key("enter", &kb()); // factory: none
+    view.handle_key("enter", &kb()); // workers: 2 → threads
+    view.park();
+    assert!(matches!(view.mode, Mode::Browse) && view.pending_setup.is_none());
+    view.handle_key("n", &kb());
+    assert_eq!(
+        view.handle_key("enter", &kb()),
+        CaptainAction::LoadChoices {
+            project: None,
+            reference: None
+        }
+    );
+    assert_eq!(
+        view.apply_choices(&setup_choices(), None),
+        CaptainAction::None
+    );
+    let Mode::Pick(Picker {
+        purpose: PickPurpose::Setup(setup),
+        ..
+    }) = &view.mode
+    else {
+        panic!("resume opens the saved step: {:?}", view.mode)
+    };
+    assert_eq!(SETUP_STEPS[setup.step], "threads");
+    assert_eq!(setup.brief, "Build Gamma end to end");
+    assert_eq!(setup.model, "antigravity/gemini-4-neon");
+    assert_eq!(setup.thinking, "high");
+    assert!(setup.factory_chosen && !setup.design && setup.machine.is_none());
+    assert_eq!(setup.parallel, 2);
+    assert_eq!(setup.choices.thinking, vec!["default", "low", "high"]);
+}
+
+#[test]
+fn start_fresh_clears_the_draft_and_begins_at_the_brief() {
+    let mut view = gamma_view();
+    walk_to_factory(&mut view);
+    view.handle_key("ctrl+c", &kb());
+    view.handle_key("n", &kb());
+    view.handle_key("down", &kb());
+    assert!(matches!(
+        view.handle_key("enter", &kb()),
+        CaptainAction::LoadChoices { .. }
+    ));
+    assert!(view.saved_draft().is_none());
+    let CaptainAction::Compose {
+        purpose, initial, ..
+    } = view.apply_choices(&setup_choices(), None)
+    else {
+        panic!("a fresh setup starts at the brief")
+    };
+    assert_eq!(purpose, ComposePurpose::Brief);
+    assert_eq!(initial, "");
+}
+
+#[test]
+fn a_cancelled_brief_keeps_the_typed_text_for_the_resume() {
+    let mut view = gamma_view();
+    view.handle_key("n", &kb());
+    let CaptainAction::Compose { purpose, .. } = view.apply_choices(&setup_choices(), None) else {
+        panic!()
+    };
+    view.keep_brief_text("Half a brief");
+    assert_eq!(view.compose_done(purpose, None), CaptainAction::None);
+    assert!(matches!(view.mode, Mode::Browse) && view.pending_setup.is_none());
+    view.handle_key("n", &kb());
+    view.handle_key("enter", &kb());
+    let CaptainAction::Compose { initial, .. } = view.apply_choices(&setup_choices(), None) else {
+        panic!("the resume reopens the brief")
+    };
+    assert_eq!(initial, "Half a brief");
+}
+
+#[test]
+fn an_empty_cancelled_brief_saves_nothing_and_n_starts_again() {
+    let mut view = gamma_view();
+    view.handle_key("n", &kb());
+    let CaptainAction::Compose { purpose, .. } = view.apply_choices(&setup_choices(), None) else {
+        panic!()
+    };
+    view.compose_done(purpose, None);
+    assert!(view.saved_draft().is_none());
+    assert!(matches!(
+        view.handle_key("n", &kb()),
+        CaptainAction::LoadChoices { .. }
+    ));
+}
+
+#[test]
+fn confirm_ctrl_c_and_chart_ctrl_c_pause_while_n_and_esc_step_back() {
+    let mut view = gamma_view();
+    walk_to_factory(&mut view);
+    view.handle_key("down", &kb());
+    view.handle_key("enter", &kb()); // chart builder
+    assert!(matches!(view.mode, Mode::Compose(_)));
+    view.handle_key("ctrl+c", &kb());
+    assert!(matches!(view.mode, Mode::Browse));
+    assert_eq!(view.saved_draft().unwrap().step, 3);
+
+    let mut view = gamma_view();
+    walk_to_factory(&mut view);
+    view.handle_key("down", &kb());
+    view.handle_key("down", &kb());
+    for _ in 0..3 {
+        view.handle_key("enter", &kb());
+    }
+    assert!(matches!(view.mode, Mode::Confirm(Confirm::Create(_))));
+    view.handle_key("n", &kb());
+    assert!(matches!(view.mode, Mode::Pick(_)), "n steps back");
+    view.handle_key("enter", &kb());
+    view.handle_key("ctrl+c", &kb());
+    assert!(matches!(view.mode, Mode::Browse));
+    assert_eq!(SETUP_STEPS[view.saved_draft().unwrap().step], "confirm");
+}
+
+#[test]
+fn drafts_persist_on_disk_and_a_created_captain_clears_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut view = gamma_view();
+    view.set_draft_dir(Some(dir.path().to_path_buf()));
+    walk_to_factory(&mut view);
+    view.handle_key("ctrl+c", &kb());
+    let files: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+    assert_eq!(files.len(), 1);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = files[0].as_ref().unwrap().path();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    let mut fresh = CaptainView::new(34);
+    fresh.set_draft_dir(Some(dir.path().to_path_buf()));
+    let mut data = snapshot();
+    data["current_root"] = json!("/work/gamma");
+    data["current"] = Value::Null;
+    fresh.apply_snapshot(&data);
+    let draft = fresh.saved_draft().expect("the draft survives a new panel");
+    assert_eq!(draft.brief, "Build Gamma end to end");
+    assert_eq!(draft.model, "antigravity/gemini-4-neon");
+    assert_eq!(draft.root, "/work/gamma");
+
+    fresh.clear_draft();
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    assert!(fresh.saved_draft().is_none());
+}
+
+#[test]
+fn n_starts_setup_with_crew_focus_when_no_project_exists() {
+    let mut view = CaptainView::new(34);
+    view.apply_snapshot(&json!({"current_root": "/work/solo", "projects": []}));
+    view.focus = Focus::Crew;
+    assert!(matches!(
+        view.handle_key("n", &kb()),
+        CaptainAction::LoadChoices { .. }
+    ));
+}
+
+#[test]
+fn a_deleting_project_or_unknown_root_does_not_block_setup() {
+    let mut view = view(34);
+    let mut data = snapshot();
+    data["projects"][0]["state"] = json!("deleting");
+    view.apply_snapshot(&data);
+    assert!(matches!(
+        view.handle_key("n", &kb()),
+        CaptainAction::LoadChoices { .. }
+    ));
+    let mut view = CaptainView::new(34);
+    view.apply_snapshot(&json!({"current_root": "", "projects": [{"id": "p", "root": ""}]}));
+    assert!(!view.here_has_captain());
+}

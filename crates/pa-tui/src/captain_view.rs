@@ -1464,6 +1464,10 @@ enum PickPurpose {
         project: String,
     },
     Setup(Box<Setup>),
+    /// `n` with an unfinished setup saved for this checkout: resume it or start fresh.
+    ResumeSetup {
+        reference: Option<String>,
+    },
     Launch,
     /// `request` makes repeated design presses from one list a single request.
     Factories {
@@ -1573,6 +1577,190 @@ pub(crate) struct Setup {
     pub factory_thinking: String,
     /// The factory the user built in the chart builder: its enabled stages and models.
     pub compose: Option<ComposeChoice>,
+}
+
+/// An unfinished setup, kept per checkout root so `n` can resume it or start fresh.
+/// The backend's options are not kept: a resume loads them again.
+#[derive(Debug, Clone, Default, serde::Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub(crate) struct SavedSetupDraft {
+    pub root: String,
+    pub reference: Option<String>,
+    pub step: usize,
+    pub brief: String,
+    pub provider: String,
+    pub model: String,
+    pub thinking: String,
+    /// The chosen machine; empty for none.
+    pub factory: String,
+    pub factory_chosen: bool,
+    pub factory_design: bool,
+    pub factory_compose: bool,
+    /// The chart builder's `{"stages": [...], "models": {...}}`.
+    pub compose_spec: Option<Value>,
+    pub factory_models: String,
+    pub factory_model: String,
+    pub factory_thinking: String,
+    pub parallel: u32,
+    pub crew: Vec<String>,
+}
+
+impl SavedSetupDraft {
+    fn from_setup(root: &str, setup: &Setup) -> Self {
+        Self {
+            root: root.to_owned(),
+            reference: setup.reference.clone(),
+            step: setup.step.min(SETUP_STEPS.len() - 1),
+            brief: setup.brief.clone(),
+            provider: setup.provider.clone(),
+            model: setup.model.clone(),
+            thinking: setup.thinking.clone(),
+            factory: setup.machine.clone().unwrap_or_default(),
+            factory_chosen: setup.factory_chosen,
+            factory_design: setup.design,
+            factory_compose: setup.compose.is_some(),
+            compose_spec: setup
+                .compose
+                .as_ref()
+                .map(|c| json!({"stages": c.stages, "models": c.models})),
+            factory_models: setup.factory_models.clone(),
+            factory_model: setup.factory_model.clone(),
+            factory_thinking: setup.factory_thinking.clone(),
+            parallel: setup.parallel,
+            crew: setup.crew.clone(),
+        }
+    }
+
+    /// The saved answers on top of freshly loaded options.
+    fn into_setup(self, choices: CaptainChoices) -> Setup {
+        let compose = self
+            .compose_spec
+            .filter(|_| self.factory_compose)
+            .map(|spec| ComposeChoice {
+                stages: spec["stages"]
+                    .as_array()
+                    .map(|s| {
+                        s.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                models: spec.get("models").cloned().unwrap_or(Value::Null),
+            });
+        Setup {
+            step: self.step.min(SETUP_STEPS.len() - 1),
+            reference: self.reference,
+            brief: self.brief,
+            provider: if self.provider.is_empty() {
+                "prime".into()
+            } else {
+                self.provider
+            },
+            model: self.model,
+            thinking: self.thinking,
+            machine: Some(self.factory).filter(|m| !m.is_empty()),
+            design: self.factory_design,
+            factory_chosen: self.factory_chosen,
+            parallel: if self.parallel == 0 { 2 } else { self.parallel },
+            crew: self.crew,
+            choices,
+            factory_models: self.factory_models,
+            factory_model: self.factory_model,
+            factory_thinking: self.factory_thinking,
+            compose,
+        }
+    }
+
+    /// The resume row: the step, the model, and the start of the brief.
+    fn summary(&self) -> String {
+        let step = SETUP_STEPS.get(self.step).copied().unwrap_or("confirm");
+        let mut text = format!("Resume where you left off · step: {step}");
+        if !self.model.is_empty() {
+            text.push_str(&format!(" · {}", self.model));
+        }
+        let brief = clean(&self.brief);
+        if !brief.is_empty() {
+            let preview = truncate_to_width(&brief, 40, "…");
+            text.push_str(&format!(" · \"{preview}\""));
+        }
+        text
+    }
+}
+
+/// Saved setup drafts: in memory, and as `<dir>/<root hash>.json` when a directory is set.
+#[derive(Debug, Default)]
+struct DraftStore {
+    dir: Option<std::path::PathBuf>,
+    memory: std::collections::HashMap<String, SavedSetupDraft>,
+}
+
+impl DraftStore {
+    /// `<hub>/captains/setup-drafts`. Tests start with memory only, so they never touch `~`.
+    fn default_dir() -> Option<std::path::PathBuf> {
+        if cfg!(test) {
+            return None;
+        }
+        if let Some(home) = std::env::var_os("PA_CAPTAIN_HOME") {
+            return Some(std::path::PathBuf::from(home).join("captains/setup-drafts"));
+        }
+        let home = std::path::PathBuf::from(std::env::var_os("HOME")?);
+        [home.join(".prime/harness"), home.join(".prime/agent")]
+            .into_iter()
+            .find(|hub| hub.join("captains").is_dir())
+            .map(|hub| hub.join("captains/setup-drafts"))
+    }
+
+    /// A stable file name per root (FNV-1a), so the name never holds the path itself.
+    fn path(&self, root: &str) -> Option<std::path::PathBuf> {
+        let hash = root.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+        });
+        Some(self.dir.as_ref()?.join(format!("{hash:016x}.json")))
+    }
+
+    fn get(&mut self, root: &str) -> Option<SavedSetupDraft> {
+        if let Some(draft) = self.memory.get(root) {
+            return Some(draft.clone());
+        }
+        let text = std::fs::read_to_string(self.path(root)?).ok()?;
+        let draft: SavedSetupDraft = serde_json::from_str(&text).ok()?;
+        (draft.root == root).then(|| {
+            self.memory.insert(root.to_owned(), draft.clone());
+            draft
+        })
+    }
+
+    fn put(&mut self, draft: SavedSetupDraft) -> Result<(), String> {
+        let path = self.path(&draft.root);
+        self.memory.insert(draft.root.clone(), draft.clone());
+        let Some(path) = path else {
+            return Ok(());
+        };
+        let write = || -> std::io::Result<()> {
+            let dir = path.parent().expect("draft path has a directory");
+            std::fs::create_dir_all(dir)?;
+            let mut file = tempfile::NamedTempFile::new_in(dir)?;
+            serde_json::to_writer_pretty(&mut file, &draft)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                file.as_file()
+                    .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
+            file.persist(&path).map_err(|e| e.error)?;
+            Ok(())
+        };
+        write().map_err(|e| format!("Could not save the setup draft: {e}"))
+    }
+
+    fn remove(&mut self, root: &str) {
+        self.memory.remove(root);
+        if let Some(path) = self.path(root) {
+            // A missing file is already the wanted state.
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 /// A chart-built factory: `factory-compose`'s ordered stages and `{stage: {model, thinking}}`.
@@ -2063,6 +2251,10 @@ pub(crate) struct CaptainView {
     viewport_rows: usize,
     /// Setup steps wait for the backend's options.
     pending_setup: Option<Setup>,
+    /// The saved draft a resumed setup restores once the options arrive.
+    pending_resume: Option<SavedSetupDraft>,
+    /// Unfinished setups, by checkout root.
+    drafts: DraftStore,
     /// A factory launch waits for the machine list.
     pending_launch: bool,
     /// The machines' parameters, for the launch form.
@@ -2175,6 +2367,11 @@ impl CaptainView {
             mode: Mode::Browse,
             viewport_rows: viewport_rows.max(12),
             pending_setup: None,
+            pending_resume: None,
+            drafts: DraftStore {
+                dir: DraftStore::default_dir(),
+                ..DraftStore::default()
+            },
             pending_launch: false,
             machine_params: std::collections::BTreeMap::new(),
             subagents: std::collections::HashMap::new(),
@@ -2200,6 +2397,12 @@ impl CaptainView {
     /// Ready the panel to park across a close: the browse page keeps its project, focus,
     /// selection, tab, and scroll; a sub-page, help, and messages go.
     pub(crate) fn park(&mut self) {
+        if let Some(setup) = self.setup_in_flight() {
+            self.save_draft(&setup);
+            self.focus = Focus::Projects;
+        }
+        self.pending_setup = None;
+        self.pending_resume = None;
         self.mode = Mode::Browse;
         self.help = false;
         self.inbox = None;
@@ -2231,6 +2434,9 @@ impl CaptainView {
                 self.snapshot = snapshot;
                 self.loaded = true;
                 self.snapshot_error = None;
+                // Read this checkout's saved setup once, so the Overview can name it.
+                let here = self.snapshot.current_root.clone();
+                self.drafts.get(&here);
                 let target = if first {
                     let here = &self.snapshot.current_root;
                     self.snapshot
@@ -2381,18 +2587,118 @@ impl CaptainView {
 
     /// The project at the current checkout, if it has a Captain.
     fn here_has_captain(&self) -> bool {
-        self.snapshot
-            .projects
-            .iter()
-            .any(|p| p.root == self.snapshot.current_root)
+        let here = &self.snapshot.current_root;
+        !here.is_empty()
+            && self
+                .snapshot
+                .projects
+                .iter()
+                .any(|p| &p.root == here && p.state != "deleting")
     }
 
-    /// Start the new-project form; `reference` promotes that conversation instead.
+    /// Point the panel at another draft directory (tests, or a custom hub).
+    #[cfg(test)]
+    pub(crate) fn set_draft_dir(&mut self, dir: Option<std::path::PathBuf>) {
+        self.drafts = DraftStore {
+            dir,
+            ..DraftStore::default()
+        };
+    }
+
+    /// The unfinished setup saved for this checkout.
+    pub(crate) fn saved_draft(&mut self) -> Option<SavedSetupDraft> {
+        let root = self.snapshot.current_root.clone();
+        self.drafts.get(&root)
+    }
+
+    /// Keep a setup that has an answer; an untouched form is not worth a resume prompt.
+    fn save_draft(&mut self, setup: &Setup) {
+        if setup.step == 0 && setup.brief.trim().is_empty() {
+            return;
+        }
+        let draft = SavedSetupDraft::from_setup(&self.snapshot.current_root, setup);
+        if let Err(error) = self.drafts.put(draft) {
+            self.error = Some(error);
+        }
+    }
+
+    /// Forget this checkout's unfinished setup.
+    pub(crate) fn clear_draft(&mut self) {
+        let root = self.snapshot.current_root.clone();
+        self.drafts.remove(&root);
+    }
+
+    /// The setup on screen or waiting for options or a shared picker, if any.
+    fn setup_in_flight(&self) -> Option<Setup> {
+        match &self.mode {
+            Mode::Pick(Picker {
+                purpose: PickPurpose::Setup(setup),
+                ..
+            }) => return Some((**setup).clone()),
+            Mode::Compose(ComposeView {
+                setup: Some(setup), ..
+            }) => return Some((**setup).clone()),
+            Mode::Confirm(Confirm::Create(setup)) => return Some((**setup).clone()),
+            _ => {}
+        }
+        // A resume still waiting for its options keeps the saved draft as it is.
+        if self.pending_resume.is_some() {
+            return None;
+        }
+        self.pending_setup.clone()
+    }
+
+    /// Stop the setup and keep its answers so `n` can resume it.
+    fn pause_setup(&mut self, setup: Setup) -> (Mode, CaptainAction) {
+        self.save_draft(&setup);
+        self.pending_setup = None;
+        self.pending_resume = None;
+        self.focus = Focus::Projects;
+        self.notice = Some(if setup.step == 0 && setup.brief.trim().is_empty() {
+            "Setup cancelled.".into()
+        } else {
+            "Setup saved. Press n to resume or start fresh.".into()
+        });
+        (Mode::Browse, CaptainAction::None)
+    }
+
+    /// Start the new-project form; `reference` promotes that conversation instead. With an
+    /// unfinished setup saved for this checkout, ask first: resume it or start fresh.
     pub(crate) fn start_setup(&mut self, reference: Option<String>) -> CaptainAction {
         if self.here_has_captain() {
             self.notice = Some("This project already has a Captain.".into());
             return CaptainAction::None;
         }
+        self.pending_setup = None;
+        self.pending_resume = None;
+        if let Some(draft) = self.saved_draft() {
+            let items = vec![
+                PickItem {
+                    label: draft.summary(),
+                    value: json!("resume"),
+                },
+                PickItem {
+                    label: "Start fresh (redo from scratch)".into(),
+                    value: json!("fresh"),
+                },
+            ];
+            self.mode = Mode::Pick(Picker::new(
+                "unfinished captain setup",
+                items,
+                PickPurpose::ResumeSetup { reference },
+            ));
+            return CaptainAction::None;
+        }
+        self.begin_setup(reference, None)
+    }
+
+    /// Load the options for a new form, or for `draft` to resume.
+    fn begin_setup(
+        &mut self,
+        reference: Option<String>,
+        draft: Option<SavedSetupDraft>,
+    ) -> CaptainAction {
+        let reference = draft.as_ref().map_or(reference, |d| d.reference.clone());
         self.notice = Some("Loading models and machines…".into());
         self.pending_setup = Some(Setup {
             reference: reference.clone(),
@@ -2400,9 +2706,19 @@ impl CaptainView {
             provider: "prime".into(),
             ..Setup::default()
         });
+        self.pending_resume = draft;
         CaptainAction::LoadChoices {
             project: None,
             reference,
+        }
+    }
+
+    /// The editor's text when the brief step was cancelled: it stays in the draft.
+    pub(crate) fn keep_brief_text(&mut self, text: &str) {
+        if let Some(setup) = self.pending_setup.as_mut() {
+            if setup.step == 0 {
+                setup.brief = text.trim().to_owned();
+            }
         }
     }
 
@@ -2438,6 +2754,9 @@ impl CaptainView {
         }
         if let Some(mut setup) = self.pending_setup.take() {
             self.notice = None;
+            if let Some(draft) = self.pending_resume.take() {
+                return self.setup_step(draft.into_setup(choices));
+            }
             setup.brief = choices.brief.clone().unwrap_or_default();
             setup.choices = choices;
             return self.setup_step(setup);
@@ -2588,6 +2907,7 @@ impl CaptainView {
 
     /// Show the setup step `setup.step`; text steps go to pa's editor.
     fn setup_step(&mut self, setup: Setup) -> CaptainAction {
+        self.save_draft(&setup);
         let step = SETUP_STEPS.get(setup.step).copied().unwrap_or("confirm");
         let boxed = |s: &Setup| PickPurpose::Setup(Box::new(s.clone()));
         let title = |name: &str| {
@@ -2801,14 +3121,12 @@ impl CaptainView {
         }
         let Some(text) = text.map(|t| t.trim().to_owned()) else {
             if purpose == ComposePurpose::Brief {
-                if let Some(mut setup) = self.pending_setup.take() {
-                    if setup.step > 0 {
-                        setup.step -= 1;
-                        return self.setup_step(setup);
-                    }
-                }
-                self.mode = Mode::Browse;
-                self.notice = Some("Setup cancelled.".into());
+                let (mode, action) = match self.pending_setup.take() {
+                    Some(setup) => self.pause_setup(setup),
+                    None => (Mode::Browse, CaptainAction::None),
+                };
+                self.mode = mode;
+                return action;
             }
             return CaptainAction::None;
         };
@@ -3197,7 +3515,9 @@ impl CaptainView {
                 };
                 return CaptainAction::None;
             }
-            "n" if !(self.focus == Focus::Crew && self.tab == Tab::Overview) => {
+            "n" if !(self.focus == Focus::Crew && self.tab == Tab::Overview)
+                || self.snapshot.projects.is_empty() =>
+            {
                 return self.start_setup(None)
             }
             "p" => return self.start_setup(Some("current".into())),
@@ -4028,8 +4348,16 @@ impl CaptainView {
                 }
                 _ => {}
             }
+            if let PickPurpose::ResumeSetup { .. } = &picker.purpose {
+                self.focus = Focus::Projects;
+                self.notice = Some("Setup saved. Press n to resume or start fresh.".into());
+                return (Mode::Browse, CaptainAction::None);
+            }
             if let PickPurpose::Setup(setup) = &picker.purpose {
                 let mut setup = (**setup).clone();
+                if key == "ctrl+c" {
+                    return self.pause_setup(setup);
+                }
                 if setup.step > 0 {
                     setup.step = if setup.step == 3 {
                         1
@@ -4320,6 +4648,14 @@ impl CaptainView {
                 self.notice = Some(format!("Loading {name}…"));
                 CaptainAction::LoadFactory { project, name }
             }
+            PickPurpose::ResumeSetup { reference } => {
+                if value == "resume" {
+                    let draft = self.saved_draft();
+                    return self.begin_setup(reference, draft);
+                }
+                self.clear_draft();
+                self.begin_setup(reference, None)
+            }
             PickPurpose::Setup(setup) => {
                 let mut setup = *setup;
                 match SETUP_STEPS[setup.step] {
@@ -4394,6 +4730,9 @@ impl CaptainView {
                 return (Mode::Factory(*review), CaptainAction::None);
             }
             if let Confirm::Create(setup) = confirm {
+                if key == "ctrl+c" {
+                    return self.pause_setup(*setup);
+                }
                 let mut setup = *setup;
                 setup.step = SETUP_STEPS.len() - 2;
                 let action = self.setup_step(setup);
@@ -5182,6 +5521,9 @@ impl CaptainView {
         self.error = None;
         if kb.matches(key, "tui.select.cancel") || key == "ctrl+c" || key == "q" {
             if let Some(setup) = compose.setup.take() {
+                if key == "ctrl+c" {
+                    return self.pause_setup(*setup);
+                }
                 let action = self.setup_step(*setup);
                 return (std::mem::replace(&mut self.mode, Mode::Browse), action);
             }
@@ -5342,7 +5684,15 @@ impl CaptainView {
                     .as_ref()
                     .map(|n| theme.fg_span(ThemeColor::Text, clean(n)))
             })
-            .or_else(|| (!self.loaded).then(|| dim("Loading…")));
+            .or_else(|| (!self.loaded).then(|| dim("Loading…")))
+            .or_else(|| {
+                let unfinished = matches!(self.mode, Mode::Browse)
+                    && self.tab == Tab::Overview
+                    && !self.here_has_captain()
+                    && self.drafts.memory.contains_key(&self.snapshot.current_root);
+                unfinished
+                    .then(|| dim("Unfinished Captain setup saved. Press n to resume or redo."))
+            });
         out.push(truncate_line(
             &vec![Span::raw(" "), status.unwrap_or_else(|| Span::raw(""))],
             width,
