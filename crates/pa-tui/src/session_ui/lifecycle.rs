@@ -1,6 +1,8 @@
 //! The open/attach/reattach pipeline (the session selection's open, the
 //! §10 reattach, the attach fold, and the transcript rebuild it feeds),
 //! the stats refresh, and the detach/exit request helpers.
+use std::path::PathBuf;
+
 use super::{
     attach_capabilities, attach_data_from_response, create_session, last_assistant_text_of, mpsc,
     reconstruct, resume_hint_from_stats, ActivityUpdates, AgentView, BTreeMap, ChatEntry,
@@ -209,10 +211,22 @@ impl SessionUi {
             captain_compose: None,
             captain_context: None,
             captain_parked: None,
+            workspace_parked: None,
+            model_pick_target: super::model_picker::ModelPickTarget::Chat,
             captain_states: None,
+            captain_status_watcher: crate::interactive::captain_hint::CaptainStatusWatcher::for_cwd(
+                &options.cwd,
+            ),
+            captain_dock: None,
+            captain_db_stamp: None,
             captain_focus_query: None,
             captain_pending_key: None,
             pending_captain_open: None,
+            captain_busy_open: None,
+            daemon_socket: options.socket_path.clone(),
+            captain_snapshot: None,
+            captain_lead_inflight: None,
+            captain_lead_queue: std::collections::VecDeque::new(),
             external_editor_request: None,
             pending_mcp_auth: None,
             picker_restored_draft: false,
@@ -303,7 +317,7 @@ impl SessionUi {
                 }),
                 _ => view.push_entry(crate::chat::ChatEntry::Status {
                     text: format!(
-                        "Reconnected to Prime Agent (update {update_id}) — your session and queued work resumed."
+                        "Reconnected to radiata (update {update_id}) — your session and queued work resumed."
                     ),
                     kind: crate::chat::StatusKind::Info,
                 }),
@@ -341,6 +355,10 @@ impl SessionUi {
         dock_fold: DockFold,
     ) -> Result<()> {
         let previous = self.active_session_id.clone();
+        // A chat the user opened replaces a Captain chat still waiting for its turn to end.
+        if previous != active_session_id {
+            self.captain_busy_open = None;
+        }
         // A direct link is bound to one session: drop it when switching.
         if self
             .client
@@ -436,6 +454,11 @@ impl SessionUi {
                 .await;
         }
         self.session_id = reconstructed.session_id;
+        // `/review`, `@` completion, and every cwd-relative action follow the attached session's
+        // own directory (a crew thread's worktree), never the launch checkout.
+        if let Some(cwd) = attached_session_cwd(&attach.snapshot) {
+            self.cwd = cwd;
+        }
         self.attach_event_generation
             .clone_from(&reconstructed.event_generation);
         self.attach_event_sequence = reconstructed.last_event_sequence;
@@ -683,6 +706,11 @@ impl SessionUi {
             }
         }
         let snapshot = self.pending_snapshot.take().unwrap_or_default();
+        let outgoing = view.reader_position();
+        let restore = view
+            .chrome
+            .nav
+            .switch_transcript(&self.session_id, outgoing);
         self.replace_transcript(snapshot, view);
         if let Some(message) = self.pending_model_fallback_message.take() {
             view.push_entry(ChatEntry::Status {
@@ -773,6 +801,10 @@ impl SessionUi {
             view.working = None;
         }
         view.follow();
+        // A chat switched back to resumes where its reader left it.
+        if let Some((entry, row)) = restore.filter(|(entry, _)| *entry < view.chat.len()) {
+            view.scroll_to_entry(entry, row);
+        }
         // An open `/heartbeats` picker follows the rebuilt session's catalog — otherwise a rebind
         // leaves it showing the previous session's rows.
         if let Some(Overlay::Heartbeats(picker)) = view.overlay.as_mut() {
@@ -856,6 +888,17 @@ impl SessionUi {
         .await;
         resume_hint_from_stats(&stats.ok()?.ok()?)
     }
+}
+
+/// The attached session's working directory from its snapshot (the state's
+/// `cwd`, else the summary's), when it names a directory that still exists.
+fn attached_session_cwd(snapshot: &Value) -> Option<PathBuf> {
+    ["state", "summary"]
+        .iter()
+        .filter_map(|section| snapshot.get(section)?.get("cwd")?.as_str())
+        .find(|cwd| !cwd.is_empty())
+        .map(PathBuf::from)
+        .filter(|cwd| cwd.is_dir())
 }
 
 #[cfg(all(test, unix))]
@@ -1901,6 +1944,16 @@ mod backfill_tests {
             assert_eq!(view.editor.get_lines().join("\n"), "draft");
             session.open_dock_group_from_click(crate::chrome::ActivityGroup::Factory, &mut view);
             assert!(matches!(view.overlay, Some(Overlay::Factory(_))));
+            session.captain_dock = Some(crate::chrome::CaptainDockState {
+                project_id: "proj-1".into(),
+                name: "alpha".into(),
+                state: "active".into(),
+                working: 1,
+                ..Default::default()
+            });
+            session.open_dock_group_from_click(crate::chrome::ActivityGroup::Captain, &mut view);
+            assert!(matches!(view.overlay, Some(Overlay::Captain(_))));
+            assert_eq!(session.captain_focus_query.as_deref(), Some("proj-1"));
             drop(session);
             server.abort();
         })
@@ -2163,5 +2216,366 @@ mod backfill_tests {
         drop(session);
         server.abort();
         }).await.expect("mock session open, warning rebuild complete within ten seconds");
+    }
+
+    fn catalog_model(provider: &str, id: &str) -> pa_types::ai::Model {
+        serde_json::from_value(json!({
+            "id": id, "name": id, "api": "openai-completions", "provider": provider,
+            "baseUrl": "https://example.invalid/v1", "reasoning": true,
+            "input": ["text"],
+            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+            "contextWindow": 128_000, "maxTokens": 4096,
+        }))
+        .unwrap()
+    }
+
+    /// Captain flows open the same `Overlay::ModelPicker` as `/model`, fed by the session's
+    /// registry catalog; Esc returns to the Captain panel and Enter routes the choice back to it.
+    #[tokio::test]
+    async fn captain_model_choices_reuse_the_shared_model_picker() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut session, server, _requests) = mock_session(
+                &dir.path().join("captain-picker.sock"),
+                mpsc::unbounded_channel().0,
+            )
+            .await;
+            session.model_catalog = vec![
+                catalog_model("anthropic", "claude-opus-5-5"),
+                catalog_model("openai-codex", "gpt-5.4"),
+            ];
+            let mut view = AgentView::new(crate::theme::Theme::builtin(
+                "prime",
+                crate::theme::ColorMode::TrueColor,
+            ));
+            view.overlay = Some(Overlay::Captain(crate::captain_view::CaptainView::new(20)));
+            session.run_captain_action(
+                crate::captain_view::CaptainAction::PickModel(
+                    crate::captain_view::CaptainModelTarget::Crew {
+                        project: "p1".into(),
+                        member: "c1".into(),
+                        label: "parser-fix".into(),
+                        current_model: "openai-codex/gpt-5.4".into(),
+                        current_thinking: "high".into(),
+                    },
+                ),
+                &mut view,
+            );
+            let Some(Overlay::ModelPicker(picker)) = view.overlay.as_ref() else {
+                panic!("the crew model choice opens the shared model picker");
+            };
+            assert_eq!(
+                picker.filtered_len(),
+                2,
+                "the picker lists the registry catalog"
+            );
+            assert_eq!(
+                picker.selected_model().map(|m| m.id.as_str()),
+                Some("gpt-5.4"),
+                "the crew's current model is preselected"
+            );
+            assert!(
+                matches!(view.modal_backdrop.as_deref(), Some(Overlay::Captain(_))),
+                "the panel floats dimmed behind the picker"
+            );
+            assert!(session.captain_parked.is_none());
+            session.apply_captain_update(
+                super::super::captain::CaptainUpdate::Acted {
+                    op: "edit".into(),
+                    done: "Background refresh landed.".into(),
+                    result: Ok(json!({})),
+                },
+                &mut view,
+            );
+            assert!(
+                matches!(view.overlay, Some(Overlay::ModelPicker(_))),
+                "a background Captain update leaves the picker open"
+            );
+            let esc = crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Esc,
+                crossterm::event::KeyModifiers::NONE,
+            );
+            session
+                .handle_model_picker_key(esc, &mut view)
+                .await
+                .unwrap();
+            assert!(
+                matches!(view.overlay, Some(Overlay::Captain(_))),
+                "Esc returns to Captain"
+            );
+            assert!(view.modal_backdrop.is_none());
+            assert!(matches!(
+                session.model_pick_target,
+                super::super::model_picker::ModelPickTarget::Chat
+            ));
+
+            // Crew assign: Enter applies the picked model to the panel's access step.
+            session.run_captain_action(
+                crate::captain_view::CaptainAction::PickModel(
+                    crate::captain_view::CaptainModelTarget::Assign {
+                        project: "p1".into(),
+                    },
+                ),
+                &mut view,
+            );
+            assert!(matches!(view.overlay, Some(Overlay::ModelPicker(_))));
+            let enter = crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            );
+            session
+                .handle_model_picker_key(enter, &mut view)
+                .await
+                .unwrap();
+            let Some(Overlay::Captain(panel)) = view.overlay.as_mut() else {
+                panic!("Enter returns to Captain");
+            };
+            let kb = crate::keybindings::KeybindingsManager::new();
+            assert!(
+                matches!(
+                    panel.handle_key("enter", &kb),
+                    crate::captain_view::CaptainAction::Compose { .. }
+                ),
+                "the picked model reaches the assign flow's access step"
+            );
+            drop(session);
+            server.abort();
+        })
+        .await
+        .expect("captain picker flow completes within ten seconds");
+    }
+
+    fn test_view() -> AgentView {
+        AgentView::new(crate::theme::Theme::builtin(
+            "prime",
+            crate::theme::ColorMode::TrueColor,
+        ))
+    }
+
+    fn key(code: crossterm::event::KeyCode) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn attached_session_cwd_prefers_an_existing_state_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        let snapshot = json!({"state": {"cwd": path}, "summary": {"cwd": "/nope/missing"}});
+        assert_eq!(
+            attached_session_cwd(&snapshot),
+            Some(dir.path().to_path_buf())
+        );
+        let summary_only = json!({"state": {"cwd": ""}, "summary": {"cwd": path}});
+        assert_eq!(
+            attached_session_cwd(&summary_only),
+            Some(dir.path().to_path_buf())
+        );
+        let missing = json!({"state": {"cwd": "/nope/missing-worktree"}});
+        assert_eq!(attached_session_cwd(&missing), None);
+        assert_eq!(attached_session_cwd(&json!({})), None);
+    }
+
+    #[tokio::test]
+    async fn attach_adopts_the_attached_session_cwd() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let dir = tempfile::tempdir().unwrap();
+            let (session, server, _requests) =
+                mock_session(&dir.path().join("cwd.sock"), mpsc::unbounded_channel().0).await;
+            assert_eq!(session.cwd, PathBuf::from("/tmp"));
+            drop(session);
+            server.abort();
+        })
+        .await
+        .expect("attach completes within ten seconds");
+    }
+
+    #[test]
+    fn transcript_switch_restores_each_sessions_reader_position() {
+        let mut view = test_view();
+        for index in 0..80 {
+            view.push_entry(ChatEntry::User {
+                text: format!("message {index}"),
+            });
+        }
+        view.render_frame(60, 20);
+        assert_eq!(view.chrome.nav.switch_transcript("a", None), None);
+        view.scroll_to_entry(10, 0);
+        view.render_frame(60, 20);
+        let paused = view.reader_position();
+        assert!(paused.is_some(), "a paused reader has a position");
+
+        // a → b: a's place is saved and b (never seen) follows.
+        assert_eq!(view.chrome.nav.switch_transcript("b", paused), None);
+        // b → a (b was following): a's place comes back, b's stays unset.
+        assert_eq!(view.chrome.nav.switch_transcript("a", None), paused);
+        assert!(!view.chrome.nav.session_scroll.contains_key("b"));
+        // A same-session rebuild keeps its place untouched.
+        assert_eq!(view.chrome.nav.switch_transcript("a", None), None);
+        let (entry, row) = paused.unwrap();
+        view.scroll_to_entry(entry, row);
+        assert!(!view.is_following());
+    }
+
+    #[tokio::test]
+    async fn a_dock_opened_factory_page_closes_to_the_dock_and_a_direct_one_to_the_editor() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut session, server, _requests) = mock_session(
+                &dir.path().join("dock-origin.sock"),
+                mpsc::unbounded_channel().0,
+            )
+            .await;
+            let mut view = test_view();
+
+            session.activity_group = crate::chrome::ActivityGroup::Factory;
+            session.subagents_focused = true;
+            session.open_dock_group_view(&mut view);
+            assert!(matches!(view.overlay, Some(Overlay::Factory(_))));
+            assert!(view.chrome.nav.opened_from_dock);
+            session
+                .handle_factory_view_key(key(crossterm::event::KeyCode::Esc), &mut view)
+                .await
+                .unwrap();
+            assert!(view.overlay.is_none());
+            assert!(session.subagents_focused, "the dock takes the focus back");
+            assert_eq!(
+                session.activity_group,
+                crate::chrome::ActivityGroup::Factory
+            );
+
+            session.subagents_focused = false;
+            session.open_fsm_page(&mut view);
+            assert!(matches!(view.overlay, Some(Overlay::Factory(_))));
+            assert!(!view.chrome.nav.opened_from_dock);
+            session
+                .handle_factory_view_key(key(crossterm::event::KeyCode::Esc), &mut view)
+                .await
+                .unwrap();
+            assert!(view.overlay.is_none());
+            assert!(
+                !session.subagents_focused,
+                "a direct open returns to the editor"
+            );
+            drop(session);
+            server.abort();
+        })
+        .await
+        .expect("factory page flow completes within ten seconds");
+    }
+
+    #[tokio::test]
+    async fn a_captain_opened_factory_page_returns_to_the_parked_panel() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut session, server, _requests) = mock_session(
+                &dir.path().join("captain-origin.sock"),
+                mpsc::unbounded_channel().0,
+            )
+            .await;
+            let mut view = test_view();
+            view.overlay = Some(Overlay::Captain(crate::captain_view::CaptainView::new(20)));
+            session.open_factory_page_from_captain(
+                &mut view,
+                Some(crate::factory_view::CaptainRunOrigin {
+                    project: "p1".into(),
+                    member: Some("gate-check".into()),
+                }),
+            );
+            let Some(Overlay::Factory(page)) = view.overlay.as_ref() else {
+                panic!("the factory page mounts over the parked panel");
+            };
+            assert!(page.returns_to_captain());
+            assert_eq!(page.captain_run().unwrap().project, "p1");
+            assert!(session.captain_parked.is_some());
+            session
+                .handle_factory_view_key(key(crossterm::event::KeyCode::Left), &mut view)
+                .await
+                .unwrap();
+            assert!(
+                matches!(view.overlay, Some(Overlay::Captain(_))),
+                "← returns to F6"
+            );
+            assert!(session.captain_parked.is_none());
+            drop(session);
+            server.abort();
+        })
+        .await
+        .expect("captain origin flow completes within ten seconds");
+    }
+
+    #[tokio::test]
+    async fn dock_enter_on_a_captain_sub_row_opens_the_captain_panel() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut session, server, _requests) = mock_session(
+                &dir.path().join("captain-item.sock"),
+                mpsc::unbounded_channel().0,
+            )
+            .await;
+            let mut view = test_view();
+            session.captain_dock = Some(crate::chrome::CaptainDockState {
+                project_id: "p1".into(),
+                name: "alpha".into(),
+                state: "active".into(),
+                active: vec![
+                    crate::chrome::CaptainDockActiveItem {
+                        label: "gate-check".into(),
+                        kind: "factory".into(),
+                        state: "paused".into(),
+                        state_text: "paused".into(),
+                        step: None,
+                    },
+                    crate::chrome::CaptainDockActiveItem {
+                        label: "ship".into(),
+                        kind: "project_factory".into(),
+                        state: "draft".into(),
+                        state_text: "needs review".into(),
+                        step: None,
+                    },
+                ],
+                ..Default::default()
+            });
+            session.activity_group = crate::chrome::ActivityGroup::Captain;
+            session.subagents_focused = true;
+            session.update_subagent_summary(&mut view);
+            let mut running = true;
+            session
+                .handle_key(
+                    key(crossterm::event::KeyCode::Down),
+                    &mut view,
+                    &mut running,
+                )
+                .await
+                .unwrap();
+            assert_eq!(view.chrome.nav.dock_captain_item, Some(0));
+            session
+                .handle_key(
+                    key(crossterm::event::KeyCode::Down),
+                    &mut view,
+                    &mut running,
+                )
+                .await
+                .unwrap();
+            assert_eq!(view.chrome.nav.dock_captain_item, Some(1));
+            assert_eq!(session.dock_captain_item(1).unwrap().1.label, "ship");
+            assert_eq!(
+                view.chrome.activity.as_ref().map(|dock| dock.selection()),
+                Some(crate::chrome::DockSelection::CaptainItem(1))
+            );
+            session
+                .handle_key(
+                    key(crossterm::event::KeyCode::Enter),
+                    &mut view,
+                    &mut running,
+                )
+                .await
+                .unwrap();
+            assert!(matches!(view.overlay, Some(Overlay::Captain(_))));
+            assert!(view.chrome.nav.opened_from_dock);
+            drop(session);
+            server.abort();
+        })
+        .await
+        .expect("captain sub-row flow completes within ten seconds");
     }
 }

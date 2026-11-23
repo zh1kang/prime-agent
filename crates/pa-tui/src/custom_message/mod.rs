@@ -75,6 +75,138 @@ pub const MODEL_PROMPT_ERROR_CUSTOM_TYPE: &str = "model_prompt_error";
 pub const SKILL_PROBLEMS_CUSTOM_TYPE: &str = "skill_problems";
 /// Wire twin of `pa_core::session_engine::model_resolution_notice::MODEL_RESOLUTION_WARNING_CUSTOM_TYPE`.
 pub const MODEL_RESOLUTION_WARNING_CUSTOM_TYPE: &str = "model_resolution_warning";
+/// Wire twin of `pa_core::session_engine::messages::ABSORBED_CONTEXT_CUSTOM_TYPE`.
+pub const ABSORBED_CONTEXT_CUSTOM_TYPE: &str = "absorbed_context";
+
+/// One `/absorb` packet: `⧉ Absorbed · <provider> · "<title>" · <tok> from <raw>` collapsed,
+/// the `[absorbed-context]` packet itself expanded.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AbsorbedContextRow {
+    /// `(provider, title)` of a single-chat packet; none for several chats.
+    pub source: Option<(String, String)>,
+    pub chats: usize,
+    pub tokens: u64,
+    /// The sources' transcript size in tokens, when the daemon measured it.
+    pub raw_tokens: Option<u64>,
+    pub changed_files: usize,
+    pub packet: String,
+}
+
+impl AbsorbedContextRow {
+    fn from_message(message: &Value, details: &Value) -> Self {
+        let sources = details
+            .get("sources")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let text = |source: &Value, key: &str| {
+            source
+                .get(key)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        let source = match sources.as_slice() {
+            [one] => Some((provider_label(&text(one, "provider")), text(one, "title"))),
+            _ => None,
+        };
+        let raw: Vec<u64> = sources
+            .iter()
+            .filter_map(|s| s.get("rawTextTokens").and_then(Value::as_u64))
+            .collect();
+        Self {
+            source,
+            chats: sources.len().max(1),
+            tokens: details.get("tokens").and_then(Value::as_u64).unwrap_or(0),
+            raw_tokens: (!raw.is_empty()).then(|| raw.iter().sum()),
+            changed_files: details
+                .get("changedFiles")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len),
+            packet: custom_content_text(message),
+        }
+    }
+
+    /// The card line as plain text.
+    pub fn summary(&self) -> String {
+        let (facts, warning) = self.parts();
+        format!("{ABSORBED_MARK}{facts}{}", warning.unwrap_or_default())
+    }
+
+    /// The one-line card: accent mark, muted facts, a warning for files changed since.
+    pub fn header(&self, theme: &crate::theme::Theme) -> crate::Line {
+        let (facts, warning) = self.parts();
+        let mut line = vec![
+            theme.bold(theme.fg_span(ThemeColor::Accent, ABSORBED_MARK)),
+            theme.fg_span(ThemeColor::Muted, facts),
+        ];
+        if let Some(warning) = warning {
+            line.push(theme.fg_span(ThemeColor::Warning, warning));
+        }
+        line
+    }
+
+    fn parts(&self) -> (String, Option<String>) {
+        let tokens = crate::workspace_view::compact_count(self.tokens);
+        let mut facts = String::new();
+        match &self.source {
+            Some((provider, title)) => {
+                if !provider.is_empty() {
+                    facts.push_str(&format!(" · {provider}"));
+                }
+                if !title.is_empty() {
+                    facts.push_str(&format!(" · \"{title}\""));
+                }
+                facts.push_str(&format!(" · {tokens} tok"));
+                if let Some(raw) = self.raw_tokens {
+                    let raw = crate::workspace_view::compact_count(raw);
+                    facts.push_str(&format!(" from {raw}"));
+                }
+            }
+            None => facts.push_str(&format!(" {} chats · {tokens} tok", self.chats)),
+        }
+        let plural = if self.changed_files == 1 { "" } else { "s" };
+        let warning = (self.changed_files > 0)
+            .then(|| format!(" · \u{26a0} {} file{plural} changed", self.changed_files));
+        (facts, warning)
+    }
+}
+
+const ABSORBED_MARK: &str = "\u{29c9} Absorbed";
+
+fn provider_label(provider: &str) -> String {
+    match provider {
+        "claude" => "Claude",
+        "codex" => "Codex",
+        "cursor" => "Cursor",
+        "antigravity" => "Antigravity",
+        "t3" => "T3",
+        "prime" => "Prime",
+        other => other,
+    }
+    .to_string()
+}
+
+/// The absorbed-context card: the header line, then the packet on the branch gutter when
+/// tool output is expanded.
+pub fn render_absorbed_context(
+    row: &AbsorbedContextRow,
+    detail: crate::chat::Detail,
+    theme: &crate::theme::Theme,
+    width: usize,
+) -> Vec<crate::Line> {
+    let mut out = vec![Vec::new()];
+    out.extend(render::text_rows(&row.header(theme), width));
+    if detail.tool_output_expanded() {
+        out.extend(crate::branch::branch_markdown(
+            &row.packet,
+            &geometry::markdown_style(ThemeColor::CustomMessageText, theme),
+            theme,
+            width,
+        ));
+    }
+    out
+}
 
 /// Which agent-message side a row renders: the received transcript rows, or the
 /// sent/queued ipython cell receipts. The direction word folds into the
@@ -229,6 +361,12 @@ pub fn custom_message_entries(message: &Value) -> Vec<ChatEntry> {
             kind: crate::chat::StatusKind::Warning,
         }],
         REFINEMENT_OUTCOME_CUSTOM_TYPE => refinement::refinement_outcome_entries(message, details),
+        // `ChatEntry` has no absorbed-context variant yet, so the transcript shows the
+        // collapsed card line; `render_absorbed_context` draws the expandable card.
+        ABSORBED_CONTEXT_CUSTOM_TYPE => vec![ChatEntry::Status {
+            text: AbsorbedContextRow::from_message(message, details).summary(),
+            kind: StatusKind::Info,
+        }],
         AGENT_MESSAGE_CUSTOM_TYPE => agent_message_entry(details).map_or_else(
             || vec![generic_panel_entry(custom_type, message)],
             |entry| vec![entry],
@@ -928,6 +1066,63 @@ mod tests {
                 text: "[Malformed compaction outcome message]".to_string(),
                 kind: StatusKind::Error,
             }]
+        );
+    }
+
+    #[test]
+    fn absorbed_context_renders_a_collapsed_card_and_the_expanded_packet() {
+        use crate::chat::Detail;
+        let theme = crate::theme::Theme::builtin("prime", crate::theme::ColorMode::TrueColor);
+        let packet = "[absorbed-context]\nLogin refresh races the token write.";
+        let message = json!({
+            "role": "custom",
+            "customType": ABSORBED_CONTEXT_CUSTOM_TYPE,
+            "content": packet,
+            "display": true,
+            "details": {
+                "sources": [{"provider": "claude", "title": "Fix auth refresh race",
+                             "rawTextTokens": 97_000, "tokens": 1412}],
+                "tokens": 1412, "changedFiles": ["src/login.rs"], "method": "distill",
+            },
+        });
+        let card = "\u{29c9} Absorbed · Claude · \"Fix auth refresh race\" · 1.4k tok from 97k · \u{26a0} 1 file changed";
+        assert_eq!(
+            decoded(&message),
+            vec![ChatEntry::Status {
+                text: card.to_string(),
+                kind: StatusKind::Info,
+            }]
+        );
+        let row = AbsorbedContextRow::from_message(&message, &message["details"]);
+        let header = row.header(&theme);
+        assert_eq!(
+            header[0].style,
+            theme.bold(theme.fg_span(ThemeColor::Accent, "x")).style
+        );
+        assert_eq!(header[2].style, theme.fg_style(ThemeColor::Warning));
+        let collapsed = plain_rows(&render_absorbed_context(
+            &row,
+            Detail::Overview,
+            &theme,
+            120,
+        ));
+        assert_eq!(collapsed, vec![String::new(), format!(" {card}")]);
+        let expanded =
+            plain_rows(&render_absorbed_context(&row, Detail::All, &theme, 120)).join("\n");
+        assert!(expanded.contains("[absorbed-context]"), "{expanded}");
+        assert!(
+            expanded.contains("Login refresh races the token write."),
+            "{expanded}"
+        );
+
+        let several = AbsorbedContextRow::from_message(
+            &json!({"content": packet}),
+            &json!({"sources": [{"provider": "claude"}, {"provider": "t3"}],
+                    "tokens": 2800, "changedFiles": ["a.rs"]}),
+        );
+        assert_eq!(
+            several.summary(),
+            "\u{29c9} Absorbed 2 chats · 2.8k tok · \u{26a0} 1 file changed"
         );
     }
 

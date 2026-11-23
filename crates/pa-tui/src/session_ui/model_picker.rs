@@ -19,6 +19,68 @@ pub(crate) struct ModelCatalogUpdate {
     pub configured_providers: std::collections::HashSet<String>,
 }
 
+/// What the open shared `Overlay::ModelPicker` applies to on Enter or Cancel.
+#[derive(Debug, Clone, Default)]
+pub(crate) enum ModelPickTarget {
+    #[default]
+    Chat,
+    Captain(crate::captain_view::CaptainModelTarget),
+    Workspace {
+        draft: String,
+        state_id: String,
+        role: Option<String>,
+        /// The state's thinking when the picker opened; kept when the effort is not edited.
+        current_thinking: String,
+    },
+}
+
+/// The picker's context header naming what a non-chat pick changes
+/// (`model › ship · review-bugs (role: reviewer)`); the chat's own model has none.
+fn model_pick_header(target: &ModelPickTarget) -> Option<String> {
+    use crate::captain_view::CaptainModelTarget;
+    let with_role = |state: &str, role: &Option<String>| match role {
+        Some(role) => format!("{state} (role: {role})"),
+        None => state.to_owned(),
+    };
+    let subject = match target {
+        ModelPickTarget::Chat => return None,
+        ModelPickTarget::Workspace {
+            draft,
+            state_id,
+            role,
+            ..
+        } => format!("{draft} \u{b7} {}", with_role(state_id, role)),
+        ModelPickTarget::Captain(captain) => match captain {
+            CaptainModelTarget::Setup { .. } => "captain setup".to_owned(),
+            CaptainModelTarget::CaptainLead { project, .. } => format!("{project} \u{b7} captain"),
+            CaptainModelTarget::Assign { project } => format!("{project} \u{b7} assign"),
+            CaptainModelTarget::Crew { member, label, .. } => {
+                if let Some(id) = member.strip_prefix("specialist:") {
+                    format!("specialist \u{b7} {id}")
+                } else {
+                    format!("crew \u{b7} {label}")
+                }
+            }
+            CaptainModelTarget::FactoryNode {
+                name,
+                state_id,
+                role,
+                ..
+            } => format!("{name} \u{b7} {}", with_role(state_id, role)),
+            CaptainModelTarget::FactoryDefault { name, .. } => {
+                format!("{name} \u{b7} default role")
+            }
+            CaptainModelTarget::SetupFactory { .. } => "new factory \u{b7} every step".to_owned(),
+        },
+    };
+    Some(format!("model \u{203a} {subject}"))
+}
+
+/// The thinking level to write after a pick: the edited effort, else the current level.
+fn picked_thinking(effort: Option<&str>, current: &str) -> String {
+    effort.unwrap_or(current).to_owned()
+}
+
 impl SessionUi {
     /// The catalog entry for the current model (the `/fast` eligibility check needs the provider
     /// and api): the provider-aware match of [`find_current_model_entry`].
@@ -70,16 +132,94 @@ impl SessionUi {
             thinking_level,
             scoped_models,
             viewport_rows: picker_viewport_rows(view.terminal_rows()),
+            header: None,
         };
         // Always open the menu (an empty catalog renders the empty panel).
         let crate::model_picker::ModelCommandOutcome::Open(picker) =
             ModelPicker::open(options, search);
+        self.park_modal_backdrop(view);
+        self.model_pick_target = ModelPickTarget::Chat;
         view.overlay = Some(Overlay::ModelPicker(*picker));
         let force = !search.trim().is_empty();
         if self.model_refresh_due(force) {
             self.spawn_model_catalog_refresh();
         }
         Ok(())
+    }
+
+    /// Open pa's shared searchable model + thinking picker for a Captain or machine-editor flow,
+    /// backed by the same `ModelRegistry` catalog as `/model`.
+    pub(crate) fn open_shared_model_picker(
+        &mut self,
+        view: &mut AgentView,
+        current_model: &str,
+        current_thinking: &str,
+        target: ModelPickTarget,
+    ) {
+        let trimmed = current_model.trim();
+        let current = if trimmed.is_empty() {
+            self.current_model(view)
+        } else if let Some((prov, id)) = trimmed.split_once('/') {
+            find_current_model_entry(&self.model_catalog, Some(prov), id)
+                .map(|m| CurrentModel {
+                    provider: m.provider.clone(),
+                    model_id: m.id.clone(),
+                })
+                .or_else(|| {
+                    Some(CurrentModel {
+                        provider: prov.to_owned(),
+                        model_id: id.to_owned(),
+                    })
+                })
+        } else {
+            find_current_model_entry(&self.model_catalog, None, trimmed).map(|m| CurrentModel {
+                provider: m.provider.clone(),
+                model_id: m.id.clone(),
+            })
+        };
+        let thinking_level = pa_types::ai::thinking_level_from_str(current_thinking.trim())
+            .or_else(|| {
+                self.default_thinking_level
+                    .as_deref()
+                    .and_then(pa_types::ai::thinking_level_from_str)
+            })
+            .or(Some(pa_types::ai::ModelThinkingLevel::Medium));
+        let options = ModelPickerOptions {
+            models: self.model_catalog.clone(),
+            current,
+            configured_providers: self.model_configured_providers.clone(),
+            recent_models: self.model_recent_models.clone(),
+            thinking_level,
+            scoped_models: Vec::new(),
+            viewport_rows: picker_viewport_rows(view.terminal_rows()),
+            header: model_pick_header(&target),
+        };
+        let crate::model_picker::ModelCommandOutcome::Open(picker) = ModelPicker::open(options, "");
+        // The page the picker was opened from floats dimmed behind it until it closes.
+        let backdrop = match &target {
+            ModelPickTarget::Chat => None,
+            ModelPickTarget::Captain(_) => self.captain_parked.take().map(Overlay::Captain),
+            ModelPickTarget::Workspace { .. } => {
+                self.workspace_parked.take().map(Overlay::Workspace)
+            }
+        };
+        self.model_pick_target = target;
+        view.overlay = Some(Overlay::ModelPicker(*picker));
+        view.modal_backdrop = backdrop.map(Box::new);
+        self.dirty = true;
+        if self.model_refresh_due(false) {
+            self.spawn_model_catalog_refresh();
+        }
+    }
+
+    /// Hand the page the picker floated over back to its parked slot, where the close path
+    /// restores it as the overlay.
+    fn park_modal_backdrop(&mut self, view: &mut AgentView) {
+        match view.modal_backdrop.take().map(|backdrop| *backdrop) {
+            Some(Overlay::Captain(panel)) => self.captain_parked = Some(panel),
+            Some(Overlay::Workspace(page)) => self.workspace_parked = Some(page),
+            _ => {}
+        }
     }
 
     /// The tray override label: the Ctrl+C exit hint while armed, else the streaming follow-up hint
@@ -124,39 +264,105 @@ impl SessionUi {
                 }
             }
             Some(ModelPickerAction::Cancel) => {
+                self.park_modal_backdrop(view);
                 view.overlay = None;
-                self.picker_restored_draft = false;
                 self.dirty = true;
-            }
-            Some(ModelPickerAction::Apply(applied)) => {
-                view.overlay = None;
-                // Applying fulfills the command either way, so the editor clears (a Cancel keeps
-                // the partial), except the browse-restore path: the user's restored draft stays.
-                if self.picker_restored_draft {
-                    self.picker_restored_draft = false;
-                } else {
-                    view.editor.set_text("");
-                }
-                // The daemon is the source of truth: the local snapshot can lag an
-                // external credential change, so the switch is sent first and the typed
-                // refusal routes the sign-in flow.
-                match self
-                    .try_set_model(&applied.provider, &applied.model_id, view)
-                    .await
-                {
-                    SetModelOutcome::Switched => {
-                        // A user-edited effort applies after the switch, the level row only on
-                        // success.
-                        if let Some(level) = &applied.effort {
-                            self.apply_thinking_level(level, view).await;
+                match std::mem::take(&mut self.model_pick_target) {
+                    ModelPickTarget::Chat => {
+                        self.picker_restored_draft = false;
+                    }
+                    ModelPickTarget::Captain(captain_target) => {
+                        if let Some(mut panel) = self.captain_parked.take() {
+                            let action = match captain_target {
+                                crate::captain_view::CaptainModelTarget::Setup { .. } => {
+                                    panel.cancel_setup_model()
+                                }
+                                crate::captain_view::CaptainModelTarget::SetupFactory {
+                                    ..
+                                } => panel.cancel_setup_factory_model(),
+                                _ => crate::captain_view::CaptainAction::None,
+                            };
+                            view.overlay = Some(Overlay::Captain(panel));
+                            self.run_captain_action(action, view);
                         }
                     }
-                    // The typed refusal: the selection routes to the sign-in flow and applies
-                    // after the login lands.
-                    SetModelOutcome::NeedsSignIn => {
-                        self.begin_model_sign_in(&applied, view).await;
+                    ModelPickTarget::Workspace { .. } => {
+                        if let Some(page) = self.workspace_parked.take() {
+                            view.overlay = Some(Overlay::Workspace(page));
+                        }
                     }
-                    SetModelOutcome::Failed => {}
+                }
+            }
+            Some(ModelPickerAction::Apply(applied)) => {
+                self.park_modal_backdrop(view);
+                view.overlay = None;
+                self.dirty = true;
+                match std::mem::take(&mut self.model_pick_target) {
+                    ModelPickTarget::Chat => {
+                        // Applying fulfills the command either way, so the editor clears (a Cancel keeps
+                        // the partial), except the browse-restore path: the user's restored draft stays.
+                        if self.picker_restored_draft {
+                            self.picker_restored_draft = false;
+                        } else {
+                            view.editor.set_text("");
+                        }
+                        // The daemon is the source of truth: the local snapshot can lag an
+                        // external credential change, so the switch is sent first and the typed
+                        // refusal routes the sign-in flow.
+                        match self
+                            .try_set_model(&applied.provider, &applied.model_id, view)
+                            .await
+                        {
+                            SetModelOutcome::Switched => {
+                                // A user-edited effort applies after the switch, the level row only on
+                                // success.
+                                if let Some(level) = &applied.effort {
+                                    self.apply_thinking_level(level, view).await;
+                                }
+                            }
+                            // The typed refusal: the selection routes to the sign-in flow and applies
+                            // after the login lands.
+                            SetModelOutcome::NeedsSignIn => {
+                                self.begin_model_sign_in(&applied, view).await;
+                            }
+                            SetModelOutcome::Failed => {}
+                        }
+                    }
+                    ModelPickTarget::Captain(captain_target) => {
+                        let full_model = format!("{}/{}", applied.provider, applied.model_id);
+                        let thinking = applied.effort.clone().unwrap_or_default();
+                        if let Some(panel) = self.captain_parked.take() {
+                            view.overlay = Some(Overlay::Captain(panel));
+                        }
+                        self.apply_captain_picked_model(
+                            captain_target,
+                            full_model,
+                            applied.effort.is_some(),
+                            thinking,
+                            view,
+                        );
+                    }
+                    ModelPickTarget::Workspace {
+                        draft,
+                        state_id,
+                        role,
+                        current_thinking,
+                    } => {
+                        let full_model = format!("{}/{}", applied.provider, applied.model_id);
+                        let thinking =
+                            picked_thinking(applied.effort.as_deref(), &current_thinking);
+                        if let Some(mut page) = self.workspace_parked.take() {
+                            let action = page.apply_picked_model(
+                                draft,
+                                state_id,
+                                full_model,
+                                thinking,
+                                role.is_some(),
+                            );
+                            view.overlay = Some(Overlay::Workspace(page));
+                            self.run_workspace_action(action, view);
+                        }
+                    }
                 }
             }
         }
@@ -166,7 +372,7 @@ impl SessionUi {
 
     /// The session's current model, resolved with the same provider-aware match as
     /// [`Self::current_model_entry`].
-    fn current_model(&self, view: &AgentView) -> Option<CurrentModel> {
+    pub(crate) fn current_model(&self, view: &AgentView) -> Option<CurrentModel> {
         let model = self.current_model_entry(view)?;
         Some(CurrentModel {
             provider: model.provider.clone(),
@@ -517,6 +723,52 @@ fn find_current_model_entry<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unedited_effort_keeps_the_current_thinking() {
+        assert_eq!(picked_thinking(None, "high"), "high");
+        assert_eq!(picked_thinking(Some("low"), "high"), "low");
+        assert_eq!(picked_thinking(None, ""), "");
+    }
+
+    #[test]
+    fn non_chat_targets_name_what_the_pick_changes() {
+        use crate::captain_view::CaptainModelTarget;
+        assert_eq!(model_pick_header(&ModelPickTarget::Chat), None);
+        assert_eq!(
+            model_pick_header(&ModelPickTarget::Captain(CaptainModelTarget::FactoryNode {
+                project: "p".into(),
+                name: "ship".into(),
+                state_id: "review-bugs".into(),
+                role: Some("reviewer".into()),
+                current_model: String::new(),
+                current_thinking: String::new(),
+            }))
+            .as_deref(),
+            Some("model \u{203a} ship \u{b7} review-bugs (role: reviewer)")
+        );
+        assert_eq!(
+            model_pick_header(&ModelPickTarget::Captain(CaptainModelTarget::Crew {
+                project: "p".into(),
+                member: "m".into(),
+                label: "parser-fix".into(),
+                current_model: String::new(),
+                current_thinking: String::new(),
+            }))
+            .as_deref(),
+            Some("model \u{203a} crew \u{b7} parser-fix")
+        );
+        assert_eq!(
+            model_pick_header(&ModelPickTarget::Workspace {
+                draft: "gate-check".into(),
+                state_id: "lint".into(),
+                role: None,
+                current_thinking: String::new(),
+            })
+            .as_deref(),
+            Some("model \u{203a} gate-check \u{b7} lint")
+        );
+    }
 
     fn entry(provider: &str, id: &str) -> pa_types::ai::Model {
         serde_json::from_value(serde_json::json!({

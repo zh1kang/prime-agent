@@ -2,12 +2,15 @@
 //! activity dock's machine-library group's destination), the view's key
 //! loop, and the daemon `factory_activity` lane the page's fetches ride
 //! (the `library` action: the machine list on open, one machine's graph
-//! payload on the drill-in).
+//! payload on the drill-in). With no kernel running, both fetches fall
+//! back to `pa thread fsm-edit` on disk: the catalog list, and a
+//! throwaway draft's compiled graph and per-state files.
 
 use std::time::Duration;
 
 use anyhow::Result;
 use serde_json::{Map, Value};
+use tokio::io::AsyncWriteExt;
 
 use pa_types::daemon::DaemonCommand;
 
@@ -125,14 +128,35 @@ impl super::SessionUi {
             // the epoch bump above is what drops it.
             Some(LibraryViewAction::Back) => {}
             Some(LibraryViewAction::Close) => {
-                view.close_overlay_if(|overlay| matches!(overlay, Overlay::Library(_)));
+                if matches!(view.overlay, Some(Overlay::Library(_))) {
+                    self.close_overlay_to_origin(view);
+                }
                 self.library_view_session = None;
             }
             Some(LibraryViewAction::DrillIn { name }) => {
                 self.spawn_library_graph_fetch(name);
             }
+            Some(LibraryViewAction::Edit { name }) => {
+                view.close_overlay_if(|overlay| matches!(overlay, Overlay::Library(_)));
+                self.library_view_session = None;
+                self.open_workspace(crate::workspace_view::WorkspaceView::machines(&name), view);
+            }
+            Some(LibraryViewAction::Run { .. }) => {
+                view.close_overlay_if(|overlay| matches!(overlay, Overlay::Library(_)));
+                self.library_view_session = None;
+                self.open_factory_launch(view);
+            }
         }
         Ok(())
+    }
+
+    /// What a background `pa thread` call needs from this session.
+    fn pa_thread(&self) -> PaThread {
+        PaThread {
+            cwd: self.cwd.clone(),
+            session_file: self.session_file.clone(),
+            socket: self.daemon_socket.clone(),
+        }
     }
 
     /// Fetch a graph off the input path. Selection changes and page mounts fence its reply.
@@ -142,6 +166,7 @@ impl super::SessionUi {
         let session = self.session_id.clone();
         let epoch = self.library_detail_epoch;
         let tx = self.library_updates.clone();
+        let pa = self.pa_thread();
         tokio::spawn(async move {
             let fetched = client.request_ok(DaemonCommand::FactoryActivity {
                 id: None,
@@ -156,6 +181,9 @@ impl super::SessionUi {
                 match tokio::time::timeout(Duration::from_millis(UI_REQUEST_TIMEOUT_MS), fetched)
                     .await
                 {
+                    Ok(Err(error)) if crate::daemon_client::is_kernel_not_running(&error) => {
+                        pa.machine_graph(&name).await
+                    }
                     Ok(reply) => reply.map_err(|error| format!("{error:#}")),
                     Err(_) => {
                         Err("timed out waiting for the Prime Agent daemon response".to_string())
@@ -180,6 +208,7 @@ impl super::SessionUi {
         let active_session_id = self.active_session_id.clone();
         let epoch = self.library_list_epoch;
         let tx = self.library_updates.clone();
+        let pa = self.pa_thread();
         tokio::spawn(async move {
             let fetched = client.request_ok(DaemonCommand::FactoryActivity {
                 id: None,
@@ -198,6 +227,20 @@ impl super::SessionUi {
                     epoch,
                     data,
                 },
+                Ok(Err(error)) if crate::daemon_client::is_kernel_not_running(&error) => {
+                    match pa.run(&["fsm-edit", "list"], &serde_json::json!({})).await {
+                        Ok(data) => LibraryUpdate::Machines {
+                            session: active_session_id,
+                            epoch,
+                            data,
+                        },
+                        Err(message) => LibraryUpdate::Error {
+                            session: active_session_id,
+                            epoch,
+                            message,
+                        },
+                    }
+                }
                 Ok(Err(error)) => LibraryUpdate::Error {
                     session: active_session_id,
                     epoch,
@@ -280,5 +323,81 @@ impl super::SessionUi {
             }
         }
         self.dirty = true;
+    }
+}
+
+/// A background `pa thread` call's context: the chat's directory, session
+/// file, and daemon socket.
+struct PaThread {
+    cwd: std::path::PathBuf,
+    session_file: Option<String>,
+    socket: std::path::PathBuf,
+}
+
+impl PaThread {
+    /// Run `pa thread ARGS` with `input` as JSON on stdin and parse its JSON answer.
+    async fn run(&self, args: &[&str], input: &Value) -> std::result::Result<Value, String> {
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let mut command = tokio::process::Command::new(exe);
+        command
+            .arg("thread")
+            .args(args)
+            .current_dir(&self.cwd)
+            .env_remove("PA_CAPTAIN_ACTOR")
+            .env("PA_CAPTAIN_NATIVE_SOCKET", &self.socket)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        if let Some(session) = &self.session_file {
+            command.env("PA_CAPTAIN_SESSION", session);
+        }
+        let mut child = command
+            .spawn()
+            .map_err(|e| format!("Could not start pa: {e}"))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(input.to_string().as_bytes())
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        let output = tokio::time::timeout(
+            Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
+            child.wait_with_output(),
+        )
+        .await
+        .map_err(|_| "timed out reading the machine library from disk".to_string())?
+        .map_err(|e| e.to_string())?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let message = stderr.trim();
+            return Err(if message.is_empty() {
+                format!("pa thread {} exited with {}", args.join(" "), output.status)
+            } else {
+                message.lines().last().unwrap_or(message).to_owned()
+            });
+        }
+        serde_json::from_slice::<Value>(&output.stdout)
+            .map_err(|e| format!("pa thread returned invalid JSON: {e}"))
+    }
+
+    /// One machine's compiled graph and per-state files from disk: a
+    /// throwaway `fsm-edit` draft, discarded as soon as it is read.
+    async fn machine_graph(&self, name: &str) -> std::result::Result<Value, String> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        let draft = self
+            .run(
+                &["fsm-edit", "draft"],
+                &serde_json::json!({"name": name, "target": format!("pa-view-{nanos}")}),
+            )
+            .await?;
+        if let Some(dir) = draft.get("draft").and_then(Value::as_str) {
+            let _ = self
+                .run(&["fsm-edit", "discard"], &serde_json::json!({"draft": dir}))
+                .await;
+        }
+        Ok(draft)
     }
 }

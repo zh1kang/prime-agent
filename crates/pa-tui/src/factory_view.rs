@@ -41,6 +41,7 @@ pub(crate) mod node;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use blocks::{BlockDiagram, DiagramRenderOptions};
 pub use library::{
     library_reply_lists_machines, parse_library_machines, LibraryMachine, LibraryView,
     LibraryViewAction, MALFORMED_LIBRARY_REPLY_ERROR,
@@ -67,16 +68,39 @@ pub fn machine_graph(spec: &Value) -> Option<String> {
     )
 }
 
-/// The static diagram of a machine spec (`pa factory compile`): the live page's boxes and
-/// wires with no run overlay. `None` when the spec has no states or transitions list.
+/// The static diagram of a machine spec (`pa factory compile`): a thin adapter over
+/// `blocks::block_diagram_with_options`. `None` when the spec has no states or transitions.
 pub(crate) fn machine_graph_lines(theme: &Theme, spec: &Value) -> Option<Vec<Line>> {
+    Some(machine_block_diagram(theme, spec, &DiagramRenderOptions::default())?.lines)
+}
+
+/// Parse a compiled machine spec and render it through the shared block diagram
+/// renderer (`blocks.rs`) with selection highlight, live overlay, and width fitting.
+pub(crate) fn machine_block_diagram(
+    theme: &Theme,
+    spec: &Value,
+    options: &DiagramRenderOptions<'_>,
+) -> Option<BlockDiagram> {
     let states: Vec<_> = spec
         .get("states")?
         .as_array()?
         .iter()
         .map(|row| {
             let mut state = FactoryState::parse(row)?;
-            state.model = scrubbed_string(row.pointer("/subagent/model"));
+            state.model = scrubbed_string(row.pointer("/subagent/model"))
+                .or_else(|| scrubbed_string(row.pointer("/subagent/role")));
+            if state.model.is_none() && row.get("python").is_none() {
+                state.model = options.inherit_model.map(inherit_label);
+            }
+            // The thinking level rides the model badge: the state's own, else its role's.
+            let thinking = scrubbed_string(row.pointer("/subagent/thinking")).or_else(|| {
+                let role = scrubbed_string(row.pointer("/subagent/role"))?;
+                scrubbed_string(spec.get("roles")?.get(role.as_str())?.get("thinking"))
+            });
+            if let (Some(model), Some(thinking)) = (state.model.as_mut(), thinking) {
+                model.push_str(" \u{b7} ");
+                model.push_str(&thinking);
+            }
             // A compiled python state names its node as {import, callable, path}.
             if let (Some(module), Some(callable)) = (
                 scrubbed_string(row.pointer("/python/import")),
@@ -93,7 +117,337 @@ pub(crate) fn machine_graph_lines(theme: &Theme, spec: &Value) -> Option<Vec<Lin
         .iter()
         .map(FactoryTransition::parse)
         .collect::<Option<_>>()?;
-    Some(blocks::block_diagram(theme, &states, &edges).lines)
+    Some(blocks::block_diagram_with_options(
+        theme, &states, &edges, options,
+    ))
+}
+
+/// How a step that names no model or role shows the model it inherits.
+pub(crate) fn inherit_label(model: &str) -> String {
+    let model = crate::menu_panel::scrub_controls(model);
+    let short = model.rsplit('/').next().unwrap_or(&model);
+    if short.is_empty() {
+        "inherit (pa default)".to_string()
+    } else {
+        format!("inherit ({short})")
+    }
+}
+
+/// Format the machine header (`machine: <name> — <desc>`) and `params:` line
+/// shown above the diagram.
+pub(crate) fn machine_header_lines(
+    theme: &Theme,
+    width: usize,
+    name: &str,
+    description: &str,
+    params: &[Value],
+) -> Vec<Line> {
+    let scrub = |s: &str| crate::menu_panel::scrub_controls(s);
+    let mut head: Line = vec![
+        Span::raw(" "),
+        theme.fg_span(ThemeColor::ToolTitle, "machine: ".to_string()),
+        theme.bold(theme.fg_span(ThemeColor::Text, scrub(name))),
+    ];
+    let desc = scrub(description);
+    if !desc.trim().is_empty() {
+        head.push(theme.fg_span(ThemeColor::Muted, format!(" — {}", desc.trim())));
+    }
+    let mut lines = vec![truncate_line(&head, width, "…")];
+    if !params.is_empty() {
+        let formatted: Vec<String> = params
+            .iter()
+            .filter_map(|p| {
+                let pname = scrub(p.get("name")?.as_str()?);
+                let ptype = scrub(p.get("type").and_then(Value::as_str).unwrap_or("text"));
+                let required = p.get("required").and_then(Value::as_bool).unwrap_or(false);
+                if required {
+                    Some(format!("{pname}: {ptype} (required)"))
+                } else if let Some(default) = p.get("default") {
+                    let rendered = match default {
+                        Value::String(s) => format!("{:?}", scrub(s)),
+                        other => scrub(&other.to_string()),
+                    };
+                    Some(format!("{pname}: {ptype} = {rendered}"))
+                } else {
+                    Some(format!("{pname}: {ptype}"))
+                }
+            })
+            .collect();
+        if !formatted.is_empty() {
+            let params_line = vec![
+                Span::raw(" "),
+                theme.fg_span(ThemeColor::ToolTitle, "params: ".to_string()),
+                theme.fg_span(ThemeColor::Muted, formatted.join(", ")),
+            ];
+            lines.push(truncate_line(&params_line, width, "…"));
+        }
+    }
+    lines
+}
+
+/// Render one static node's detail view (kind, model/role/thinking, budget,
+/// inputs, outputs, route/next, and source files) for `Enter files`.
+pub(crate) fn render_node_detail_lines(
+    theme: &Theme,
+    width: usize,
+    state_id: &str,
+    detail: &Value,
+) -> Vec<Line> {
+    let scrub = |s: &str| crate::menu_panel::scrub_controls(s);
+    let mut out: Vec<Line> = Vec::new();
+    let kind = scrub(
+        detail
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("agent"),
+    );
+    let mut title = vec![
+        Span::raw(" "),
+        theme.fg_span(ThemeColor::ToolTitle, "node: ".to_string()),
+        theme.bold(theme.fg_span(ThemeColor::Accent, scrub(state_id))),
+        theme.fg_span(ThemeColor::Muted, format!("  ({kind})")),
+    ];
+    if detail
+        .get("entry")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        title.push(theme.fg_span(ThemeColor::Warning, "  entry".to_string()));
+    }
+    out.push(truncate_line(&title, width, "…"));
+
+    let mut meta_parts: Vec<String> = Vec::new();
+    if kind == "python" {
+        if let Some(run) = detail
+            .get("run")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            meta_parts.push(format!("run: {}", scrub(run)));
+        }
+    } else {
+        let model = detail.get("model").and_then(Value::as_str).unwrap_or("");
+        let role = detail.get("role").and_then(Value::as_str).unwrap_or("");
+        let thinking = detail.get("thinking").and_then(Value::as_str).unwrap_or("");
+        let model_desc = match (model.is_empty(), role.is_empty()) {
+            (false, false) => format!("{} (role: {})", scrub(model), scrub(role)),
+            (false, true) => scrub(model),
+            (true, false) => format!("role: {}", scrub(role)),
+            (true, true) => inherit_label(
+                detail
+                    .get("inherit_model")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            ),
+        };
+        meta_parts.push(format!("model: {model_desc}"));
+        if !thinking.is_empty() {
+            meta_parts.push(format!("thinking: {}", scrub(thinking)));
+        }
+    }
+    if let Some(budget) = detail
+        .get("budget")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        meta_parts.push(format!("budget: {}", scrub(budget)));
+    }
+    if let Some(max_e) = detail.get("max_entries").and_then(Value::as_u64) {
+        meta_parts.push(format!("max_entries: {max_e}"));
+    }
+    if let Some(retries) = detail.get("retries").and_then(Value::as_u64) {
+        meta_parts.push(format!("retries: {retries}"));
+    }
+    if !meta_parts.is_empty() {
+        out.push(truncate_line(
+            &vec![
+                Span::raw(" "),
+                theme.fg_span(ThemeColor::Muted, meta_parts.join(" · ")),
+            ],
+            width,
+            "…",
+        ));
+    }
+
+    if let Some(inputs) = detail.get("inputs").and_then(Value::as_object) {
+        if !inputs.is_empty() {
+            out.push(Vec::new());
+            out.push(vec![
+                Span::raw(" "),
+                theme.fg_span(ThemeColor::ToolTitle, "inputs".to_string()),
+            ]);
+            for (k, v) in inputs {
+                let src = v
+                    .as_str()
+                    .map(scrub)
+                    .unwrap_or_else(|| scrub(&v.to_string()));
+                out.push(truncate_line(
+                    &vec![
+                        Span::raw("   "),
+                        theme.fg_span(ThemeColor::Text, scrub(k)),
+                        theme.fg_span(ThemeColor::Dim, " <- ".to_string()),
+                        theme.fg_span(ThemeColor::Muted, src),
+                    ],
+                    width,
+                    "…",
+                ));
+            }
+        }
+    }
+
+    if let Some(outputs) = detail.get("outputs").and_then(Value::as_object) {
+        if !outputs.is_empty() {
+            out.push(Vec::new());
+            out.push(vec![
+                Span::raw(" "),
+                theme.fg_span(ThemeColor::ToolTitle, "outputs".to_string()),
+            ]);
+            for (k, v) in outputs {
+                let ty = v
+                    .as_str()
+                    .map(scrub)
+                    .unwrap_or_else(|| scrub(&v.to_string()));
+                out.push(truncate_line(
+                    &vec![
+                        Span::raw("   "),
+                        theme.fg_span(ThemeColor::Text, scrub(k)),
+                        theme.fg_span(ThemeColor::Dim, ": ".to_string()),
+                        theme.fg_span(ThemeColor::Muted, ty),
+                    ],
+                    width,
+                    "…",
+                ));
+            }
+        }
+    }
+
+    let has_route = detail.get("route").is_some_and(Value::is_object);
+    let has_next = detail.get("next").is_some_and(|v| !v.is_null());
+    let has_join = detail.get("join").is_some_and(Value::is_array);
+    if has_route || has_next || has_join {
+        out.push(Vec::new());
+        out.push(vec![
+            Span::raw(" "),
+            theme.fg_span(ThemeColor::ToolTitle, "transitions".to_string()),
+        ]);
+        if let Some(join) = detail.get("join").and_then(Value::as_array) {
+            let names: Vec<String> = join.iter().filter_map(Value::as_str).map(scrub).collect();
+            out.push(truncate_line(
+                &vec![
+                    Span::raw("   "),
+                    theme.fg_span(ThemeColor::Warning, "join: ".to_string()),
+                    theme.fg_span(ThemeColor::Muted, names.join(", ")),
+                ],
+                width,
+                "…",
+            ));
+        }
+        if let Some(next) = detail.get("next") {
+            let targets = match next {
+                Value::String(s) => scrub(s),
+                Value::Array(arr) => arr
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(scrub)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                _ => String::new(),
+            };
+            if !targets.is_empty() {
+                out.push(truncate_line(
+                    &vec![
+                        Span::raw("   "),
+                        theme.fg_span(ThemeColor::Dim, "next -> ".to_string()),
+                        theme.fg_span(ThemeColor::Text, targets),
+                    ],
+                    width,
+                    "…",
+                ));
+            }
+        }
+        if let Some(route) = detail.get("route").and_then(Value::as_object) {
+            let on = route
+                .get("on")
+                .and_then(Value::as_str)
+                .map(scrub)
+                .unwrap_or_default();
+            out.push(truncate_line(
+                &vec![
+                    Span::raw("   "),
+                    theme.fg_span(ThemeColor::Dim, "route on ".to_string()),
+                    theme.fg_span(ThemeColor::Text, on),
+                ],
+                width,
+                "…",
+            ));
+            for (k, v) in route {
+                if k == "on" {
+                    continue;
+                }
+                if let Some(target) = v.as_str() {
+                    out.push(truncate_line(
+                        &vec![
+                            Span::raw("     "),
+                            theme.fg_span(ThemeColor::Warning, scrub(k)),
+                            theme.fg_span(ThemeColor::Dim, " -> ".to_string()),
+                            theme.fg_span(ThemeColor::Text, scrub(target)),
+                        ],
+                        width,
+                        "…",
+                    ));
+                }
+            }
+        }
+    }
+
+    if let Some(files) = detail.get("files").and_then(Value::as_array) {
+        for file in files {
+            let label = scrub(file.get("label").and_then(Value::as_str).unwrap_or("file"));
+            let content = scrub(file.get("content").and_then(Value::as_str).unwrap_or(""));
+            let truncated = file
+                .get("truncated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            out.push(Vec::new());
+            out.push(truncate_line(
+                &vec![Span::raw(" "), theme.fg_span(ThemeColor::ToolTitle, label)],
+                width,
+                "…",
+            ));
+            for line in content.lines() {
+                let row = vec![
+                    Span::raw("   "),
+                    theme.fg_span(ThemeColor::MdCodeBlock, line.to_string()),
+                ];
+                out.extend(crate::width::wrap_line(&row, width));
+            }
+            if truncated {
+                out.push(vec![
+                    Span::raw("   "),
+                    theme.fg_span(ThemeColor::Warning, "[truncated at 64 KiB]".to_string()),
+                ]);
+            }
+        }
+    }
+    out
+}
+
+/// Keep the selected node's `[top, bottom)` span inside `[scroll, scroll + visible)`.
+pub(crate) fn scroll_to_span(
+    scroll: usize,
+    top: usize,
+    bottom: usize,
+    visible: usize,
+    total: usize,
+) -> usize {
+    let max_scroll = total.saturating_sub(visible);
+    let mut next = scroll.min(max_scroll);
+    if top < next {
+        next = top;
+    } else if bottom > next + visible {
+        next = bottom.saturating_sub(visible);
+    }
+    next.min(max_scroll)
 }
 
 /// Render one run's fused snapshot (the kernel `factory.graph` shape) as the
@@ -141,6 +495,10 @@ pub struct FactoryRunSnapshot {
     pub last_fired: Vec<FactoryEdge>,
     pub milestones: Vec<String>,
     pub nodes: std::collections::HashMap<String, FactoryNodeState>,
+    /// Human names and elapsed milliseconds of the instances' children, by child id, when
+    /// the graph carries them.
+    pub child_names: std::collections::HashMap<String, String>,
+    pub child_elapsed: std::collections::HashMap<String, u64>,
 }
 
 impl FactoryRunSnapshot {
@@ -428,12 +786,34 @@ fn parse_run(run: &Value) -> Option<FactoryRunSnapshot> {
         .map(|rows| rows.iter().filter_map(FactoryEdge::parse).collect())
         .unwrap_or_default();
     let mut nodes = std::collections::HashMap::new();
+    let mut child_names = std::collections::HashMap::new();
+    let mut child_elapsed = std::collections::HashMap::new();
     for node in run
         .get("nodes")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
     {
+        for instance in node
+            .get("instances")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(child) = opt_string(instance.get("child")) else {
+                continue;
+            };
+            if let Some(name) = scrubbed_string(get_either(instance, "child_name", "childName"))
+                .filter(|name| !name.trim().is_empty())
+            {
+                child_names.insert(child.clone(), name);
+            }
+            if let Some(ms) =
+                get_either(instance, "duration_ms", "durationMs").and_then(Value::as_u64)
+            {
+                child_elapsed.insert(child, ms);
+            }
+        }
         if let (Some(id), Some(node)) = (
             scrubbed_string(node.get("id")),
             FactoryNodeState::parse(node),
@@ -467,6 +847,8 @@ fn parse_run(run: &Value) -> Option<FactoryRunSnapshot> {
         last_fired,
         milestones,
         nodes,
+        child_names,
+        child_elapsed,
     })
 }
 
@@ -501,7 +883,21 @@ pub enum FactoryViewAction {
     Resume {
         run_id: String,
     },
+    /// Resume the selected (paused) run with a reviewer note for the retried step.
+    ResumeWithNote {
+        run_id: String,
+        note: String,
+    },
     Close,
+}
+
+/// The Captain run a factory page was opened on from the Captain panel: its
+/// close returns to the parked panel, and a resume note rides the Captain's
+/// own answer path.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CaptainRunOrigin {
+    pub project: String,
+    pub member: Option<String>,
 }
 
 /// One selectable row, by identity: a run's header (`state_id` `None`)
@@ -541,6 +937,12 @@ pub struct FactoryView {
     viewport_rows: usize,
     /// The open node inspection view, if the selected run state is open.
     pub node: Option<node::NodeView>,
+    /// The page was opened from the Captain panel: its close returns there.
+    returns_to_captain: bool,
+    /// The Captain run this page was opened on, when it came from the panel.
+    captain_run: Option<CaptainRunOrigin>,
+    /// The reviewer note being typed for the selected paused run (`m`).
+    resume_note: Option<String>,
 }
 
 impl FactoryView {
@@ -559,9 +961,69 @@ impl FactoryView {
             error: None,
             viewport_rows,
             node: None,
+            returns_to_captain: false,
+            captain_run: None,
+            resume_note: None,
         };
         view.selected = view.rows().into_iter().next();
         view
+    }
+
+    /// Mark the page as opened from the Captain panel, optionally on one
+    /// Captain run: `Esc`/`←` then return to the parked panel.
+    pub fn set_captain_origin(&mut self, run: Option<CaptainRunOrigin>) {
+        self.returns_to_captain = true;
+        self.captain_run = run;
+    }
+
+    /// Whether closing the page returns to the parked Captain panel.
+    #[must_use]
+    pub fn returns_to_captain(&self) -> bool {
+        self.returns_to_captain
+    }
+
+    /// The Captain run this page was opened on, if any.
+    #[must_use]
+    pub fn captain_run(&self) -> Option<&CaptainRunOrigin> {
+        self.captain_run.as_ref()
+    }
+
+    /// The reviewer note being typed, while the note prompt is open.
+    #[must_use]
+    pub fn resume_note(&self) -> Option<&str> {
+        self.resume_note.as_deref()
+    }
+
+    /// The note prompt owns every key: text edits the note, Enter resumes
+    /// the selected run with it, Esc cancels the prompt.
+    fn handle_note_key(&mut self, key: &str, kb: &KeybindingsManager) -> FactoryViewAction {
+        if key == "ctrl+c" || kb.matches(key, "tui.select.cancel") {
+            self.resume_note = None;
+            return FactoryViewAction::None;
+        }
+        if kb.matches(key, "tui.select.confirm") {
+            let note = self.resume_note.take().unwrap_or_default();
+            return match self.selected_run() {
+                Some(run) if Self::available_actions(run).contains(&FactoryAction::Resume) => {
+                    FactoryViewAction::ResumeWithNote {
+                        run_id: run.run_id.clone(),
+                        note: note.trim().to_string(),
+                    }
+                }
+                _ => FactoryViewAction::None,
+            };
+        }
+        let Some(note) = self.resume_note.as_mut() else {
+            return FactoryViewAction::None;
+        };
+        if key == "backspace" {
+            note.pop();
+        } else if key == "space" {
+            note.push(' ');
+        } else if let Some(ch) = single_char(key) {
+            note.push(ch);
+        }
+        FactoryViewAction::None
     }
 
     /// The run-level actions the page offers on one run: resume on a
@@ -698,49 +1160,11 @@ impl FactoryView {
     /// state), and any other key only disarms. `r` resumes a paused run.
     #[must_use]
     pub fn handle_key(&mut self, key: &str, kb: &KeybindingsManager) -> FactoryViewAction {
+        if self.resume_note.is_some() {
+            return self.handle_note_key(key, kb);
+        }
         if kb.matches(key, "app.factory.toggle") {
             return FactoryViewAction::Close;
-        }
-        if let Some(offset) = self.graph_offset {
-            match key {
-                "g" | "escape" | "left" | "q" => self.graph_offset = None,
-                "down" | "pagedown" => {
-                    let height = self.selected_run().map_or(0, |run| {
-                        blocks::block_diagram(
-                            &Theme::builtin("prime", crate::theme::ColorMode::TrueColor),
-                            &run.states,
-                            &run.transitions,
-                        )
-                        .lines
-                        .len()
-                    });
-                    let step = if key == "down" {
-                        1
-                    } else {
-                        self.viewport_rows.max(1)
-                    };
-                    self.graph_offset =
-                        Some(offset.saturating_add(step).min(
-                            height.saturating_sub(self.viewport_rows.saturating_sub(1).max(1)),
-                        ));
-                }
-                "up" | "pageup" => {
-                    self.graph_offset = Some(offset.saturating_sub(if key == "up" {
-                        1
-                    } else {
-                        self.viewport_rows.max(1)
-                    }))
-                }
-                "e" => {
-                    return FactoryViewAction::Edit(
-                        self.selected_run()
-                            .map(|run| run.spec_id.clone())
-                            .unwrap_or_default(),
-                    )
-                }
-                _ => {}
-            }
-            return FactoryViewAction::None;
         }
         if let Some(node) = self.node.as_mut() {
             if key == "ctrl+c" || kb.matches(key, "tui.select.cancel") {
@@ -779,6 +1203,81 @@ impl FactoryView {
                             child_id: child_id.to_string(),
                         }
                     });
+            }
+            return FactoryViewAction::None;
+        }
+        if let Some(offset) = self.graph_offset {
+            if key == "g" || key == "q" || key == "left" || kb.matches(key, "tui.select.cancel") {
+                self.graph_offset = None;
+                return FactoryViewAction::None;
+            }
+            if kb.matches(key, "tui.select.confirm") {
+                return self.open_selected_node();
+            }
+            if key == "o" || key == "right" {
+                return self.open_selected();
+            }
+            if key == "e" {
+                return FactoryViewAction::Edit(
+                    self.selected_run()
+                        .map(|run| run.spec_id.clone())
+                        .unwrap_or_default(),
+                );
+            }
+            let Some(run) = self.selected_run().cloned() else {
+                return FactoryViewAction::None;
+            };
+            let diagram = blocks::block_diagram(
+                &Theme::builtin("prime", crate::theme::ColorMode::TrueColor),
+                &run.states,
+                &run.transitions,
+            );
+            let visible = self.viewport_rows.saturating_sub(3).max(1);
+            let total = diagram.lines.len();
+            if kb.matches(key, "tui.select.down") || key == "j" {
+                if !diagram.node_spans.is_empty() {
+                    let cur = self
+                        .selected
+                        .as_ref()
+                        .and_then(|r| r.state_id.as_deref())
+                        .and_then(|id| diagram.node_spans.iter().position(|(s, _, _)| s == id));
+                    let next_idx = cur.map_or(0, |i| (i + 1).min(diagram.node_spans.len() - 1));
+                    let (ref id, top, bottom) = diagram.node_spans[next_idx];
+                    self.selected = Some(FactoryRow {
+                        run_id: run.run_id.clone(),
+                        state_id: Some(id.clone()),
+                    });
+                    self.graph_offset = Some(scroll_to_span(offset, top, bottom, visible, total));
+                }
+                return FactoryViewAction::None;
+            }
+            if kb.matches(key, "tui.select.up") || key == "k" {
+                if !diagram.node_spans.is_empty() {
+                    let cur = self
+                        .selected
+                        .as_ref()
+                        .and_then(|r| r.state_id.as_deref())
+                        .and_then(|id| diagram.node_spans.iter().position(|(s, _, _)| s == id));
+                    let next_idx = cur.map_or(0, |i| i.saturating_sub(1));
+                    let (ref id, top, bottom) = diagram.node_spans[next_idx];
+                    self.selected = Some(FactoryRow {
+                        run_id: run.run_id.clone(),
+                        state_id: Some(id.clone()),
+                    });
+                    self.graph_offset = Some(scroll_to_span(offset, top, bottom, visible, total));
+                }
+                return FactoryViewAction::None;
+            }
+            if key == "pagedown" || kb.matches(key, "tui.select.pageDown") {
+                let step = visible.max(1);
+                self.graph_offset = Some(
+                    offset
+                        .saturating_add(step)
+                        .min(total.saturating_sub(visible)),
+                );
+            } else if key == "pageup" || kb.matches(key, "tui.select.pageUp") {
+                let step = visible.max(1);
+                self.graph_offset = Some(offset.saturating_sub(step));
             }
             return FactoryViewAction::None;
         }
@@ -842,6 +1341,14 @@ impl FactoryView {
                 }
                 _ => FactoryViewAction::None,
             },
+            "m" => {
+                if self.selected_run().is_some_and(|run| {
+                    Self::available_actions(run).contains(&FactoryAction::Resume)
+                }) {
+                    self.resume_note = Some(String::new());
+                }
+                FactoryViewAction::None
+            }
             _ => FactoryViewAction::None,
         }
     }
@@ -931,20 +1438,6 @@ impl FactoryView {
     /// trailing key hint.
     #[must_use]
     pub fn render(&self, theme: &Theme, width: usize, kb: &KeybindingsManager) -> Vec<Line> {
-        if let (Some(offset), Some(run)) = (self.graph_offset, self.selected_run()) {
-            let graph = blocks::block_diagram(theme, &run.states, &run.transitions);
-            let visible = self.viewport_rows.saturating_sub(1).max(1);
-            let start = offset.min(graph.lines.len().saturating_sub(visible));
-            let mut lines: Vec<_> = graph
-                .lines
-                .into_iter()
-                .skip(start)
-                .take(visible)
-                .map(|line| truncate_line(&line, width, "…"))
-                .collect();
-            lines.push(vec![Span::raw("↑/↓ scroll · e edit machine · g back")]);
-            return lines;
-        }
         if let Some(node) = &self.node {
             let viewport_rows = self
                 .viewport_rows
@@ -967,6 +1460,61 @@ impl FactoryView {
                 rows.drain(..rows.len() - self.viewport_rows);
             }
             return rows;
+        }
+        if let (Some(offset), Some(run)) = (self.graph_offset, self.selected_run()) {
+            let selected_state = self
+                .selected
+                .as_ref()
+                .and_then(|row| row.state_id.as_deref())
+                .or_else(|| run.states.first().map(|s| s.id.as_str()));
+            let graph = blocks::block_diagram_with_options(
+                theme,
+                &run.states,
+                &run.transitions,
+                &DiagramRenderOptions {
+                    selected_state,
+                    live_nodes: Some(&run.nodes),
+                    max_width: Some(width.saturating_sub(2)),
+                    inherit_model: None,
+                },
+            );
+            let mut header = vec![
+                Span::raw(" "),
+                theme.fg_span(ThemeColor::ToolTitle, "machine: ".to_string()),
+                theme.bold(theme.fg_span(ThemeColor::Text, run.display_name())),
+            ];
+            if let Some(state) = &run.state {
+                header.push(
+                    theme.fg_span(run_state_color(Some(state.as_str())), format!(" — {state}")),
+                );
+            }
+            let mut lines = vec![truncate_line(&header, width, "…"), Vec::new()];
+            let visible = self.viewport_rows.saturating_sub(lines.len() + 1).max(1);
+            let start = offset.min(graph.lines.len().saturating_sub(visible));
+            lines.extend(
+                graph
+                    .lines
+                    .into_iter()
+                    .skip(start)
+                    .take(visible)
+                    .map(|line| {
+                        let mut row = vec![Span::raw(" ")];
+                        row.extend(line);
+                        truncate_line(&row, width, "…")
+                    }),
+            );
+            lines.push(truncate_line(
+                &vec![
+                    Span::raw(" "),
+                    theme.fg_span(
+                        ThemeColor::Dim,
+                        "↑/↓ node · PageUp/PageDown scroll · Enter inspect · →/o session · e edit · Esc back",
+                    ),
+                ],
+                width,
+                "…",
+            ));
+            return lines;
         }
         // The panel area: one panel per run; the selected row's line (and
         // its panel's start) is recorded for the budget window below.
@@ -1056,6 +1604,16 @@ impl FactoryView {
                 .map_or_else(|| fallback.to_string(), |key| format_key_text(&key))
         };
         let stop_key = key("app.agents.delete", "ctrl+x");
+        if let Some(note) = &self.resume_note {
+            return (
+                format!(
+                    "resume note: {note}\u{2588}  {} resume \u{b7} {} cancel",
+                    key("tui.select.confirm", "Enter"),
+                    key("tui.select.cancel", "Esc"),
+                ),
+                ThemeColor::Warning,
+            );
+        }
         if let Some((armed, _)) = &self.armed {
             return (
                 format!(
@@ -1087,7 +1645,7 @@ impl FactoryView {
             .selected_run()
             .is_some_and(|run| Self::available_actions(run).contains(&FactoryAction::Resume))
         {
-            parts.push("r resume".to_string());
+            parts.push("r resume · m resume with note".to_string());
         }
         (parts.join(" \u{b7} "), ThemeColor::Dim)
     }
@@ -1213,7 +1771,7 @@ impl FactoryView {
                 Some(node) if node.latest_child().is_none() => {
                     (node_glyph(&node.status).0, ThemeColor::Dim)
                 }
-                Some(node) if node.is_active() => ("●", ThemeColor::Accent),
+                Some(node) if node.is_active() => ("◐", ThemeColor::Accent),
                 Some(node) => node_glyph(&node.status),
                 None => ("○", ThemeColor::Dim),
             };
@@ -1251,11 +1809,46 @@ impl FactoryView {
             }
             let status_text =
                 node.map_or_else(|| "pending".to_string(), |node| node.status_line(state));
-            row.push(theme.fg_span(color, format!("  {status_text}")));
+            let running = node.is_some_and(|node| node.is_active() && node.running_agents() > 0);
+            if running {
+                row.push(theme.bold(theme.fg_span(color, "  RUNNING".to_string())));
+                if let Some(model) = &state.model {
+                    if state.subagent.as_deref() != Some(model.as_str()) {
+                        row.push(theme.fg_span(ThemeColor::MdLink, format!(" {model}")));
+                    }
+                }
+            } else {
+                row.push(theme.fg_span(color, format!("  {status_text}")));
+            }
             if state.entry {
                 row.push(theme.fg_span(ThemeColor::Dim, "  [entry]".to_string()));
             }
             rows.push(row);
+            // Each running child by its human name, with its elapsed time.
+            for instance in node
+                .filter(|_| running)
+                .map(|node| node.instances.as_slice())
+                .unwrap_or_default()
+                .iter()
+                .filter(|instance| instance.status == "running")
+            {
+                let Some(child) = instance.child.as_deref() else {
+                    continue;
+                };
+                let name = run.child_names.get(child).map_or(child, String::as_str);
+                let mut line: Line = vec![
+                    Span::raw("   "),
+                    Span::raw("│   "),
+                    theme.fg_span(ThemeColor::Accent, "↳ ".to_string()),
+                    theme.fg_span(ThemeColor::Text, name.to_string()),
+                ];
+                if let Some(ms) = run.child_elapsed.get(child).filter(|ms| **ms > 0) {
+                    line.push(
+                        theme.fg_span(ThemeColor::Dim, format!(" · {}", format_duration(*ms))),
+                    );
+                }
+                rows.push(line);
+            }
             // The outgoing edges under the source: single-source transitions
             // render once; a join (a multi-source from list) renders once
             // under its last source with the join label.
@@ -1302,6 +1895,13 @@ impl FactoryView {
     }
 }
 
+/// The one printable character a key id names (`a`, `A`, `?`), if any.
+fn single_char(key: &str) -> Option<char> {
+    let mut chars = key.chars();
+    let ch = chars.next()?;
+    (chars.next().is_none() && !ch.is_control()).then_some(ch)
+}
+
 /// A compact duration: seconds under a minute, minutes under an hour.
 fn format_duration(ms: u64) -> String {
     let seconds = ms / 1_000;
@@ -1311,5 +1911,124 @@ fn format_duration(ms: u64) -> String {
         format!("{}m{:02}s", seconds / 60, seconds % 60)
     } else {
         format!("{}h{:02}m", seconds / 3_600, (seconds % 3_600) / 60)
+    }
+}
+
+#[cfg(test)]
+mod captain_origin_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn paused_view() -> FactoryView {
+        let reply = json!({"runs": [{
+            "runId": "run-gate",
+            "specId": "gate-check",
+            "name": "gate-check",
+            "state": "paused",
+            "machine": {"states": [{"id": "check", "entry": true}], "transitions": []},
+            "nodes": [{"id": "check", "status": "failed", "instances": []}],
+        }]});
+        FactoryView::from_reply(&reply, 30)
+    }
+
+    #[test]
+    fn a_captain_origin_marks_the_page_and_names_the_run() {
+        let mut view = paused_view();
+        assert!(!view.returns_to_captain());
+        assert_eq!(view.captain_run(), None);
+        view.set_captain_origin(Some(CaptainRunOrigin {
+            project: "alpha".into(),
+            member: Some("gate-check".into()),
+        }));
+        assert!(view.returns_to_captain());
+        assert_eq!(
+            view.captain_run().and_then(|run| run.member.as_deref()),
+            Some("gate-check")
+        );
+        let kb = KeybindingsManager::new();
+        assert_eq!(view.handle_key("left", &kb), FactoryViewAction::Close);
+    }
+
+    #[test]
+    fn m_types_a_resume_note_and_enter_sends_it() {
+        let kb = KeybindingsManager::new();
+        let mut view = paused_view();
+        assert_eq!(view.handle_key("m", &kb), FactoryViewAction::None);
+        assert_eq!(view.resume_note(), Some(""));
+        for key in ["f", "i", "x", "space", "i", "t", "backspace", "t"] {
+            assert_eq!(view.handle_key(key, &kb), FactoryViewAction::None);
+        }
+        let hint = view.hint(&kb).0;
+        assert!(hint.contains("resume note: fix it"), "{hint}");
+        assert_eq!(
+            view.handle_key("enter", &kb),
+            FactoryViewAction::ResumeWithNote {
+                run_id: "run-gate".into(),
+                note: "fix it".into(),
+            }
+        );
+        assert_eq!(view.resume_note(), None);
+    }
+
+    #[test]
+    fn escape_cancels_the_note_without_closing_the_page() {
+        let kb = KeybindingsManager::new();
+        let mut view = paused_view();
+        let _ = view.handle_key("m", &kb);
+        assert_eq!(view.handle_key("escape", &kb), FactoryViewAction::None);
+        assert_eq!(view.resume_note(), None);
+        assert_eq!(view.handle_key("escape", &kb), FactoryViewAction::Close);
+    }
+
+    #[test]
+    fn m_on_a_running_run_opens_no_note() {
+        let kb = KeybindingsManager::new();
+        let reply = json!({"runs": [{
+            "runId": "run-live",
+            "specId": "live",
+            "state": "running",
+            "machine": {"states": [], "transitions": []},
+            "nodes": [],
+        }]});
+        let mut view = FactoryView::from_reply(&reply, 30);
+        assert_eq!(view.handle_key("m", &kb), FactoryViewAction::None);
+        assert_eq!(view.resume_note(), None);
+    }
+
+    #[test]
+    fn a_running_state_names_its_child_and_elapsed_time() {
+        let reply = json!({"runs": [{
+            "runId": "run-live",
+            "specId": "eigen-pipeline",
+            "state": "running",
+            "machine": {"states": [
+                {"id": "design", "entry": true},
+                {"id": "implement", "subagent": {"model": "antigravity/gemini-4-argon"}}
+            ], "transitions": [{"from": ["design"], "to": "implement"}]},
+            "nodes": [
+                {"id": "design", "status": "done", "instances": [
+                    {"status": "done", "child": "sub-11111111", "childName": "eigen › design #1"}
+                ]},
+                {"id": "implement", "status": "running", "running": 1, "queued": 0,
+                 "entries": [{"index": 0, "status": "running"}],
+                 "instances": [{"status": "running", "child": "sub-abc12345",
+                                "childName": "eigen › implement #1.1", "durationMs": 12_400}]}
+            ],
+        }]});
+        let view = FactoryView::from_reply(&reply, 40);
+        let theme = Theme::builtin("prime", crate::theme::ColorMode::TrueColor);
+        let rows: Vec<String> = view
+            .render(&theme, 100, &KeybindingsManager::new())
+            .iter()
+            .map(|row| row.iter().map(|s| s.content.as_str()).collect())
+            .collect();
+        let all = rows.join("\n");
+        let implement = rows.iter().find(|r| r.contains("◐ implement")).unwrap();
+        assert!(implement.contains("RUNNING"), "{all}");
+        assert!(
+            all.contains("↳ eigen › implement #1.1 · 12s"),
+            "the running child by name:\n{all}"
+        );
+        assert!(!all.contains("sub-abc12345"), "{all}");
     }
 }

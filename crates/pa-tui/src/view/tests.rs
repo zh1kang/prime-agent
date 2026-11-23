@@ -347,7 +347,7 @@ fn frame_is_exactly_height_rows() {
     assert_eq!(frame.len(), 24);
     assert!(frame.iter().all(|l| str_width(&text_of(l)) <= 80));
     let joined = frame.iter().map(text_of).collect::<Vec<_>>().join("\n");
-    assert!(joined.contains("prime agent v0.0.0"));
+    assert!(joined.contains("radiata v0.0.0"));
     assert!(joined.contains("Collapsed mode (Ctrl+O to expand)"));
     assert!(joined.contains('>'));
 }
@@ -1733,4 +1733,60 @@ fn settled_rows_survive_a_cache_roundtrip() {
         fresh_text.replace("0s", "").replace("0.0s", ""),
         "a fresh view renders the same rows (the Took clock may move)"
     );
+}
+
+/// A machine-editor model pick floats over the editor's diagram: the page stays drawn around a
+/// framed card instead of the chat behind a docked picker.
+#[test]
+fn a_model_picker_with_a_workspace_backdrop_floats_over_the_fsm_diagram() {
+    use crate::workspace_view::{WorkspaceRequest, WorkspaceView};
+    let (mut page, _) = WorkspaceView::machines("");
+    page.apply(
+        WorkspaceRequest::Draft,
+        Ok(serde_json::json!({
+            "draft": "/m/.pa-edit-1", "file": "/m/.pa-edit-1/MACHINE.md", "name": "code-review",
+            "target": "my-code-review", "kind": "md",
+            "states": [{"id": "review", "model": "inherit", "editable": true},
+                       {"id": "publish", "model": "inherit", "editable": true}],
+            "graph": {"states": [{"id": "review", "kind": "agent"}, {"id": "publish", "kind": "agent"}],
+                      "transitions": [{"from": "review", "to": "publish"}]}
+        })),
+    );
+    let picker = || {
+        crate::model_picker::ModelPicker::new(crate::model_picker::ModelPickerOptions {
+            models: Vec::new(),
+            current: None,
+            configured_providers: std::collections::HashSet::new(),
+            recent_models: Vec::new(),
+            scoped_models: Vec::new(),
+            thinking_level: None,
+            viewport_rows: 10,
+            header: Some("model \u{203a} my-code-review \u{b7} review".into()),
+        })
+    };
+    let plain = |frame: &[Line]| {
+        frame
+            .iter()
+            .map(|line| line.iter().map(|s| s.content.as_str()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let mut v = view();
+    v.overlay = Some(Overlay::ModelPicker(picker()));
+    let docked = plain(&v.render_frame(110, 40));
+    assert!(!docked.contains("my-code-review  draft"), "{docked}");
+
+    v.modal_backdrop = Some(Box::new(Overlay::Workspace(page)));
+    let floating = plain(&v.render_frame(110, 40));
+    assert!(floating.contains("my-code-review"), "{floating}");
+    assert!(
+        floating.contains("╭────") && floating.contains("╰────"),
+        "{floating}"
+    );
+    assert!(
+        floating.contains("│ model › my-code-review · review"),
+        "{floating}"
+    );
+    assert!(floating.contains("Search models"), "{floating}");
 }

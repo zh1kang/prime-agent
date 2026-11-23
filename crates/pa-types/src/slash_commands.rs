@@ -53,15 +53,16 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: &[BuiltinSlashCommand] = &[
     BuiltinSlashCommand { name: "session", description: "Show session info", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
     BuiltinSlashCommand { name: "system-prompt", description: "Show the exact system prompt sent to the model", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
     BuiltinSlashCommand { name: "logs", description: "Show where daemon and client logs are saved", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
-    BuiltinSlashCommand { name: "traces", description: "Preview, upload, or configure Prime Agent traces", execution: SlashCommandExecution::Client, argument_hint: Some("[status|on|off|preview|upload|upload-current|upload-all|login]"), aliases: &[], takes_argument: false },
+    BuiltinSlashCommand { name: "traces", description: "Preview, upload, or configure radiata traces", execution: SlashCommandExecution::Client, argument_hint: Some("[status|on|off|preview|upload|upload-current|upload-all|login]"), aliases: &[], takes_argument: false },
     BuiltinSlashCommand { name: "telemetry", description: "Show or change usage telemetry (pseudonymous metrics, never prompts or code)", execution: SlashCommandExecution::Client, argument_hint: Some("[status|on|off]"), aliases: &[], takes_argument: true },
     BuiltinSlashCommand { name: "context", description: "Show token, cost, and context usage for agent and sub-agents", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &["usage"], takes_argument: false },
     BuiltinSlashCommand { name: "changelog", description: "Show changelog entries", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
     BuiltinSlashCommand { name: "update", description: "Update to the latest version (sessions preserved)", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
-    BuiltinSlashCommand { name: "nightly", description: "Switch Prime Agent updates to the nightly channel (unreleased builds, may be broken)", execution: SlashCommandExecution::Client, argument_hint: Some("[on|off|status]"), aliases: &[], takes_argument: true },
+    BuiltinSlashCommand { name: "nightly", description: "Switch radiata updates to the nightly channel (unreleased builds, may be broken)", execution: SlashCommandExecution::Client, argument_hint: Some("[on|off|status]"), aliases: &[], takes_argument: true },
     BuiltinSlashCommand { name: "hotkeys", description: "Show all keyboard shortcuts", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
     BuiltinSlashCommand { name: "fork", description: "Create a new fork from a previous user message", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
     BuiltinSlashCommand { name: "history", description: "Search conversations across local providers", execution: SlashCommandExecution::Client, argument_hint: Some("[text]"), aliases: &[], takes_argument: true },
+    BuiltinSlashCommand { name: "absorb", description: "Absorb context from previous chats into this chat", execution: SlashCommandExecution::Client, argument_hint: Some("[text] [--focus <topic>]"), aliases: &[], takes_argument: true },
     BuiltinSlashCommand { name: "review", description: "Review and stage this worktree's changes", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
     BuiltinSlashCommand { name: "subthread", description: "Branch the conversation at its current position", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
     BuiltinSlashCommand { name: "clone", description: "Duplicate the current session at the current position", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
@@ -78,16 +79,16 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: &[BuiltinSlashCommand] = &[
     BuiltinSlashCommand { name: "rlm-max-depth", description: "Set/view the per-chat persistent RLM max depth immediately; never interrupts or queues the running turn", execution: SlashCommandExecution::Client, argument_hint: Some("[<int> [--global]]"), aliases: &[], takes_argument: true },
     BuiltinSlashCommand { name: "heartbeat", description: "Set or view a persistent heartbeat; delivery defaults to steer, use --follow-up to queue; supports pause, resume, stop, and clear", execution: SlashCommandExecution::Client, argument_hint: Some("[status|pause|resume|stop|[every <duration>] [--steer|--follow-up] <instruction>]"), aliases: &[], takes_argument: true },
     BuiltinSlashCommand { name: "heartbeats", description: "View and manage all user and agent heartbeats", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
-    BuiltinSlashCommand { name: "fsm", description: "Inspect live factories or edit machine definitions", execution: SlashCommandExecution::Client, argument_hint: Some("[edit [machine]]"), aliases: &[], takes_argument: true },
-    BuiltinSlashCommand { name: "captain", description: "Open the project Captain and its crew", execution: SlashCommandExecution::Client, argument_hint: Some("[new | promote | chat | stop | resume | delete | search]"), aliases: &[], takes_argument: true },
+    BuiltinSlashCommand { name: "fsm", description: "Inspect live factories or edit machine definitions", execution: SlashCommandExecution::Client, argument_hint: Some("[edit [machine]]"), aliases: &[], takes_argument: false },
+    BuiltinSlashCommand { name: "captain", description: "Open the project Captain and its crew", execution: SlashCommandExecution::Client, argument_hint: Some("[new | promote | chat | stop | resume | delete | search]"), aliases: &[], takes_argument: false },
     BuiltinSlashCommand { name: "crew", description: "Switch between this Captain and its crew chats", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
     BuiltinSlashCommand { name: "threads", description: "Search local conversations and threads", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
-    BuiltinSlashCommand { name: "connect", description: "Connect a harness provider", execution: SlashCommandExecution::Client, argument_hint: Some("codex|claude|antigravity"), aliases: &[], takes_argument: true },
+    BuiltinSlashCommand { name: "connect", description: "Connect a harness provider", execution: SlashCommandExecution::Client, argument_hint: Some("codex|claude|antigravity|cursor"), aliases: &[], takes_argument: true },
     BuiltinSlashCommand { name: "factory", description: "Show or set the agent factory opt-in gate (off by default)", execution: SlashCommandExecution::Client, argument_hint: Some("[on|off|status]"), aliases: &[], takes_argument: true },
     BuiltinSlashCommand { name: "resume", description: "Browse conversations across providers, or resume a Prime session by ID or path", execution: SlashCommandExecution::Client, argument_hint: Some("[id|path]"), aliases: &[], takes_argument: true },
     BuiltinSlashCommand { name: "reload", description: "Reload keybindings, skills, prompts, and themes", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
     BuiltinSlashCommand { name: "speed", description: "Toggle footer readout of model output tok/sec (latest response and session average)", execution: SlashCommandExecution::Client, argument_hint: Some("[on|off]"), aliases: &[], takes_argument: true },
-    BuiltinSlashCommand { name: "quit", description: "Quit Prime Agent", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
+    BuiltinSlashCommand { name: "quit", description: "Quit radiata", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
 ];
 
 /// The registry with alias resolution maps prebuilt.
@@ -303,6 +304,19 @@ mod tests {
         assert_eq!(plain.name, "model");
         assert_eq!(plain.args, "");
         assert!(registry.parse("not a command").is_none());
+    }
+
+    #[test]
+    fn absorb_is_a_client_command_with_optional_args() {
+        let registry = SlashCommandRegistry::builtin();
+        let absorb = registry.get("absorb").unwrap();
+        assert_eq!(absorb.execution, SlashCommandExecution::Client);
+        assert!(registry.takes_argument("absorb"));
+        assert_eq!(registry.parse("/absorb").unwrap().args, "");
+        assert_eq!(
+            registry.parse("/absorb auth --focus login").unwrap().args,
+            "auth --focus login"
+        );
     }
 
     #[test]

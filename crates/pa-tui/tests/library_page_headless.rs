@@ -610,6 +610,11 @@ fn library_page_lists_machines_drills_in_and_escs_back() {
         },
         HeadlessStep::Key(down()),
         HeadlessStep::Key(down()),
+        HeadlessStep::Key(KeyEvent::new(KeyCode::Char('M'), KeyModifiers::SHIFT)),
+        HeadlessStep::WaitRender {
+            needle: "stateDiagram-v2".to_string(),
+            timeout_ms: 15_000,
+        },
         HeadlessStep::Key(down()),
         HeadlessStep::Key(down()),
         HeadlessStep::WaitMs(200),
@@ -646,24 +651,19 @@ fn library_page_lists_machines_drills_in_and_escs_back() {
         all.contains("\u{25b8} pr-manager"),
         "the arrows walked the selection to pr-manager:\n{all}"
     );
-    // The drill-in: the ANSI diagram (the run page's renderer over the
-    // same snapshot shape) and the mermaid panel with the seed's
-    // guarded edges.
+    // The drill-in: the interactive block diagram first, then the mermaid
+    // source panel toggled with `M` showing the seed's guarded edges.
     assert!(
         all.contains("machine: pr-manager"),
         "the drill-in rendered the machine header:\n{all}"
     );
     assert!(
-        all.contains("entry (pr-entry) pending [entry]"),
-        "the diagram rendered the entry state row:\n{all}"
-    );
-    assert!(
-        all.contains("when verdict.approved eq false"),
-        "the diagram rendered the guarded edge:\n{all}"
+        all.contains("entry") && all.contains("reviewing") && all.contains("fixing"),
+        "the block diagram rendered the seed's state boxes:\n{all}"
     );
     assert!(
         all.contains("mermaid"),
-        "the mermaid panel title rendered:\n{all}"
+        "the mermaid panel title rendered after M:\n{all}"
     );
     assert!(
         all.contains("stateDiagram-v2"),

@@ -3,11 +3,11 @@
 //! stream reconcile, and the selection/key/mouse dispatch residue.
 use super::{
     build_rows, compute_rollups, filter_by_session_ids, filter_empty_sessions,
-    filter_unified_sessions, parse_search_query, reconcile_unified_sessions, resolve_selection,
-    scope_ancestors, scope_root, scope_to_subtree, subtree_contains, AgentsViewMode, AgentsViewRow,
-    AgentsViewScope, Composer, OpenedRow, PathBuf, PressedMouseClick, RowKind, SavedMore,
-    ScopeRoot, SelectionEdge, SelectionKey, SessionSelection, Value, ANCHOR_LOADING_HINT,
-    SAVED_CATALOG_PAGE_FILES,
+    filter_unified_sessions, has_session_children, parse_search_query, reconcile_unified_sessions,
+    resolve_selection, scope_ancestors, scope_root, scope_to_subtree, subtree_contains,
+    AgentsViewMode, AgentsViewRow, AgentsViewScope, Composer, OpenedRow, PathBuf,
+    PressedMouseClick, RowKind, SavedMore, ScopeRoot, SelectionEdge, SelectionKey,
+    SessionSelection, Value, ANCHOR_LOADING_HINT, SAVED_CATALOG_PAGE_FILES,
 };
 
 impl AgentsViewMode {
@@ -682,14 +682,15 @@ impl AgentsViewMode {
             return;
         }
         // `app.input.clear` (default escape): clear the search; scoped, reopen the last-opened
-        // session (the scope root in this flow) without touching the scope frame; otherwise exit.
+        // session (the scope root in this flow) without touching the scope frame; globally, return
+        // to the chat the view was opened from (exit only when there is none to return to).
         if self.keybindings.matches(key, "app.input.clear") {
             if !self.query.is_empty() {
                 self.query.clear();
                 self.query_changed(false);
             } else if self.scope_active {
                 self.open_scope_root(false);
-            } else {
+            } else if !self.open_anchor_session() {
                 self.running = false;
             }
             return;
@@ -741,6 +742,61 @@ impl AgentsViewMode {
             self.query.push_str(&text);
             self.query_changed(was_empty);
         }
+    }
+
+    /// Reopen the entry anchor's session (the chat the global view was opened from), live or
+    /// saved. False when there is no anchor or it no longer resolves to an openable session.
+    fn open_anchor_session(&mut self) -> bool {
+        let Some(anchor) = self
+            .options
+            .anchor_session_id
+            .clone()
+            .filter(|id| !id.is_empty())
+        else {
+            return false;
+        };
+        let records = self.records();
+        let Some(summary) = records
+            .iter()
+            .map(crate::agents_view_state::summary_for_record)
+            .find(|summary| {
+                ["sessionId", "activeSessionId"]
+                    .iter()
+                    .any(|field| summary.get(*field).and_then(Value::as_str) == Some(&anchor))
+            })
+        else {
+            return false;
+        };
+        let Some(selection) = SessionSelection::open_summary(&summary) else {
+            return false;
+        };
+        let key = crate::agents_view_forest::selection_key(&summary);
+        let has_children = has_session_children(&records, &key);
+        let anchor_scope = AgentsViewScope {
+            session_id: Some(anchor),
+            active_session_id: None,
+            session_name: None,
+        };
+        self.opened = Some(OpenedRow {
+            selection,
+            expanded_ancestors: scope_ancestors(&records, &anchor_scope),
+            selected_row_identity: self.selected_identity.clone().unwrap_or_default(),
+            selected_key: key,
+            rlm_depth: summary
+                .get("rlmDepth")
+                .and_then(Value::as_u64)
+                .map(|depth| depth as u32),
+            has_children,
+            status_message: None,
+            cwd: summary
+                .get("cwd")
+                .and_then(Value::as_str)
+                .filter(|cwd| !cwd.is_empty())
+                .map(str::to_string),
+            panel: None,
+        });
+        self.running = false;
+        true
     }
 
     /// Materialize the armed composer's parked suggestion request: `getSuggestions`

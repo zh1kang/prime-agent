@@ -125,6 +125,9 @@ pub struct AgentView {
     /// it, so two panels can never be open at once, and keys, render, paste, mouse and cursor all
     /// dispatch on the same value.
     pub(crate) overlay: Option<Overlay>,
+    /// The page an open `Overlay::ModelPicker` floats over (the machine editor or the Captain);
+    /// it draws only behind the picker and returns to its owner when the picker closes.
+    pub(crate) modal_backdrop: Option<Box<Overlay>>,
     /// One dim line above the prompt: a Captain text step's label or the Captain breadcrumb.
     pub editor_header: Option<String>,
     pub side_pane: Option<crate::side_question::SideQuestionPane>,
@@ -329,6 +332,7 @@ impl AgentView {
             working_since: None,
             retry: None,
             overlay: None,
+            modal_backdrop: None,
             editor_header: None,
             side_pane: None,
             show_images: true,

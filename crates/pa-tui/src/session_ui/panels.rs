@@ -7,6 +7,7 @@ use super::{
     FactoryUpdate, GoalPanel, HeartbeatsUpdate, InfoContent, InfoPanelAction, KeyEvent, Map,
     Overlay, Result, SessionUi, Value,
 };
+use crate::interactive::captain_hint::{factory_name, CaptainItemTarget};
 
 pub(crate) struct ActivityUpdates {
     pub heartbeats: mpsc::UnboundedSender<HeartbeatsUpdate>,
@@ -98,8 +99,21 @@ impl SessionUi {
             self.activity_group =
                 dock.step(self.activity_group, crate::chrome::ActivityDirection::Prev);
         }
+        // A Captain sub-row selection lives only while its group is selected, focused, and the
+        // row still renders.
+        if !self.subagents_focused
+            || self.activity_group != crate::chrome::ActivityGroup::Captain
+            || view
+                .chrome
+                .nav
+                .dock_captain_item
+                .is_some_and(|index| index >= dock.captain_item_count())
+        {
+            view.chrome.nav.dock_captain_item = None;
+        }
         view.chrome.activity = Some(crate::chrome::ActivityDock {
             selected: self.activity_group,
+            captain_item: view.chrome.nav.dock_captain_item,
             focused: self.subagents_focused,
             ..dock
         });
@@ -152,10 +166,13 @@ impl SessionUi {
             // lane: the factory's opt-in gate (a daemon without the
             // factory lane never mounts the group).
             factory_group: self.factory_activity_supported(),
+            captain: self.captain_dock.clone(),
             goal_label,
             selected: self.activity_group,
+            captain_item: None,
             focused: self.subagents_focused,
         }
+        .with_captain_factory_runs()
     }
 
     /// The editor's Down and Alt+A hand focus to the dock, which expands it.
@@ -224,6 +241,7 @@ impl SessionUi {
         view: &mut AgentView,
     ) {
         self.activity_group = group;
+        view.chrome.nav.dock_captain_item = None;
         self.subagents_focused = true;
         self.update_subagent_summary(view);
         self.open_dock_group_view(view);
@@ -294,6 +312,20 @@ impl SessionUi {
     /// The dock's Enter hand-off (the operator's direct-navigation redesign):
     /// the focused group opens its own view directly, no intermediate list.
     pub(super) fn open_dock_group_view(&mut self, view: &mut AgentView) {
+        let captain_item = view
+            .chrome
+            .nav
+            .dock_captain_item
+            .filter(|_| self.activity_group == crate::chrome::ActivityGroup::Captain);
+        match captain_item {
+            Some(index) => self.open_dock_captain_item(view, index),
+            None => self.open_dock_group(view),
+        }
+        view.chrome.nav.opened_from_dock = view.overlay.is_some();
+    }
+
+    /// The selected group's own view (see [`Self::open_dock_group_view`]).
+    fn open_dock_group(&mut self, view: &mut AgentView) {
         match self.activity_group {
             crate::chrome::ActivityGroup::Subagents => {
                 self.emit_activity_opened("subagents");
@@ -322,6 +354,17 @@ impl SessionUi {
                 self.emit_activity_opened("factory");
                 self.open_factory_page(view);
             }
+            crate::chrome::ActivityGroup::Captain => {
+                self.emit_activity_opened("captain");
+                self.subagents_focused = false;
+                self.update_subagent_summary(view);
+                let query = self
+                    .captain_dock
+                    .as_ref()
+                    .map(|c| c.project_id.clone())
+                    .unwrap_or_default();
+                self.open_captain_panel(view, &query);
+            }
             crate::chrome::ActivityGroup::Library => {
                 self.emit_activity_opened("library");
                 self.open_library_page(view);
@@ -331,6 +374,69 @@ impl SessionUi {
                 self.open_goal_panel(view);
             }
         }
+    }
+
+    /// The `⚓ captain` sub-row at `index` (a crew thread, a Captain factory run, or a project
+    /// factory awaiting review), as the dock rendered it.
+    pub(crate) fn dock_captain_item(
+        &self,
+        index: usize,
+    ) -> Option<(String, crate::chrome::CaptainDockActiveItem)> {
+        let captain = self.captain_dock.as_ref()?;
+        let item = captain.active.get(index)?;
+        Some((captain.project_id.clone(), item.clone()))
+    }
+
+    /// Enter on a `⚓ captain` sub-row: a paused or running Captain run opens its live
+    /// factory page, a factory waiting for review its review page, and a crew thread the
+    /// Captain panel on the item's project.
+    fn open_dock_captain_item(&mut self, view: &mut AgentView, index: usize) {
+        self.emit_activity_opened("captain");
+        self.subagents_focused = false;
+        self.update_subagent_summary(view);
+        let Some((project, item)) = self.dock_captain_item(index) else {
+            return self.open_captain_panel(view, "");
+        };
+        let target = match self.captain_status_watcher.active_item(index) {
+            Some(status) if status.label == item.label => status.target(),
+            _ if item.kind == "project_factory" => CaptainItemTarget::Factory {
+                name: factory_name(&item.label),
+            },
+            _ => CaptainItemTarget::Panel,
+        };
+        match target {
+            CaptainItemTarget::Run { member } => {
+                self.open_captain_run(view, project, member, None);
+            }
+            CaptainItemTarget::Factory { name } => {
+                self.open_captain_panel(view, &project);
+                self.run_captain_action(
+                    crate::captain_view::CaptainAction::LoadFactory { project, name },
+                    view,
+                );
+            }
+            CaptainItemTarget::Panel => self.open_captain_panel(view, &project),
+        }
+    }
+
+    /// Close the open overlay to where it was launched from: an overlay the
+    /// activity dock opened hands focus back to the expanded dock, one a
+    /// direct shortcut or command opened returns to the editor.
+    pub(crate) fn close_overlay_to_origin(&mut self, view: &mut AgentView) {
+        view.overlay = None;
+        if std::mem::take(&mut view.chrome.nav.opened_from_dock) {
+            self.focus_activity_dock(view);
+        } else {
+            self.subagents_focused = false;
+            self.update_subagent_summary(view);
+        }
+        self.dirty = true;
+    }
+
+    /// Mark the next overlay as opened by a direct shortcut or command: its
+    /// close returns to the editor.
+    pub(crate) fn mark_opened_directly(view: &mut AgentView) {
+        view.chrome.nav.opened_from_dock = false;
     }
 
     /// The dock's goal row opens the read-only goal panel (the operator's
@@ -377,11 +483,10 @@ impl SessionUi {
             || view.editor.keybindings().matches(&id, "app.modal.back")
             || view.editor.keybindings().matches(&id, "app.clear")
         {
-            view.overlay = None;
             // The exit restores the dock's own group (the operator's 2026-09-26
-            // panel-exit ruling).
-            self.focus_activity_dock(view);
-            self.dirty = true;
+            // panel-exit ruling): the goal panel only ever opens from the dock.
+            view.chrome.nav.opened_from_dock = true;
+            self.close_overlay_to_origin(view);
         }
         Ok(())
     }

@@ -350,6 +350,7 @@ impl SessionUi {
             if self.captain_compose_active() {
                 self.captain_compose_key("escape", view);
             } else {
+                Self::mark_opened_directly(view);
                 self.open_captain_panel(view, "");
             }
             return Ok(());
@@ -492,15 +493,22 @@ impl SessionUi {
                 self.open_dock_group_view(view);
                 return Ok(());
             }
-            let dock = self.activity_dock_state();
-            // Up from the top row leaves the dock; Down from the bottom row wraps to the top.
-            if down || (up && dock.groups()[0] != self.activity_group) {
+            let dock = crate::chrome::ActivityDock {
+                captain_item: view.chrome.nav.dock_captain_item,
+                ..self.activity_dock_state()
+            };
+            let current = dock.selection();
+            // Up from the top row leaves the dock; Down from the bottom row wraps to the top. The
+            // Captain group's sub-rows are rows of their own.
+            if down || (up && dock.selections()[0] != current) {
                 let direction = if down {
                     crate::chrome::ActivityDirection::Next
                 } else {
                     crate::chrome::ActivityDirection::Prev
                 };
-                self.activity_group = dock.step(self.activity_group, direction);
+                let next = dock.step_selection(current, direction);
+                self.activity_group = next.group();
+                view.chrome.nav.dock_captain_item = next.captain_item();
                 self.update_subagent_summary(view);
                 self.dirty = true;
                 return Ok(());

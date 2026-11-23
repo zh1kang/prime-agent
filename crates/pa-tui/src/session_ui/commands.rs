@@ -38,7 +38,7 @@ impl SessionUi {
         match name.as_str() {
             "help" => {
                 self.note(
-                    "/history [text] search local conversations\n/review         review this worktree\n/subthread      branch this conversation\n/help           this list\n/list           live sessions\n/switch <n|id>  switch to a session from /list\n/new            start a new session\n/exit           detach and exit",
+                    "/history [text] search local conversations\n/absorb [text]  absorb earlier chats into this one\n/review         review this worktree\n/subthread      branch this conversation\n/help           this list\n/list           live sessions\n/switch <n|id>  switch to a session from /list\n/new            start a new session\n/exit           detach and exit",
                     view,
                 );
                 return Ok(());
@@ -66,7 +66,7 @@ impl SessionUi {
             // Oversized names are prompts; close typos get the suggestion error,
             // everything else passes through to the model.
             if name.chars().count() > 64 {
-                return self.send_prompt(text, behavior, view);
+                return self.send_prompt_or_captain(text, behavior, view);
             }
             let candidates = registry.suggestion_candidates();
             return match pa_types::slash_commands::find_slash_command_suggestion(&name, &candidates)
@@ -78,7 +78,7 @@ impl SessionUi {
                     );
                     Ok(())
                 }
-                None => self.send_prompt(text, behavior, view),
+                None => self.send_prompt_or_captain(text, behavior, view),
             };
         };
 
@@ -90,11 +90,24 @@ impl SessionUi {
         // canonical name, before the command runs.
         self.track_command_used(resolved.name);
         match command.execution {
-            SlashCommandExecution::Session => self.send_prompt(text, behavior, view),
+            SlashCommandExecution::Session => self.send_prompt_or_captain(text, behavior, view),
             SlashCommandExecution::Client => {
                 self.dispatch_client_command(&resolved, text, view).await
             }
         }
+    }
+
+    /// A prompt typed in the Captain's chat is a Captain turn; any other chat sends it.
+    fn send_prompt_or_captain(
+        &mut self,
+        text: &str,
+        behavior: SubmitBehavior,
+        view: &mut AgentView,
+    ) -> Result<()> {
+        if self.send_to_captain(text, super::prompt::SubmitBehavior::Steer, view) {
+            return Ok(());
+        }
+        self.send_prompt(text, behavior, view)
     }
 
     /// Create a fresh session and rebind the view to it (the `/new` flow,
@@ -265,6 +278,10 @@ impl SessionUi {
                 crate::workspace_view::WorkspaceView::history(&resolved.args),
                 view,
             ),
+            "absorb" => self.open_workspace(
+                crate::workspace_view::WorkspaceView::absorb(&resolved.args),
+                view,
+            ),
             "review" => {
                 if resolved.args.is_empty() {
                     self.open_workspace(crate::workspace_view::WorkspaceView::review(None), view);
@@ -403,13 +420,16 @@ impl SessionUi {
                     crate::workspace_view::WorkspaceView::machines(arg[5..].trim()),
                     view,
                 ),
-                "" | "live" => self.open_factory_page(view),
+                "" | "live" => self.open_fsm_page(view),
                 _ => self.error_row("Usage: /fsm [live | edit [machine]]", view),
             },
             "captain" => match resolved.args.trim() {
                 "chat" => self.open_parent_chat(view),
                 op @ ("stop" | "resume" | "delete") => self.captain_command(op, view),
-                query => self.open_captain_panel(view, query),
+                query => {
+                    Self::mark_opened_directly(view);
+                    self.open_captain_panel(view, query);
+                }
             },
             "crew" => self.open_crew_picker(view),
             "threads" => {
@@ -510,6 +530,7 @@ impl SessionUi {
                             self.error_row(&format!("{error:#}"), view);
                             return Ok(());
                         }
+                        self.hot_disable_factory_lane();
                         self.note(
                             "The factory is disabled. The factory group and page disappear on the next client start.",
                             view,
@@ -584,8 +605,8 @@ impl SessionUi {
                 // confirm renders each line truncated, never wrapped).
                 view.overlay = Some(Overlay::Confirm {
                     panel: crate::confirm::ConfirmPanel::yes_no(
-                        "Update Prime Agent",
-                        "Update installs the latest Prime Agent build;\nyour sessions and configuration (~/.prime/agent) are never touched.\n\nThe update runs in the background — restart prime-agent after it\nfinishes to run the new build.",
+                        "Update radiata",
+                        "Update installs the latest radiata build;\nyour sessions and configuration (~/.prime/agent) are never touched.\n\nThe update runs in the background — restart prime-agent after it\nfinishes to run the new build.",
                     ),
                     pending: PendingConfirm::Update,
                 });

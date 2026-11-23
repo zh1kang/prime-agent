@@ -4,10 +4,15 @@ use serde_json::json;
 
 thread_local! {
     static ORDERING_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static LABEL_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 pub(super) fn count_ordering_visit() {
     ORDERING_VISITS.with(|visits| visits.set(visits.get() + 1));
+}
+
+pub(super) fn count_label_scan() {
+    LABEL_SCANS.with(|scans| scans.set(scans.get() + 1));
 }
 
 fn plain(diagram: &BlockDiagram) -> String {
@@ -450,4 +455,192 @@ fn crossing_routes_leave_a_gap_without_hiding_real_junctions() {
     junction.vertical(2, 2, 4);
     assert_eq!(junction.0[2][2], Cell::Line(LEFT | RIGHT | DOWN));
     assert_eq!(line_char(LEFT | RIGHT | DOWN), '┬');
+}
+
+#[test]
+fn back_edge_guards_clear_forward_wires_on_their_departure_row() {
+    let states = vec![
+        state("a", true),
+        state("b", false),
+        state("c", false),
+        state("e", false),
+        state("d", false),
+    ];
+    let label = "rework after every inspection pass";
+    let transitions = vec![
+        transition(&["a"], "b", None),
+        transition(&["a"], "c", None),
+        transition(&["a"], "e", None),
+        transition(&["b"], "d", None),
+        transition(&["c"], "d", None),
+        transition(&["e"], "d", None),
+        transition(
+            &["c"],
+            "a",
+            Some(json!({"output": "route", "op": "eq", "value": label})),
+        ),
+    ];
+    let diagram = block_diagram(
+        &Theme::builtin("prime", ColorMode::TrueColor),
+        &states,
+        &transitions,
+    );
+    let text = plain(&diagram);
+    let departure = text
+        .lines()
+        .find(|row| row.contains(&format!(" {label} ")))
+        .unwrap_or_else(|| panic!("the full back-edge guard must survive its row:\n{text}"));
+    assert!(
+        departure.contains(&format!(" {label} ")),
+        "a crossing replaced a guard character:\n{text}"
+    );
+}
+
+#[test]
+fn many_back_edges_fail_the_size_guard_before_label_work() {
+    let states: Vec<_> = (0..300).map(|i| state(&format!("s{i}"), i == 0)).collect();
+    let mut transitions: Vec<_> = (0..299)
+        .map(|i| transition(&[&states[i].id], &states[i + 1].id, None))
+        .collect();
+    transitions.extend((1..300).map(|i| {
+        transition(
+            &[&states[i].id],
+            &states[0].id,
+            Some(json!({"output": "route", "op": "eq", "value": "again"})),
+        )
+    }));
+    LABEL_SCANS.with(|scans| scans.set(0));
+    let diagram = block_diagram(
+        &Theme::builtin("prime", ColorMode::TrueColor),
+        &states,
+        &transitions,
+    );
+    assert_eq!(diagram.lines.len(), 1);
+    assert!(
+        plain(&diagram).contains("300 states"),
+        "{}",
+        plain(&diagram)
+    );
+    assert_eq!(
+        LABEL_SCANS.with(std::cell::Cell::get),
+        0,
+        "label work ran before the back-edge size guard"
+    );
+}
+
+#[test]
+fn selected_box_highlights_in_accent_and_adaptive_width_fits_80_columns() {
+    let theme = Theme::builtin("prime", ColorMode::TrueColor);
+    let agent = |id: &str, entry: bool, model: &str| {
+        let mut s = state(id, entry);
+        s.model = Some(model.to_string());
+        s
+    };
+    let py = |id: &str, call: &str| {
+        let mut s = state(id, false);
+        s.python = Some(call.to_string());
+        s
+    };
+    let states = vec![
+        agent("design", true, "openai-codex/gpt-6-astra"),
+        agent("setup", false, "openai-codex/gpt-6-luna"),
+        agent("implement", false, "openai-codex/gpt-6-luna"),
+        py("sanitize-diff", "sanitize.sanitize"),
+        agent("teammate-review", false, "anthropic/claude-opus-5-5"),
+        agent("bugbot-review", false, "openai-codex/gpt-6.1-sol"),
+        agent("robust-review", false, "openai-codex/gpt-6.1-sol"),
+        py("escalate-human", "escalate.consolidate"),
+        agent("validate", false, "openai-codex/gpt-6-luna"),
+    ];
+    let transitions = vec![
+        transition(&["design"], "setup", None),
+        transition(&["setup"], "implement", None),
+        transition(&["implement"], "sanitize-diff", None),
+        transition(&["sanitize-diff"], "teammate-review", None),
+        transition(&["sanitize-diff"], "bugbot-review", None),
+        transition(&["sanitize-diff"], "robust-review", None),
+        transition(
+            &["teammate-review", "bugbot-review", "robust-review"],
+            "escalate-human",
+            None,
+        ),
+        transition(
+            &["escalate-human"],
+            "implement",
+            Some(json!({"output": "route", "op": "eq", "value": "rework"})),
+        ),
+        transition(
+            &["escalate-human"],
+            "validate",
+            Some(json!({"output": "route", "op": "eq", "value": "proceed"})),
+        ),
+    ];
+    let diagram = block_diagram_with_options(
+        &theme,
+        &states,
+        &transitions,
+        &DiagramRenderOptions {
+            selected_state: Some("robust-review"),
+            live_nodes: None,
+            max_width: Some(78),
+            inherit_model: None,
+        },
+    );
+    assert_eq!(diagram.node_spans.len(), states.len());
+    assert_eq!(diagram.node_spans[0].0, "design");
+    assert_eq!(diagram.node_spans.last().unwrap().0, "validate");
+    let max_width = diagram
+        .lines
+        .iter()
+        .map(|row| crate::width::line_width(row))
+        .max()
+        .unwrap_or(0);
+    assert!(
+        max_width <= 78,
+        "3-way fan-out + rework gutter must fit 80-col viewport (got {max_width}):\n{}",
+        plain(&diagram)
+    );
+    let accent = theme.fg_style(ThemeColor::Accent).fg;
+    let selected_row = diagram
+        .node_spans
+        .iter()
+        .find(|(id, _, _)| id == "robust-review")
+        .unwrap()
+        .1
+        + 1;
+    assert!(
+        diagram.lines[selected_row]
+            .iter()
+            .any(|s| s.content.contains("robust-review") && s.style.fg == accent),
+        "selected box title must render in accent color"
+    );
+    let text = plain(&diagram);
+    assert!(text.contains("start"), "{text}");
+    assert!(text.contains("join"), "{text}");
+    assert!(text.contains("rework"), "{text}");
+    assert!(text.contains("proceed"), "{text}");
+}
+
+#[test]
+fn machine_boxes_show_the_state_or_role_thinking_level_beside_the_model() {
+    let theme = Theme::builtin("prime", ColorMode::TrueColor);
+    let spec = json!({
+        "roles": {"reviewer": {"model": "anthropic/claude-opus-5-5", "thinking": "medium"}},
+        "states": [
+            {"id": "draft", "entry": true, "subagent": {"model": "antigravity/gemini-4-neon", "thinking": "high"}},
+            {"id": "review", "subagent": {"role": "reviewer"}},
+            {"id": "ship", "subagent": {"model": "openai/gpt-5"}}
+        ],
+        "transitions": [{"from": "draft", "to": "review"}, {"from": "review", "to": "ship"}]
+    });
+    let diagram =
+        crate::factory_view::machine_block_diagram(&theme, &spec, &DiagramRenderOptions::default())
+            .expect("diagram");
+    let shown = plain(&diagram);
+    assert!(shown.contains("gemini-4-neon · high"), "{shown}");
+    assert!(shown.contains("reviewer · medium"), "{shown}");
+    assert!(
+        shown.contains("gpt-5") && !shown.contains("gpt-5 ·"),
+        "{shown}"
+    );
 }

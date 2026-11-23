@@ -33,6 +33,10 @@ pub(super) fn render(
     // the search input): one leading space, the active side accented, then the dim toggle key and
     // muted description, truncated with "...".
     let mut lines = Vec::new();
+    if let Some(header) = picker.header() {
+        let line = vec![theme.fg_span(ThemeColor::Accent, format!(" {header}"))];
+        lines.push(crate::width::truncate_line(&line, width, "..."));
+    }
     if picker.has_scoped_models() {
         let muted = |text: &str| theme.fg_span(ThemeColor::Muted, text.to_string());
         let (all, scoped) = if picker.scoped_side() {
@@ -98,6 +102,7 @@ pub(super) fn render(
     if filtered_len == 0 {
         lines.push(no_match_row(theme, width, "No matching models"));
     } else if let Some(model) = picker.selected_model().cloned() {
+        lines.push(thinking_bar(picker, theme, width, kb, &model));
         if picker.detail_rows() > 0 {
             lines.extend(detail_lines(theme, width, &model));
         }
@@ -208,6 +213,38 @@ fn effort_square_spans(
         spans.push(Span::raw(" ".repeat(square_slots - used)));
     }
     spans
+}
+
+/// The selected model's thinking level: `thinking: high  [←/→ change]`, or `thinking: none`
+/// for a model without a reasoning surface.
+fn thinking_bar(
+    picker: &ModelPicker,
+    theme: &Theme,
+    width: usize,
+    kb: &KeybindingsManager,
+    model: &Model,
+) -> Line {
+    let line = match picker.effort_of(model) {
+        Some(effort) => {
+            let keys = format!(
+                "{}/{}",
+                kb.first_key("tui.editor.cursorLeft")
+                    .map_or_else(|| "\u{2190}".to_string(), |key| format_key_text(&key)),
+                kb.first_key("tui.editor.cursorRight")
+                    .map_or_else(|| "\u{2192}".to_string(), |key| format_key_text(&key))
+            );
+            vec![
+                theme.fg_span(ThemeColor::Muted, " thinking: "),
+                theme.fg_span(ThemeColor::Accent, effort.wire_name().to_string()),
+                theme.fg_span(ThemeColor::Dim, format!("  [{keys} change]")),
+            ]
+        }
+        None => vec![
+            theme.fg_span(ThemeColor::Muted, " thinking: "),
+            theme.fg_span(ThemeColor::Dim, "none"),
+        ],
+    };
+    crate::width::truncate_line(&line, width, "...")
 }
 
 /// The selected model's price detail block (TS `renderInlineModelDetails`).

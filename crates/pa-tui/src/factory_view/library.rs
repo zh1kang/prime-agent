@@ -8,17 +8,20 @@
 //! `library` action over the `factory_activity` bridge) and folds the
 //! replies into the open view.
 //!
-//! The drill-in reuses the run page's seams with no new renderer code:
-//! the machine's diagram renders through the existing diagram renderer
-//! over the graph payload — the same snapshot shape the active-run graph
-//! lane answers — and the mermaid text rides below it as plain
-//! monospace rows (copyable; GitHub, previews, and external tools render
-//! the text — the terminal renders the ANSI diagram above it, a graphics
-//! subsystem for in-TUI mermaid pixels does not exist).
+//! The drill-in is the factory review's interactive block diagram: the
+//! machine header (`machine:` + `params:`), the shared block renderer with
+//! the selected node highlighted (↑/↓), the node's files on Enter, and the
+//! raw mermaid source behind `M` (copyable monospace rows). The graph
+//! arrives either as the daemon's snapshot shape (the active-run graph
+//! lane's) or, with no kernel running, as `pa thread fsm-edit`'s compiled
+//! spec with its per-state details.
 
 use serde_json::Value;
 
-use super::{parse_run, FactoryRunSnapshot};
+use super::{
+    machine_block_diagram, machine_header_lines, parse_run, render_node_detail_lines,
+    scroll_to_span, BlockDiagram, DiagramRenderOptions, FactoryRunSnapshot,
+};
 use crate::keybindings::{format_key_text, KeybindingsManager};
 use crate::theme::{Theme, ThemeColor};
 use crate::width::truncate_line;
@@ -47,15 +50,20 @@ impl LibraryMachine {
         let scrub = |text: &str| crate::menu_panel::scrub_controls(text);
         Some(Self {
             name: scrub(value.get("name")?.as_str()?),
-            description: scrub(value.get("description")?.as_str()?),
+            // `pa thread fsm-edit list` (the no-kernel fallback) carries no description.
+            description: value
+                .get("description")
+                .and_then(Value::as_str)
+                .map(scrub)
+                .unwrap_or_default(),
             source: scrub(value.get("source")?.as_str()?),
         })
         .filter(|machine| !machine.name.trim().is_empty())
     }
 }
 
-/// Parse the `library` list reply (`{"machines": [...]}`): every row that
-/// carries a name, description, and source drops the malformed ones.
+/// Parse the `library` list reply (`{"machines": [...]}`): rows without a
+/// name or source drop as malformed.
 #[must_use]
 pub fn parse_library_machines(data: &Value) -> Vec<LibraryMachine> {
     data.get("machines")
@@ -72,15 +80,24 @@ pub fn library_reply_lists_machines(data: &Value) -> bool {
     data.get("machines").is_some_and(Value::is_array)
 }
 
-/// One drilled-in machine: the graph payload parsed into the run page's
-/// snapshot shape (the diagram renderer's input — the same shape the
-/// active-run graph lane answers), the machine file's description, and
-/// the mermaid rendering below the diagram.
+/// A drilled-in machine's graph: the daemon's snapshot shape, or the
+/// compiled spec `pa thread fsm-edit` answers.
+#[derive(Debug, Clone, PartialEq)]
+enum LibraryGraph {
+    Snapshot(Box<FactoryRunSnapshot>),
+    Spec(Value),
+}
+
+/// One drilled-in machine: its header fields, its graph, the per-state
+/// details the node view shows (files included when `fsm-edit` answered),
+/// and the mermaid source `M` shows.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LibraryDetail {
     pub name: String,
     pub description: String,
-    pub snapshot: FactoryRunSnapshot,
+    pub params: Vec<Value>,
+    graph: LibraryGraph,
+    state_details: Value,
     pub mermaid: Vec<String>,
 }
 
@@ -91,6 +108,36 @@ impl LibraryDetail {
     /// session UI reports the exact lane error instead of mounting a
     /// half diagram).
     fn parse(data: &Value) -> Option<Self> {
+        let scrub = |value: Option<&Value>| {
+            value
+                .and_then(Value::as_str)
+                .map(crate::menu_panel::scrub_controls)
+                .unwrap_or_default()
+        };
+        let params = data
+            .get("params")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let state_details = data
+            .get("state_details")
+            .filter(|details| details.is_object())
+            .cloned()
+            .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+        if let Some(spec) = data.get("graph").filter(|graph| graph.is_object()) {
+            let name = scrub(data.get("name").or_else(|| data.get("target")));
+            if name.is_empty() {
+                return None;
+            }
+            return Some(Self {
+                name,
+                description: scrub(data.get("description")),
+                params,
+                graph: LibraryGraph::Spec(spec.clone()),
+                state_details,
+                mermaid: Vec::new(),
+            });
+        }
         let snapshot = parse_run(data)?;
         let name = snapshot.spec_id.clone();
         if name.is_empty() {
@@ -108,9 +155,53 @@ impl LibraryDetail {
                 .and_then(Value::as_str)
                 .map(crate::menu_panel::scrub_controls)
                 .unwrap_or_default(),
-            snapshot,
+            params,
+            graph: LibraryGraph::Snapshot(Box::new(snapshot)),
+            state_details,
             mermaid: mermaid.lines().map(str::to_string).collect(),
         })
+    }
+
+    fn diagram(&self, theme: &Theme, width: usize, selected: Option<&str>) -> Option<BlockDiagram> {
+        let options = DiagramRenderOptions {
+            selected_state: selected,
+            live_nodes: None,
+            max_width: Some(width.saturating_sub(2)),
+            inherit_model: None,
+        };
+        match &self.graph {
+            LibraryGraph::Spec(spec) => machine_block_diagram(theme, spec, &options),
+            LibraryGraph::Snapshot(snapshot) if snapshot.states.is_empty() => None,
+            LibraryGraph::Snapshot(snapshot) => Some(super::blocks::block_diagram_with_options(
+                theme,
+                &snapshot.states,
+                &snapshot.transitions,
+                &options,
+            )),
+        }
+    }
+
+    /// The node view's input: the `fsm-edit` state details, else what the
+    /// snapshot's state row carries.
+    fn node_detail(&self, state_id: &str) -> Value {
+        if let Some(detail) = self.state_details.get(state_id) {
+            return detail.clone();
+        }
+        let state = match &self.graph {
+            LibraryGraph::Snapshot(snapshot) => snapshot.states.iter().find(|s| s.id == state_id),
+            LibraryGraph::Spec(_) => None,
+        };
+        match state {
+            Some(state) => serde_json::json!({
+                "id": state.id,
+                "kind": if state.python.is_some() { "python" } else { "agent" },
+                "entry": state.entry,
+                "model": state.model.clone().unwrap_or_default(),
+                "run": state.python.clone().unwrap_or_default(),
+                "max_entries": state.max_entries,
+            }),
+            None => serde_json::json!({ "id": state_id }),
+        }
     }
 }
 
@@ -128,6 +219,10 @@ pub enum LibraryViewAction {
     /// Esc inside a drill-in: back out to the list. The session fences the
     /// drill-in's pending request with this action.
     Back,
+    /// `e`: open the machine in the Machine Editor.
+    Edit { name: String },
+    /// `n`: launch a run.
+    Run { name: String },
 }
 
 /// The machine library page: the machine list, the selection, the open
@@ -143,6 +238,12 @@ pub struct LibraryView {
     loading: bool,
     /// The detail document window's first row (0 = the top).
     detail_scroll: usize,
+    /// The diagram's selected node.
+    selected_node: Option<String>,
+    /// `M`: the drill-in shows the raw mermaid source instead of the diagram.
+    show_mermaid: bool,
+    /// The open node view's scroll offset; `None` shows the diagram.
+    node_scroll: Option<usize>,
     viewport_rows: usize,
     viewport_width: usize,
 }
@@ -164,6 +265,9 @@ impl LibraryView {
             list_error: None,
             loading: false,
             detail_scroll: 0,
+            selected_node: None,
+            show_mermaid: false,
+            node_scroll: None,
             viewport_rows,
             viewport_width: usize::MAX,
         }
@@ -236,6 +340,7 @@ impl LibraryView {
             // reachable from the visible list.
             self.detail = None;
             self.detail_scroll = 0;
+            self.node_scroll = None;
         }
     }
 
@@ -245,8 +350,17 @@ impl LibraryView {
     pub fn apply_detail(&mut self, name: &str, data: &Value) {
         match LibraryDetail::parse(data) {
             Some(detail) => {
+                let theme = Theme::builtin("prime", crate::theme::ColorMode::TrueColor);
+                let same = self.open_machine_name().as_deref() == Some(detail.name.as_str());
+                if !same {
+                    self.detail_scroll = 0;
+                    self.show_mermaid = false;
+                    self.node_scroll = None;
+                    self.selected_node = detail
+                        .diagram(&theme, 200, None)
+                        .and_then(|diagram| diagram.node_spans.first().map(|span| span.0.clone()));
+                }
                 self.detail = Some(detail);
-                self.detail_scroll = 0;
                 self.error = None;
             }
             None => {
@@ -255,42 +369,80 @@ impl LibraryView {
         }
     }
 
-    /// One key press on the activity pages' picker keyset: the arrows
-    /// walk the list selection (or scroll the open drill-in's document),
-    /// Enter drills into the selected machine (the list) and Esc backs
-    /// out of the drill-in before it closes the page.
+    /// One key press. The list: the arrows walk the selection, Enter drills
+    /// in, `e` edits, `n` runs, Esc/← close. The drill-in: ↑/↓ select a node,
+    /// PgUp/PgDn scroll, Enter opens the node's files, `M` toggles the
+    /// mermaid source, `e`/`n` as on the list, Esc/← back to the list.
     #[must_use]
     pub fn handle_key(&mut self, key: &str, kb: &KeybindingsManager) -> LibraryViewAction {
-        if key == "ctrl+c" || kb.matches(key, "tui.select.cancel") {
-            // Esc backs out of the open drill-in before it closes the
-            // page — the drill-in's back, on the one close key the page
-            // carries (the factory page's keyset).
-            if self.detail.is_some() {
-                self.detail = None;
-                self.detail_scroll = 0;
-                self.error = None;
-                return LibraryViewAction::Back;
+        let cancel = key == "ctrl+c" || kb.matches(key, "tui.select.cancel");
+        let back = cancel || key == "left" || kb.matches(key, "app.modal.back");
+        let up = kb.matches(key, "tui.select.up");
+        let down = kb.matches(key, "tui.select.down");
+        let page_up = key == "pageup" || kb.matches(key, "tui.select.pageUp");
+        let page_down = key == "pagedown" || kb.matches(key, "tui.select.pageDown");
+        let Some(detail) = self.detail.as_ref() else {
+            if back {
+                return LibraryViewAction::Close;
             }
-            return LibraryViewAction::Close;
-        }
-        if kb.matches(key, "tui.select.up") || kb.matches(key, "tui.select.down") {
-            let delta: isize = if kb.matches(key, "tui.select.up") {
-                -1
-            } else {
-                1
+            if up || down {
+                self.move_selection(if up { -1 } else { 1 });
+                return LibraryViewAction::None;
+            }
+            let Some(name) = self.selected_machine().map(|m| m.name.clone()) else {
+                return LibraryViewAction::None;
             };
-            match self.detail {
-                Some(_) => self.scroll_detail(delta),
-                None => self.move_selection(delta),
+            return match key {
+                "e" => LibraryViewAction::Edit { name },
+                "n" => LibraryViewAction::Run { name },
+                _ if kb.matches(key, "tui.select.confirm") => LibraryViewAction::DrillIn { name },
+                _ => LibraryViewAction::None,
+            };
+        };
+        let name = detail.name.clone();
+        if let Some(scroll) = self.node_scroll.as_mut() {
+            if back || key == "q" {
+                self.node_scroll = None;
+            } else if up {
+                *scroll = scroll.saturating_sub(1);
+            } else if down {
+                *scroll += 1;
+            } else if page_up {
+                *scroll = scroll.saturating_sub(10);
+            } else if page_down {
+                *scroll += 10;
             }
             return LibraryViewAction::None;
         }
-        if self.detail.is_none() && kb.matches(key, "tui.select.confirm") {
-            if let Some(machine) = self.selected_machine() {
-                return LibraryViewAction::DrillIn {
-                    name: machine.name.clone(),
-                };
+        if back {
+            self.detail = None;
+            self.detail_scroll = 0;
+            self.error = None;
+            return LibraryViewAction::Back;
+        }
+        match key {
+            "e" => return LibraryViewAction::Edit { name },
+            "n" => return LibraryViewAction::Run { name },
+            "M" | "shift+m" => {
+                self.show_mermaid = !self.show_mermaid;
+                self.detail_scroll = 0;
+                return LibraryViewAction::None;
             }
+            _ => {}
+        }
+        if up || down {
+            let delta = if up { -1 } else { 1 };
+            if self.show_mermaid || !self.step_node(delta) {
+                self.scroll_detail(delta);
+            }
+        } else if page_up || page_down {
+            let page = self.detail_visible_rows(usize::MAX).max(1) as isize;
+            self.scroll_detail(if page_up { -page } else { page });
+        } else if kb.matches(key, "tui.select.confirm")
+            && !self.show_mermaid
+            && self.selected_node.is_some()
+        {
+            self.node_scroll = Some(0);
         }
         LibraryViewAction::None
     }
@@ -304,12 +456,53 @@ impl LibraryView {
             (self.selected as isize + delta).clamp(0, self.machines.len() as isize - 1) as usize;
     }
 
-    /// One arrow step on the open drill-in: the document window scrolls a
-    /// row (the diagram rides the top; the mermaid text below it).
+    /// One arrow step on the diagram: the selection walks the nodes in the
+    /// diagram's order and the window follows it. False when the diagram has
+    /// no nodes to select.
+    fn step_node(&mut self, delta: isize) -> bool {
+        let theme = Theme::builtin("prime", crate::theme::ColorMode::TrueColor);
+        let Some(detail) = self.detail.as_ref() else {
+            return false;
+        };
+        let (document, spans) = Self::detail_document(
+            &theme,
+            self.viewport_width,
+            detail,
+            self.selected_node.as_deref(),
+            false,
+        );
+        if spans.is_empty() {
+            return false;
+        }
+        let current = self
+            .selected_node
+            .as_deref()
+            .and_then(|id| spans.iter().position(|(span, _, _)| span == id));
+        let next = match current {
+            Some(index) => (index as isize + delta).clamp(0, spans.len() as isize - 1) as usize,
+            None => 0,
+        };
+        let (id, top, bottom) = spans[next].clone();
+        self.selected_node = Some(id);
+        let visible = self.detail_visible_rows(document.len());
+        self.detail_scroll =
+            scroll_to_span(self.detail_scroll, top, bottom, visible, document.len());
+        true
+    }
+
+    /// Scroll the open drill-in's document window.
     fn scroll_detail(&mut self, delta: isize) {
         let theme = Theme::builtin("prime", crate::theme::ColorMode::TrueColor);
         let total = self.detail.as_ref().map_or(0, |detail| {
-            Self::detail_document(&theme, self.viewport_width, detail).len()
+            Self::detail_document(
+                &theme,
+                self.viewport_width,
+                detail,
+                self.selected_node.as_deref(),
+                self.show_mermaid,
+            )
+            .0
+            .len()
         });
         let visible = self.detail_visible_rows(total);
         let max = total.saturating_sub(visible);
@@ -331,8 +524,8 @@ impl LibraryView {
             .min(total.max(1))
     }
 
-    /// Render the page: the machine list, or the open drill-in's document
-    /// (the diagram plus the mermaid panel) — the error row and the key
+    /// Render the page: the machine list, or the open drill-in (the diagram,
+    /// the mermaid source, or one node's files) — the error row and the key
     /// hint pinned at the frame's end either way.
     #[must_use]
     pub fn render(
@@ -344,62 +537,115 @@ impl LibraryView {
     ) -> Vec<Line> {
         self.viewport_rows = viewport_rows;
         self.viewport_width = width;
-        match &self.detail {
-            Some(detail) => {
-                let document = Self::detail_document(theme, width, detail);
-                self.render_detail(theme, width, kb, document)
-            }
-            None => self.render_list(theme, width, kb),
+        let Some(detail) = &self.detail else {
+            return self.render_list(theme, width, kb);
+        };
+        if let (Some(scroll), Some(node)) = (self.node_scroll, self.selected_node.as_deref()) {
+            let body = render_node_detail_lines(theme, width, node, &detail.node_detail(node));
+            let visible = self.detail_visible_rows(body.len());
+            let scroll = scroll.min(body.len().saturating_sub(visible));
+            self.node_scroll = Some(scroll);
+            let hint = format!(
+                "{} scroll · {} back",
+                updown(kb),
+                key_text(kb, "tui.select.cancel", "Esc")
+            );
+            return self.render_window(theme, width, body, scroll, &hint);
         }
-    }
-
-    /// The detail document: the machine's header, its diagram (the run
-    /// page's existing renderer over the same snapshot shape the
-    /// active-run graph lane answers), and the mermaid text panel below
-    /// it. The key loop counts the same rows for its scroll bounds.
-    fn detail_document(theme: &Theme, width: usize, detail: &LibraryDetail) -> Vec<Line> {
-        let mut document: Vec<Line> = Vec::new();
-        let mut header: Line = vec![Span::raw("  ")];
-        header.push(theme.fg_span(ThemeColor::ToolTitle, "machine: "));
-        header.push(theme.fg_span(ThemeColor::Text, detail.name.clone()));
-        if !detail.description.is_empty() {
-            header.push(theme.fg_span(ThemeColor::Muted, format!(" — {}", detail.description)));
-        }
-        document.push(truncate_line(&header, width, ""));
-        document.push(vec![Span::raw("")]);
-        super::FactoryView::render_diagram(theme, &detail.snapshot, None, &mut document);
-        document.push(vec![Span::raw("")]);
-        let mut title: Line = vec![Span::raw("  ")];
-        title.push(theme.fg_span(ThemeColor::ToolTitle, "mermaid"));
-        document.push(title);
-        for line in &detail.mermaid {
-            let row = vec![
-                Span::raw("  "),
-                theme.fg_span(ThemeColor::MdCodeBlock, line.clone()),
-            ];
-            document.extend(crate::width::wrap_line(&row, width));
-        }
-        document
-    }
-
-    /// The drill-in mode: the document's scroll window (the diagram rides
-    /// the top, the mermaid text below), the error row, and the hint
-    /// pinned at the frame's end — the info panel's own geometry.
-    fn render_detail(
-        &mut self,
-        theme: &Theme,
-        width: usize,
-        kb: &KeybindingsManager,
-        document: Vec<Line>,
-    ) -> Vec<Line> {
+        let (document, _) = Self::detail_document(
+            theme,
+            width,
+            detail,
+            self.selected_node.as_deref(),
+            self.show_mermaid,
+        );
         let total = document.len();
         let visible = self.detail_visible_rows(total);
         self.detail_scroll = self.detail_scroll.min(total.saturating_sub(visible));
-        let mut rows: Vec<Line> = document
+        let back = key_text(kb, "tui.select.cancel", "Esc");
+        let hint = if self.show_mermaid {
+            format!(
+                "{} scroll · M diagram · e edit · n run · {back} back",
+                updown(kb)
+            )
+        } else {
+            format!(
+                "{} node · PgUp/PgDn scroll · {} files · M mermaid · e edit · n run · {back} back",
+                updown(kb),
+                key_text(kb, "tui.select.confirm", "Enter")
+            )
+        };
+        self.render_window(theme, width, document, self.detail_scroll, &hint)
+    }
+
+    /// The detail document: the machine header (`machine:` + `params:`),
+    /// then the interactive block diagram with the selected node
+    /// highlighted, or the raw mermaid source. Returns the node spans
+    /// (`(state, top, bottom)` document rows) the selection walks.
+    #[allow(clippy::type_complexity)]
+    fn detail_document(
+        theme: &Theme,
+        width: usize,
+        detail: &LibraryDetail,
+        selected: Option<&str>,
+        mermaid: bool,
+    ) -> (Vec<Line>, Vec<(String, usize, usize)>) {
+        let mut document = machine_header_lines(
+            theme,
+            width,
+            &detail.name,
+            &detail.description,
+            &detail.params,
+        );
+        document.push(vec![Span::raw("")]);
+        let muted = |text: &str| {
+            vec![
+                Span::raw("  "),
+                theme.fg_span(ThemeColor::Muted, text.to_string()),
+            ]
+        };
+        if mermaid {
+            let mut title: Line = vec![Span::raw("  ")];
+            title.push(theme.fg_span(ThemeColor::ToolTitle, "mermaid"));
+            document.push(title);
+            if detail.mermaid.is_empty() {
+                document.push(muted("No mermaid source for this machine."));
+            }
+            for line in &detail.mermaid {
+                let row = vec![
+                    Span::raw("  "),
+                    theme.fg_span(ThemeColor::MdCodeBlock, line.clone()),
+                ];
+                document.extend(crate::width::wrap_line(&row, width));
+            }
+            return (document, Vec::new());
+        }
+        let Some(diagram) = detail.diagram(theme, width, selected) else {
+            document.push(muted("This machine has no states to draw."));
+            return (document, Vec::new());
+        };
+        let offset = document.len();
+        let spans = diagram
+            .node_spans
             .into_iter()
-            .skip(self.detail_scroll)
-            .take(visible)
+            .map(|(id, top, bottom)| (id, top + offset, bottom + offset))
             .collect();
+        document.extend(diagram.lines);
+        (document, spans)
+    }
+
+    /// The drill-in frame: the document's scroll window, the error row, and
+    /// the hint pinned at the frame's end — the info panel's own geometry.
+    fn render_window(
+        &self,
+        theme: &Theme,
+        width: usize,
+        document: Vec<Line>,
+        scroll: usize,
+        hint: &str,
+    ) -> Vec<Line> {
+        let visible = self.detail_visible_rows(document.len());
+        let mut rows: Vec<Line> = document.into_iter().skip(scroll).take(visible).collect();
         if let Some(error) = self.visible_error() {
             rows.push(vec![
                 Span::raw("  "),
@@ -409,10 +655,7 @@ impl LibraryView {
         rows.push(vec![Span::raw("")]);
         rows.push(vec![
             Span::raw("  "),
-            theme.fg_span(
-                ThemeColor::Dim,
-                list_hint(kb, "scroll", "back", /*confirm*/ None),
-            ),
+            theme.fg_span(ThemeColor::Dim, hint.to_string()),
         ]);
         // Shed footer rows before the frame can crop the document from the front.
         rows.truncate(self.viewport_rows.max(1));
@@ -472,10 +715,7 @@ impl LibraryView {
         tail.push(vec![Span::raw("")]);
         tail.push(vec![
             Span::raw("  "),
-            theme.fg_span(
-                ThemeColor::Dim,
-                list_hint(kb, "move", "close", Some("open")),
-            ),
+            theme.fg_span(ThemeColor::Dim, list_hint(kb)),
         ]);
         // Keep the selected machine before chrome when the dock is short.
         let budget = self.viewport_rows.max(1);
@@ -497,20 +737,26 @@ impl LibraryView {
     }
 }
 
-/// The page's navigation hint, with Enter shown only on the machine list.
-fn list_hint(kb: &KeybindingsManager, middle: &str, close: &str, confirm: Option<&str>) -> String {
-    let key = |binding: &str, fallback: &str| {
-        kb.first_key(binding)
-            .map_or_else(|| fallback.to_string(), |key| format_key_text(&key))
-    };
-    let confirm = confirm.map_or_else(String::new, |action| {
-        format!(" · {} {action}", key("tui.select.confirm", "Enter"))
-    });
+fn key_text(kb: &KeybindingsManager, binding: &str, fallback: &str) -> String {
+    kb.first_key(binding)
+        .map_or_else(|| fallback.to_string(), |key| format_key_text(&key))
+}
+
+fn updown(kb: &KeybindingsManager) -> String {
     format!(
-        "{}/{} {middle}{confirm} · {} {close}",
-        key("tui.select.up", "\u{2191}"),
-        key("tui.select.down", "\u{2193}"),
-        key("tui.select.cancel", "Esc"),
+        "{}/{}",
+        key_text(kb, "tui.select.up", "\u{2191}"),
+        key_text(kb, "tui.select.down", "\u{2193}")
+    )
+}
+
+/// The machine list's navigation hint.
+fn list_hint(kb: &KeybindingsManager) -> String {
+    format!(
+        "{} move · {} open · e edit · n run · {} close",
+        updown(kb),
+        key_text(kb, "tui.select.confirm", "Enter"),
+        key_text(kb, "tui.select.cancel", "Esc"),
     )
 }
 
@@ -645,17 +891,17 @@ mod tests {
             "the header renders: {text}"
         );
         assert!(
-            text.contains("entry  pending  [entry]"),
-            "the diagram renders: {text}"
+            text.contains('┌') || text.contains('╭'),
+            "the block diagram renders: {text}"
         );
+        assert!(text.contains("reviewing"), "{text}");
         assert!(
-            text.contains("when verdict exists"),
-            "the diagram carries the guarded edge: {text}"
+            !text.contains("stateDiagram-v2"),
+            "no raw mermaid by default: {text}"
         );
-        assert!(
-            text.contains("mermaid"),
-            "the mermaid panel title renders: {text}"
-        );
+        // `M` swaps the diagram for the raw mermaid source, and back.
+        assert_eq!(view.handle_key("M", &kb()), LibraryViewAction::None);
+        let text = plain(&view.render(&theme(), 100, &kb(), 30));
         assert!(
             text.contains("stateDiagram-v2"),
             "the mermaid text renders as plain rows: {text}"
@@ -664,6 +910,7 @@ mod tests {
             text.contains("state \"entry\" as entry"),
             "the mermaid state line rides the panel: {text}"
         );
+        assert_eq!(view.handle_key("M", &kb()), LibraryViewAction::None);
         // Esc backs out to the list first (the Back action fences the
         // drill-in's pending reply); the second Esc closes.
         assert_eq!(view.handle_key("escape", &kb()), LibraryViewAction::Back);
@@ -870,6 +1117,7 @@ mod tests {
         for (terminal_rows, budget) in [(5, 1), (6, 2)] {
             let mut library = LibraryView::new(Vec::new(), 20);
             library.apply_detail("builder", &graph("entry --> checking\nchecking --> done"));
+            library.show_mermaid = true;
             let mut view = crate::view::AgentView::new(theme());
             // A six-row frame can arrive before the cached terminal size catches up.
             view.set_terminal_rows(terminal_rows);
@@ -880,8 +1128,15 @@ mod tests {
                 unreachable!()
             };
             assert_eq!(library.viewport_rows, budget);
-            let document_rows =
-                LibraryView::detail_document(&theme(), 100, library.detail.as_ref().unwrap()).len();
+            let document_rows = LibraryView::detail_document(
+                &theme(),
+                100,
+                library.detail.as_ref().unwrap(),
+                None,
+                true,
+            )
+            .0
+            .len();
             for _ in 0..document_rows {
                 assert_eq!(library.handle_key("down", &kb()), LibraryViewAction::None);
             }
@@ -908,23 +1163,90 @@ mod tests {
         }
     }
 
+    /// Enter on the diagram opens the selected node's files; Esc returns to
+    /// the diagram at the same scroll, ← backs out to the list, and ← closes.
     #[test]
-    fn enter_keeps_the_open_detail_and_scroll_position() {
+    fn enter_opens_the_node_files_and_esc_returns_to_the_diagram() {
         let mut view = LibraryView::new(
             vec![LibraryMachine {
-                name: "builder".to_string(),
+                name: "gate-check".to_string(),
                 description: String::new(),
                 source: "repo".to_string(),
             }],
-            6,
+            30,
         );
-        view.apply_detail("builder", &graph(&"entry --> entry\n".repeat(20)));
-        let _ = view.render(&theme(), 100, &kb(), 6);
+        view.apply_detail("gate-check", &describe_reply());
+        let diagram = plain(&view.render(&theme(), 100, &kb(), 30));
+        assert!(diagram.contains("machine: gate-check"), "{diagram}");
+        assert!(diagram.contains("params: base"), "{diagram}");
+        assert!(diagram.contains("Enter files"), "{diagram}");
+        assert_eq!(view.selected_node.as_deref(), Some("lint"));
         assert_eq!(view.handle_key("down", &kb()), LibraryViewAction::None);
-        let before = view.render(&theme(), 100, &kb(), 6);
-        assert!(view.detail_scroll > 0);
+        assert_eq!(view.selected_node.as_deref(), Some("ship"));
         assert_eq!(view.handle_key("enter", &kb()), LibraryViewAction::None);
-        assert_eq!(view.render(&theme(), 100, &kb(), 6), before);
+        let files = plain(&view.render(&theme(), 100, &kb(), 30));
+        assert!(files.contains("node: ship"), "{files}");
+        assert!(files.contains("prompts/ship.md"), "{files}");
+        assert_eq!(view.handle_key("escape", &kb()), LibraryViewAction::None);
+        let back = plain(&view.render(&theme(), 100, &kb(), 30));
+        assert!(back.contains("machine: gate-check"), "{back}");
+        assert!(!back.contains("node: ship"), "{back}");
+        assert_eq!(
+            view.handle_key("e", &kb()),
+            LibraryViewAction::Edit {
+                name: "gate-check".to_string()
+            }
+        );
+        assert_eq!(
+            view.handle_key("n", &kb()),
+            LibraryViewAction::Run {
+                name: "gate-check".to_string()
+            }
+        );
+        assert_eq!(view.handle_key("left", &kb()), LibraryViewAction::Back);
+        assert_eq!(view.handle_key("left", &kb()), LibraryViewAction::Close);
+    }
+
+    /// `pa thread fsm-edit draft`'s answer: the no-kernel drill-in.
+    fn describe_reply() -> Value {
+        json!({
+            "draft": "/d/.pa-edit-1", "name": "gate-check", "target": "pa-view-1",
+            "description": "Lint, then ship.",
+            "params": [{"name": "base", "default": "main"}],
+            "states": [],
+            "state_details": {
+                "ship": {"id": "ship", "kind": "agent", "model": "anthropic/x",
+                         "files": [{"label": "prompt (prompts/ship.md)", "text": "Ship it."}]}
+            },
+            "graph": {
+                "states": [{"id": "lint", "entry": true, "subagent": {"model": "anthropic/x"}},
+                           {"id": "ship", "subagent": {"model": "anthropic/x"}}],
+                "transitions": [{"from": "lint", "to": "ship"}]
+            }
+        })
+    }
+
+    /// The machine list's own actions: `e` edits and `n` runs the selected
+    /// machine, and a list row from `fsm-edit list` (no description) parses.
+    #[test]
+    fn the_list_edits_and_runs_the_selected_machine() {
+        let data = json!({"machines": [
+            {"name": "gate-check", "source": "repo", "kind": "toml", "editable": false}
+        ]});
+        let mut view = LibraryView::new(parse_library_machines(&data), 20);
+        assert_eq!(
+            view.handle_key("e", &kb()),
+            LibraryViewAction::Edit {
+                name: "gate-check".to_string()
+            }
+        );
+        assert_eq!(
+            view.handle_key("n", &kb()),
+            LibraryViewAction::Run {
+                name: "gate-check".to_string()
+            }
+        );
+        assert_eq!(view.handle_key("left", &kb()), LibraryViewAction::Close);
     }
 
     #[test]
@@ -932,6 +1254,7 @@ mod tests {
         let mut view = LibraryView::new(Vec::new(), 6);
         let mermaid = format!("{}TAIL", "x".repeat(60));
         view.apply_detail("builder", &graph(&mermaid));
+        assert_eq!(view.handle_key("M", &kb()), LibraryViewAction::None);
         let _ = view.render(&theme(), 12, &kb(), 6);
         let mut end = Vec::new();
         for _ in 0..100 {
@@ -942,7 +1265,7 @@ mod tests {
         assert!(text.contains("TAIL"), "{text}");
         assert!(end.iter().all(|row| crate::width::line_width(row) <= 12));
         let detail = view.detail.as_ref().unwrap();
-        let source = LibraryView::detail_document(&theme(), 12, detail);
+        let (source, _) = LibraryView::detail_document(&theme(), 12, detail, None, true);
         let title = source
             .iter()
             .position(|row| plain(std::slice::from_ref(row)).trim() == "mermaid")

@@ -726,10 +726,8 @@ async fn run_interactive_surface(
         );
     }
     if !headless {
-        let hint = std::env::current_dir()
-            .ok()
-            .and_then(|cwd| super::captain_hint::missing_captain_hint(&cwd));
-        if let Some(hint) = hint {
+        // The status watcher resolved the project root once at session start.
+        if let Some(hint) = session.missing_captain_hint() {
             view.push_entry(crate::chat::ChatEntry::Status {
                 text: hint.to_string(),
                 kind: crate::chat::StatusKind::Info,
@@ -770,7 +768,9 @@ async fn run_interactive_surface(
     // previous chat view of this session left via the agents view or a
     // switch) returns to the editor when its chat reopens.
     session.restore_prompt_stash_on_open(&mut view);
-    // A chat of a Captain project shows its breadcrumb once the Captain records load.
+    // A chat of a Captain project shows its breadcrumb once the Captain records load,
+    // and its bottom activity dock reads the atomic status file immediately with no subprocess.
+    session.poll_captain_status(&mut view);
     session.refresh_captain_context();
     if let super::SessionSelection::ResumeWith {
         draft: Some(draft), ..
@@ -1395,11 +1395,15 @@ async fn run_interactive_surface(
         let auto_scroll_armed = session.selection_auto_scroll_armed();
         let bash_refresh_wanted = session.kernel_bash_supported();
         let factory_refresh_wanted = session.factory_activity_supported();
-        // The open Captain panel or crew picker re-reads the Captain records on the same cadence.
-        let captain_refresh_wanted = matches!(
+        // The open Captain panel or crew picker re-reads the Captain records on the same cadence;
+        // when neither bash nor factory polling is armed, also stat the Captain status file on
+        // that cadence if a Captain hub exists.
+        let captain_overlay_open = matches!(
             view.overlay,
             Some(crate::view::Overlay::Captain(_) | crate::view::Overlay::CrewPicker(_))
         );
+        let captain_refresh_wanted = captain_overlay_open
+            || (!bash_refresh_wanted && !factory_refresh_wanted && session.captain_hub_present());
         // A settle waiting out a member is pending work like the
         // autocomplete park: the gate runs at the loop top, so its
         // re-check (and the settle bound's expiry) needs this arm's
@@ -1577,9 +1581,7 @@ async fn run_interactive_surface(
             maybe_captain = captain_rx.recv() => {
                 if let Some(update) = maybe_captain {
                     session.apply_captain_update(update, &mut view);
-                    if let Some((path, draft, factory)) = session.pending_captain_open.take() {
-                        session.open_captain_session(&mut view, path, draft, factory).await?;
-                    }
+                    session.open_pending_captain_session(&mut view).await?;
                 }
             }
             maybe_library = library_rx.recv() => {
@@ -1763,6 +1765,8 @@ async fn run_interactive_surface(
             } => {
                 last_bash_refresh = Instant::now();
                 session.spawn_bash_activity_refresh();
+                session.poll_captain_status(&mut view);
+                session.open_pending_captain_session(&mut view).await?;
                 session.refresh_expanded_dock(&mut view);
             }
             () = async {
@@ -1782,6 +1786,8 @@ async fn run_interactive_surface(
             } => {
                 last_factory_refresh = Instant::now();
                 session.spawn_factory_refresh();
+                session.poll_captain_status(&mut view);
+                session.open_pending_captain_session(&mut view).await?;
             }
             _captain_tick = async {
                 if !captain_refresh_wanted {
@@ -1793,7 +1799,11 @@ async fn run_interactive_surface(
                 .await;
             } => {
                 last_captain_refresh = Instant::now();
-                session.poll_captain(&view);
+                session.poll_captain_status(&mut view);
+                session.open_pending_captain_session(&mut view).await?;
+                if captain_overlay_open {
+                    session.poll_captain(&view);
+                }
             }
             _frame = async {
                 match render_deadline {

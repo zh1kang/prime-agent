@@ -10,6 +10,7 @@ use super::{AgentView, Overlay};
 use crate::captain_view::{
     CaptainAction, CaptainSnapshot, CaptainView, ComposePurpose, OpenTarget,
 };
+use crate::image_load::LoadedImage;
 use crate::interactive::SessionSelection;
 use crate::session_ui::picker_viewport_rows;
 use crate::session_ui::sessions_fork::create_session;
@@ -39,11 +40,129 @@ pub(crate) enum CaptainUpdate {
         explicit: bool,
         result: Result<Value, String>,
     },
+    /// A chart edit's reply; on success the factory's review page loads.
+    Saved {
+        project: String,
+        name: String,
+        result: Result<Value, String>,
+    },
+    /// A Captain file's `edit-history` reply.
+    History {
+        project: String,
+        field: String,
+        result: Result<Value, String>,
+    },
     /// A workspace page's `pa thread` call.
     Workspace {
         request: crate::workspace_view::WorkspaceRequest,
         result: Result<Value, String>,
     },
+}
+
+/// A chat to open in place: its session file, a draft for the editor, and whether the
+/// factory page opens over it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CaptainOpen {
+    pub path: PathBuf,
+    pub draft: Option<String>,
+    pub factory: bool,
+    /// A repeat of an open that waited for a running turn: its notice was already shown.
+    pub retry: bool,
+}
+
+/// A message for the Captain waiting for the `lead` call before it to answer, so messages
+/// reach the Captain in the order they were typed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CaptainLead {
+    pub project: String,
+    pub text: String,
+    pub done: String,
+    /// `lead` queues a server-side Captain turn; `steer` reaches a running one.
+    pub op: &'static str,
+    /// Hub-owned copies of the images attached to the message.
+    pub images: Vec<String>,
+}
+
+/// The most images one Captain message carries, so a turn's context stays bounded.
+const MAX_CAPTAIN_IMAGES: usize = 4;
+
+const STEERED_NOTE: &str = "Steered Captain";
+const QUEUED_NOTE: &str = "Queued for Captain (CLI provider / digest turn)";
+
+/// `<hub>/captains/attachments`, where Captain chat images live for the turns that read them.
+fn captain_attachments_dir() -> PathBuf {
+    if let Some(home) = std::env::var_os("PA_CAPTAIN_HOME") {
+        return PathBuf::from(home).join("captains/attachments");
+    }
+    let hub = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .and_then(|home| {
+            [home.join(".prime/harness"), home.join(".prime/agent")]
+                .into_iter()
+                .find(|hub| hub.join("captains").is_dir())
+        });
+    hub.unwrap_or_else(std::env::temp_dir)
+        .join("captains/attachments")
+}
+
+/// Write each image into `dir` as `<uuid>.<ext>` and return the paths.
+fn save_captain_images(dir: &Path, images: &[&LoadedImage]) -> Result<Vec<String>, String> {
+    use base64::Engine as _;
+    std::fs::create_dir_all(dir).map_err(|e| format!("Could not save the image: {e}"))?;
+    images
+        .iter()
+        .map(|image| {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(&image.data)
+                .map_err(|e| format!("Could not read the image: {e}"))?;
+            let ext = image.mime_type.strip_prefix("image/").map_or("png", |ext| {
+                if ext == "jpeg" {
+                    "jpg"
+                } else {
+                    ext
+                }
+            });
+            let path = dir.join(format!("{}.{ext}", uuid::Uuid::new_v4()));
+            std::fs::write(&path, bytes).map_err(|e| format!("Could not save the image: {e}"))?;
+            Ok(path.to_string_lossy().into_owned())
+        })
+        .collect()
+}
+
+/// An `open` reply naming a native session with no handoff, as a live step subagent's is.
+fn native_open_target(reply: &Value) -> Option<OpenTarget> {
+    if reply.get("kind").and_then(Value::as_str) != Some("native") {
+        return None;
+    }
+    let path = reply.get("session")?.as_str()?.trim();
+    (!path.is_empty()).then(|| OpenTarget::Session {
+        path: path.to_owned(),
+        factory: false,
+        draft: None,
+    })
+}
+
+/// An older backend that knows no `act steer`.
+fn steer_unsupported(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("steer")
+        && ["unknown", "unsupported", "invalid choice", "not supported"]
+            .iter()
+            .any(|marker| lower.contains(marker))
+}
+
+/// A `steer` or `lead` reply's note: whether the running turn took the message.
+fn captain_delivery_note(op: &str, reply: &Value) -> &'static str {
+    let steered = reply
+        .get("steered")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || reply.get("delivery").and_then(Value::as_str) == Some("steered");
+    if op == "steer" && steered {
+        STEERED_NOTE
+    } else {
+        QUEUED_NOTE
+    }
 }
 
 /// A text step waiting in pa's prompt editor; the chat's own draft waits beside it.
@@ -69,18 +188,36 @@ pub(crate) enum ComposeOwner {
 pub(crate) struct CaptainContext {
     pub project: String,
     pub project_name: String,
-    /// The open chat's label: "captain" or the crew member's title.
+    /// The Captain or crew chat the open chat is, or descends from: "captain" or the crew
+    /// member's title.
     pub chat: String,
-    /// Every chat of the project that pa can open: (label, session path, member id).
+    /// The open subagent's name when the open chat is a subagent of `chat`.
+    pub subagent: Option<String>,
+    /// Every chat of the project that pa can open: the Captain, the crew, and live runs.
     pub chats: Vec<CrewChat>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CrewChat {
     pub label: String,
     pub session: Option<String>,
     pub member: Option<String>,
     pub busy: bool,
+    /// needs_you, working, paused, failed, or idle.
+    pub status: String,
+    /// The short model badge.
+    pub model: Option<String>,
+    /// captain, chat, factory, or the provider of a provider CLI thread.
+    pub kind: String,
+    /// A Captain run's id in its host session.
+    pub run_id: Option<String>,
+}
+
+impl CrewChat {
+    /// A provider CLI thread: no native session, so the panel's thread view shows it.
+    pub(crate) fn is_provider_thread(&self) -> bool {
+        self.session.is_none() && self.member.is_some() && self.kind != "factory"
+    }
 }
 
 fn same_file(a: &str, b: &str) -> bool {
@@ -92,58 +229,178 @@ fn same_file(a: &str, b: &str) -> bool {
     a == b || canonical(a) == canonical(b)
 }
 
-/// The project and chat label for `session_file`, from a status snapshot.
+/// The switchable chats of one project: the Captain, its crew chats and provider threads,
+/// and its live factory runs.
+fn project_chats(project: &crate::captain_view::CaptainProject) -> Vec<CrewChat> {
+    let lead_status = match project.lead_state.as_str() {
+        "needs_you" => "needs_you",
+        _ if project.lead_busy || project.lead_state == "running" => "working",
+        _ => "idle",
+    };
+    let short = |model: &str| {
+        (!model.is_empty()).then(|| model.rsplit('/').next().unwrap_or(model).to_owned())
+    };
+    let mut chats = vec![CrewChat {
+        label: "captain".into(),
+        session: project.lead_session.clone(),
+        member: None,
+        busy: project.lead_busy,
+        status: lead_status.into(),
+        model: short(&project.model),
+        kind: "captain".into(),
+        run_id: None,
+    }];
+    let live_run = |m: &crate::captain_view::CaptainMember| {
+        !matches!(
+            m.run_state.as_deref(),
+            Some("done" | "failed" | "stopped" | "lost" | "cancelled")
+        ) && m.state != "done"
+    };
+    chats.extend(
+        project
+            .crew
+            .iter()
+            .filter(|m| !m.archived && (!m.is_run() || live_run(m)))
+            .map(|m| CrewChat {
+                label: m.label(),
+                session: (!m.is_run()).then(|| m.session.clone()).flatten(),
+                member: Some(m.id.clone()),
+                busy: m.busy,
+                status: m.chat_status().into(),
+                model: (!m.is_run()).then(|| m.short_model_badge()).flatten(),
+                kind: if m.is_run() {
+                    "factory".into()
+                } else if m.session.is_some() {
+                    "chat".into()
+                } else {
+                    m.provider.clone()
+                },
+                run_id: m.run_id.clone(),
+            }),
+    );
+    chats
+}
+
+/// The project and chat label for `session_file`, from a status snapshot. `ancestors` are
+/// the session files `session_file` descends from (a subagent's parent first), so a subagent
+/// of a Captain or crew chat keeps its project.
 pub(crate) fn captain_context(
     snapshot: &CaptainSnapshot,
     session_file: &str,
+    ancestors: &[(String, String)],
 ) -> Option<CaptainContext> {
-    for project in &snapshot.projects {
-        let mut chats = vec![CrewChat {
-            label: "captain".into(),
-            session: project.lead_session.clone(),
-            member: None,
-            busy: project.lead_busy,
-        }];
-        chats.extend(
-            project
-                .crew
-                .iter()
-                .filter(|m| m.kind != "factory")
-                .map(|m| CrewChat {
-                    label: m.label(),
-                    session: m.session.clone(),
-                    member: Some(m.id.clone()),
-                    busy: m.busy,
-                }),
-        );
-        let current = chats.iter().find(|chat| {
-            chat.session
-                .as_deref()
-                .is_some_and(|path| same_file(path, session_file))
-        });
-        if let Some(current) = current {
-            return Some(CaptainContext {
-                project: project.id.clone(),
-                project_name: project.name.clone(),
-                chat: current.label.clone(),
-                chats,
+    let lookup = std::iter::once((session_file, None)).chain(
+        ancestors
+            .iter()
+            .map(|(file, name)| (file.as_str(), Some(name))),
+    );
+    for (file, _) in lookup.clone() {
+        for project in &snapshot.projects {
+            let chats = project_chats(project);
+            let current = chats.iter().find(|chat| {
+                chat.session
+                    .as_deref()
+                    .is_some_and(|path| same_file(path, file))
             });
+            if let Some(current) = current {
+                let subagent = (file != session_file).then(|| {
+                    lookup
+                        .clone()
+                        .find_map(|(_, name)| name.cloned())
+                        .unwrap_or_else(|| "subagent".into())
+                });
+                return Some(CaptainContext {
+                    project: project.id.clone(),
+                    project_name: project.name.clone(),
+                    chat: current.label.clone(),
+                    subagent,
+                    chats,
+                });
+            }
         }
     }
     None
 }
 
-/// The breadcrumb above the prompt in a Captain chat.
-pub(crate) fn breadcrumb(context: &CaptainContext, switch_key: &str, parent_key: &str) -> String {
-    let path = if context.chat == "captain" {
-        format!("{} › captain", context.project_name)
+/// The breadcrumb above the prompt in a Captain chat. The Captain's own chat names no
+/// return-to-Captain key; a crew chat and a subagent do.
+pub(crate) fn breadcrumb(
+    context: &CaptainContext,
+    switch_key: &str,
+    parent_key: &str,
+    overview_key: &str,
+) -> String {
+    let mut path = format!("{} › {}", context.project_name, context.chat);
+    if let Some(subagent) = &context.subagent {
+        path.push_str(" › ");
+        path.push_str(subagent);
+    }
+    if context.chat == "captain" && context.subagent.is_none() {
+        format!("{path} · {switch_key} switch · {overview_key} overview")
     } else {
-        format!("captain › {}", context.chat)
+        format!("{path} · {switch_key} switch · {parent_key} captain · {overview_key} overview")
+    }
+}
+
+/// The session files `session_file` descends from in the daemon roster, nearest first, each
+/// with the name of the session below it (the subagent the breadcrumb shows).
+pub(crate) fn session_ancestors(roster: &[Value], session_file: &str) -> Vec<(String, String)> {
+    let summary_of = |file: &str| {
+        roster
+            .iter()
+            .filter_map(|entry| entry.get("summary"))
+            .find(|summary| {
+                summary
+                    .get("sessionFile")
+                    .and_then(Value::as_str)
+                    .is_some_and(|path| same_file(path, file))
+            })
     };
-    format!("{path} · {switch_key} switch chat · {parent_key} captain")
+    let mut out = Vec::new();
+    let mut file = session_file.to_owned();
+    while out.len() < 16 {
+        let Some(summary) = summary_of(&file) else {
+            break;
+        };
+        let text = |key: &str| {
+            summary
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        };
+        let own = text("sessionName").or_else(|| text("name"));
+        let Some(parent) = text("parentSessionPath") else {
+            break;
+        };
+        out.push((parent.clone(), own.unwrap_or_else(|| "subagent".into())));
+        file = parent;
+    }
+    out
 }
 
 impl super::SessionUi {
+    /// The Captain context of `file`, through its roster ancestors for a subagent.
+    fn context_for(&self, snapshot: &CaptainSnapshot, file: &str) -> Option<CaptainContext> {
+        captain_context(snapshot, file, &session_ancestors(&self.roster, file))
+    }
+
+    /// Subagents per crew session, from the daemon roster, for the panel's `◆N` badges.
+    fn crew_subagents(&self) -> std::collections::HashMap<String, usize> {
+        let mut counts = std::collections::HashMap::new();
+        for project in self.captain_snapshot.iter().flat_map(|s| &s.projects) {
+            for session in project.crew.iter().filter_map(|m| m.session.as_ref()) {
+                let identity =
+                    crate::subagents::SessionIdentity::new(None, None, Some(session.clone()));
+                let total = crate::subagents::count_descendants(&self.roster, &identity).total;
+                if total > 0 {
+                    counts.insert(session.clone(), total);
+                }
+            }
+        }
+        counts
+    }
+
     fn key_text(view: &AgentView, id: &str) -> String {
         crate::keybindings::format_key_text(&view.editor.keybindings().get_keys(id).join("/"))
     }
@@ -171,6 +428,7 @@ impl super::SessionUi {
         let tx = self.captain_updates.clone();
         let cwd = self.cwd.clone();
         let session = self.session_file.clone();
+        let socket = self.daemon_socket.clone();
         tokio::spawn(async move {
             let result = async {
                 let exe = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -180,6 +438,8 @@ impl super::SessionUi {
                     .args(&args)
                     .current_dir(&cwd)
                     .env_remove("PA_CAPTAIN_ACTOR")
+                    // Captain turns run on this chat's daemon, so the chat can show them live.
+                    .env("PA_CAPTAIN_NATIVE_SOCKET", &socket)
                     .stdin(std::process::Stdio::piped())
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())
@@ -231,8 +491,41 @@ impl super::SessionUi {
         self.spawn_captain(vec!["status".into()], None, CaptainUpdate::Snapshot);
     }
 
-    /// The open panel's poll: the records, and the open provider thread's transcript.
-    pub(crate) fn poll_captain(&self, view: &AgentView) {
+    /// Cheap `stat`-only poll of `<hub>/captains/status/<project-id>.json`.
+    /// Never starts Python or `git`: updates the bottom activity dock and emits
+    /// crew/factory change toasts directly from the status file.
+    pub(crate) fn poll_captain_status(&mut self, view: &mut AgentView) {
+        use crate::interactive::captain_hint::{status_toasts, CaptainStatusPoll};
+        match self.captain_status_watcher.poll() {
+            CaptainStatusPoll::Unchanged => {}
+            CaptainStatusPoll::Changed(Some(status)) => {
+                let (states, toasts) = status_toasts(self.captain_states.as_ref(), &status);
+                self.captain_states = Some(states);
+                for toast in toasts {
+                    view.toasts.push(toast);
+                    self.dirty = true;
+                }
+                self.captain_dock = Some(status.to_dock_state());
+                self.sync_activity_dock(view);
+                // A status change may mean the turn that held a chat ended.
+                retry_busy_open(&mut self.pending_captain_open, &mut self.captain_busy_open);
+            }
+            CaptainStatusPoll::Changed(None) => {
+                if self.captain_dock.take().is_some() {
+                    self.sync_activity_dock(view);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn captain_hub_present(&self) -> bool {
+        self.captain_status_watcher.hub_present()
+    }
+
+    /// The open panel's poll: skips spawning Python when the hub DB and status
+    /// file have not changed since the last snapshot.
+    pub(crate) fn poll_captain(&mut self, view: &AgentView) {
+        let mut need_snapshot = false;
         if let Some(Overlay::Captain(panel)) = &view.overlay {
             if let Some((project, member)) = panel.open_thread_member() {
                 self.load_transcript(project, member);
@@ -241,12 +534,24 @@ impl super::SessionUi {
                 self.load_factory(project, name, false);
             }
         }
-        self.refresh_captain();
+        let stamp = self.captain_status_watcher.db_stamp();
+        if stamp.is_none() || stamp != self.captain_db_stamp {
+            self.captain_db_stamp = stamp;
+            need_snapshot = true;
+        }
+        if need_snapshot {
+            self.refresh_captain();
+        }
+    }
+
+    /// The startup hint when this project has no Captain, from the watcher's resolved root.
+    pub(crate) fn missing_captain_hint(&self) -> Option<&'static str> {
+        self.captain_status_watcher.missing_captain_hint()
     }
 
     /// Read the Captain records when this chat may belong to a project, for the breadcrumb.
     pub(crate) fn refresh_captain_context(&self) {
-        if self.session_file.is_some() && crate::interactive::captain_hint::has_captain(&self.cwd) {
+        if self.session_file.is_some() && self.captain_status_watcher.has_captain() {
             self.refresh_captain();
         }
     }
@@ -288,27 +593,71 @@ impl super::SessionUi {
         self.run_captain_action(action, view);
     }
 
+    /// The Captain panel on screen, or dimmed behind a floating model picker.
     fn panel_mut(view: &mut AgentView) -> Option<&mut CaptainView> {
         match view.overlay.as_mut() {
             Some(Overlay::Captain(panel)) => Some(panel),
-            _ => None,
+            _ => match view.modal_backdrop.as_deref_mut() {
+                Some(Overlay::Captain(panel)) => Some(panel),
+                _ => None,
+            },
         }
     }
 
-    fn run_captain_action(&mut self, action: CaptainAction, view: &mut AgentView) {
+    pub(crate) fn run_captain_action(&mut self, action: CaptainAction, view: &mut AgentView) {
         match action {
             CaptainAction::None => {}
             CaptainAction::Close => {
-                view.overlay = None;
-                self.captain_parked = None;
-                self.dirty = true;
+                // The panel parks: F6 reopens it on the same project, row, tab, and scroll.
+                if let Some(Overlay::Captain(mut panel)) = view.overlay.take() {
+                    if !panel.is_transient() {
+                        panel.park();
+                        self.captain_parked = Some(panel);
+                    }
+                }
+                self.close_overlay_to_origin(view);
             }
+            CaptainAction::OpenFactoryRun {
+                project,
+                member,
+                run_id,
+            } => self.open_captain_run(view, project, member, run_id),
+            CaptainAction::LoadHistory { project, field } => {
+                if let Some(panel) = Self::panel_mut(view) {
+                    panel.set_notice("Loading history…");
+                }
+                let args = serde_json::json!({"project": project, "field": field});
+                self.spawn_captain(
+                    vec!["act".into(), "edit-history".into()],
+                    Some(args),
+                    move |result| CaptainUpdate::History {
+                        project,
+                        field,
+                        result,
+                    },
+                );
+            }
+            CaptainAction::OpenSubagents { session } => self.open_crew_subagents(view, &session),
             CaptainAction::Refresh => self.refresh_captain(),
             CaptainAction::Act { op, args, done } => {
                 if let Some(panel) = Self::panel_mut(view) {
                     panel.set_notice("Working…");
                 }
                 self.captain_act(&op, args, done);
+            }
+            CaptainAction::SaveFactory {
+                op,
+                project,
+                name,
+                args,
+            } => {
+                self.spawn_captain(vec!["act".into(), op], Some(args), move |result| {
+                    CaptainUpdate::Saved {
+                        project,
+                        name,
+                        result,
+                    }
+                });
             }
             CaptainAction::Open { project, member } => {
                 if let Some(panel) = Self::panel_mut(view) {
@@ -358,13 +707,188 @@ impl super::SessionUi {
                 );
             }
             CaptainAction::Review { project, member } => {
-                // The review page replaces the panel; Esc returns to the chat.
+                // The review page replaces the panel; Esc returns to the panel.
                 if let Some(Overlay::Captain(panel)) = view.overlay.take() {
                     self.captain_parked = Some(panel);
                 }
                 self.open_workspace(
                     crate::workspace_view::WorkspaceView::review(Some((project, member))),
                     view,
+                );
+            }
+            CaptainAction::PickModel(target) => {
+                if let Some(Overlay::Captain(panel)) = view.overlay.take() {
+                    self.captain_parked = Some(panel);
+                }
+                let (current_model, current_thinking) = match &target {
+                    crate::captain_view::CaptainModelTarget::Setup {
+                        current_model,
+                        current_thinking,
+                    }
+                    | crate::captain_view::CaptainModelTarget::CaptainLead {
+                        current_model,
+                        current_thinking,
+                        ..
+                    }
+                    | crate::captain_view::CaptainModelTarget::Crew {
+                        current_model,
+                        current_thinking,
+                        ..
+                    }
+                    | crate::captain_view::CaptainModelTarget::FactoryNode {
+                        current_model,
+                        current_thinking,
+                        ..
+                    }
+                    | crate::captain_view::CaptainModelTarget::FactoryDefault {
+                        current_model,
+                        current_thinking,
+                        ..
+                    }
+                    | crate::captain_view::CaptainModelTarget::SetupFactory {
+                        current_model,
+                        current_thinking,
+                    } => (current_model.clone(), current_thinking.clone()),
+                    crate::captain_view::CaptainModelTarget::Assign { .. } => {
+                        (String::new(), String::new())
+                    }
+                };
+                self.open_shared_model_picker(
+                    view,
+                    &current_model,
+                    &current_thinking,
+                    super::model_picker::ModelPickTarget::Captain(target),
+                );
+            }
+        }
+    }
+
+    /// Apply a model + thinking choice returned from pa's shared `ModelPicker` to a Captain flow.
+    pub(crate) fn apply_captain_picked_model(
+        &mut self,
+        target: crate::captain_view::CaptainModelTarget,
+        full_model: String,
+        effort_edited: bool,
+        thinking: String,
+        view: &mut AgentView,
+    ) {
+        use crate::captain_view::CaptainModelTarget;
+        match target {
+            CaptainModelTarget::Setup { .. } => {
+                if let Some(panel) = Self::panel_mut(view) {
+                    let action = panel.apply_setup_model(full_model, thinking);
+                    self.run_captain_action(action, view);
+                }
+            }
+            CaptainModelTarget::SetupFactory { .. } => {
+                if let Some(panel) = Self::panel_mut(view) {
+                    let action = panel.apply_setup_factory_model(full_model, thinking);
+                    self.run_captain_action(action, view);
+                }
+            }
+            CaptainModelTarget::FactoryDefault { project, name, .. } => {
+                let args = serde_json::json!({
+                    "project": project,
+                    "name": name,
+                    "model": full_model,
+                    "thinking": thinking,
+                });
+                if let Some(panel) = Self::panel_mut(view) {
+                    panel.set_notice("Updating the default model…");
+                }
+                self.spawn_captain(
+                    vec!["act".into(), "factory-set-default-model".into()],
+                    Some(args),
+                    move |result| CaptainUpdate::Factory {
+                        project,
+                        explicit: true,
+                        result,
+                    },
+                );
+            }
+            CaptainModelTarget::CaptainLead { project, .. } => {
+                let args = captain_lead_model_args(project, full_model, effort_edited, thinking);
+                if let Some(panel) = Self::panel_mut(view) {
+                    panel.set_notice("Updating model…");
+                }
+                self.captain_act("edit", args, "Captain model updated.".into());
+            }
+            CaptainModelTarget::Assign { project } => {
+                if let Some(panel) = Self::panel_mut(view) {
+                    panel.apply_assign_model(project, full_model, thinking);
+                }
+            }
+            CaptainModelTarget::Crew { member, .. }
+                if member.starts_with(crate::captain_view::COMPOSE_MEMBER) =>
+            {
+                let stage = &member[crate::captain_view::COMPOSE_MEMBER.len()..];
+                if let Some(panel) = Self::panel_mut(view) {
+                    panel.apply_compose_model(stage, full_model, thinking);
+                }
+            }
+            CaptainModelTarget::Crew { member, .. }
+                if member.starts_with(crate::captain_view::SPECIALIST_MEMBER) =>
+            {
+                let id = &member[crate::captain_view::SPECIALIST_MEMBER.len()..];
+                if let Some(panel) = Self::panel_mut(view) {
+                    let action =
+                        panel.apply_specialist_model(id, full_model, effort_edited, thinking);
+                    self.run_captain_action(action, view);
+                }
+            }
+            CaptainModelTarget::Crew {
+                project,
+                member,
+                label,
+                ..
+            } => {
+                let mut args = serde_json::json!({
+                    "project": project,
+                    "member": member,
+                    "model": full_model,
+                });
+                if effort_edited {
+                    args["thinking"] = Value::String(thinking);
+                }
+                if let Some(panel) = Self::panel_mut(view) {
+                    panel.set_notice(format!("Updating model for {label}…"));
+                }
+                self.captain_act("crew-model", args, format!("Updated model for {label}."));
+            }
+            CaptainModelTarget::FactoryNode {
+                project,
+                name,
+                state_id,
+                role,
+                current_thinking,
+                ..
+            } => {
+                let effective_thinking = if effort_edited {
+                    thinking
+                } else {
+                    current_thinking
+                };
+                let mut args = serde_json::json!({
+                    "project": project,
+                    "name": name,
+                    "state": state_id,
+                    "model": full_model,
+                    "thinking": effective_thinking,
+                });
+                if role.is_some() {
+                    args["edit_role"] = Value::Bool(true);
+                }
+                if let Some(panel) = Self::panel_mut(view) {
+                    panel.set_notice(format!("Updating model for {state_id}…"));
+                }
+                self.spawn_captain(
+                    vec!["act".into(), "factory-set-model".into()],
+                    Some(args),
+                    move |result| CaptainUpdate::Factory {
+                        project,
+                        explicit: true,
+                        result,
+                    },
                 );
             }
         }
@@ -374,30 +898,108 @@ impl super::SessionUi {
     /// Captain reads its rules, plan, crew reports, and operations, and the backend counts it as
     /// a user turn for approvals and grants. The job runs through this chat's daemon, so the
     /// message and reply appear here. Returns true when the message was taken.
-    pub(crate) fn send_to_captain(&mut self, text: &str, view: &mut AgentView) -> bool {
-        let Some(project) = self
+    ///
+    /// A busy Captain is steered (`act steer`, which the backend turns into a queued `lead`
+    /// job when the running turn cannot take it), so the backend holds the message, not pa.
+    pub(crate) fn send_to_captain(
+        &mut self,
+        text: &str,
+        behavior: super::prompt::SubmitBehavior,
+        view: &mut AgentView,
+    ) -> bool {
+        let Some((project, busy)) = self
             .captain_context
             .as_ref()
-            .filter(|context| context.chat == "captain")
-            .map(|context| context.project.clone())
+            .filter(|context| context.chat == "captain" && context.subagent.is_none())
+            .map(|context| {
+                let busy = context
+                    .chats
+                    .iter()
+                    .any(|chat| chat.label == "captain" && chat.busy);
+                (context.project.clone(), busy)
+            })
         else {
             return false;
         };
-        if !crate::image_markers::collect_marked_images(&self.pasted_images, text).is_empty() {
+        let attached: Vec<&LoadedImage> =
+            crate::image_markers::collect_marked_images(&self.pasted_images, text)
+                .into_iter()
+                .map(|(_, image)| image)
+                .collect();
+        if attached.len() > MAX_CAPTAIN_IMAGES {
             view.editor.set_text(text);
             self.note(
-                "The Captain takes text only. Remove the image to send.",
+                &format!(
+                    "The Captain takes up to {MAX_CAPTAIN_IMAGES} images per message. Remove {} to send.",
+                    attached.len() - MAX_CAPTAIN_IMAGES
+                ),
                 view,
             );
             return true;
         }
+        let images = match save_captain_images(&captain_attachments_dir(), &attached) {
+            Ok(images) => images,
+            Err(error) => {
+                view.editor.set_text(text);
+                self.note(&error, view);
+                return true;
+            }
+        };
         view.editor.add_to_history(text);
-        self.captain_act(
-            "lead",
-            serde_json::json!({"project": project, "text": text}),
-            String::new(),
-        );
+        let running = busy || self.captain_lead_inflight.is_some();
+        let (op, done) = if running {
+            match behavior {
+                super::prompt::SubmitBehavior::FollowUp => ("lead", QUEUED_NOTE.to_owned()),
+                super::prompt::SubmitBehavior::Steer => ("steer", STEERED_NOTE.to_owned()),
+            }
+        } else {
+            ("lead", String::new())
+        };
+        self.captain_lead_queue.push_back(CaptainLead {
+            project,
+            text: text.to_owned(),
+            done,
+            op,
+            images,
+        });
+        self.send_next_captain_lead();
         true
+    }
+
+    /// Start the next queued `lead` call once the one before it answered.
+    fn send_next_captain_lead(&mut self) {
+        if self.captain_lead_inflight.is_some() {
+            return;
+        }
+        let Some(lead) = self.captain_lead_queue.pop_front() else {
+            return;
+        };
+        self.captain_act(lead.op, captain_lead_args(&lead), lead.done.clone());
+        self.captain_lead_inflight = Some(lead);
+        self.refresh_captain();
+    }
+
+    /// A `lead` or `steer` call answered. A `steer` an older backend refuses is sent again as
+    /// a `lead` job. A refused message goes back above the editor's text, and the messages
+    /// typed after it stay in the editor too, so none is sent out of order.
+    fn captain_lead_answered(&mut self, error: Option<&str>, view: &mut AgentView) {
+        let Some(mut lead) = self.captain_lead_inflight.take() else {
+            return;
+        };
+        if lead.op == "steer" && error.is_some_and(steer_unsupported) {
+            lead.op = "lead";
+            lead.done = QUEUED_NOTE.to_owned();
+            self.captain_lead_queue.push_front(lead);
+            self.send_next_captain_lead();
+            return;
+        }
+        if error.is_some() {
+            let mut texts = vec![lead.text];
+            texts.extend(self.captain_lead_queue.drain(..).map(|lead| lead.text));
+            prepend_draft(view, &texts.join("\n\n"));
+            return;
+        }
+        self.send_next_captain_lead();
     }
 
     /// A text step: park the panel and the chat's draft, and ask in pa's prompt editor.
@@ -492,6 +1094,7 @@ impl super::SessionUi {
                     context,
                     &Self::key_text(view, "app.captain.crew"),
                     &Self::key_text(view, "app.captain.parent"),
+                    &Self::key_text(view, "app.factory.toggle"),
                 )
             })
         };
@@ -501,12 +1104,13 @@ impl super::SessionUi {
         self.dirty = true;
         match update {
             CaptainUpdate::Snapshot(result) => {
+                self.captain_db_stamp = self.captain_status_watcher.db_stamp();
                 if let Ok(data) = &result {
                     if let Ok(snapshot) = serde_json::from_value::<CaptainSnapshot>(data.clone()) {
                         self.captain_context = self
                             .session_file
-                            .as_deref()
-                            .and_then(|file| captain_context(&snapshot, file));
+                            .clone()
+                            .and_then(|file| self.context_for(&snapshot, &file));
                         self.sync_captain_header(view);
                         let (states, toasts) = crate::captain_view::crew_toasts(
                             self.captain_states.as_ref(),
@@ -516,9 +1120,13 @@ impl super::SessionUi {
                         for toast in toasts {
                             view.toasts.push(toast);
                         }
+                        self.captain_snapshot = Some(snapshot);
                     }
                 }
+                self.poll_captain_status(view);
+                let subagents = self.crew_subagents();
                 if let Some(panel) = Self::panel_mut(view) {
+                    panel.set_subagents(subagents);
                     match result {
                         Ok(data) => {
                             panel.apply_snapshot(&data);
@@ -547,58 +1155,86 @@ impl super::SessionUi {
                 if let Some(Overlay::CrewPicker(picker)) = view.overlay.as_mut() {
                     if let Some(context) = &self.captain_context {
                         picker.set_chats(context.chats.clone());
+                        if let Some(project) = self
+                            .captain_snapshot
+                            .as_ref()
+                            .and_then(|s| s.projects.iter().find(|p| p.id == context.project))
+                        {
+                            picker.set_project(project);
+                        }
                     }
                 }
             }
-            CaptainUpdate::Acted { op, done, result } => match result {
-                Ok(reply) => {
-                    if let Some(target) = OpenTarget::from_reply(&reply) {
-                        self.open_captain_target(target, view);
+            CaptainUpdate::Acted { op, done, result } => {
+                if matches!(op.as_str(), "lead" | "steer") {
+                    let error = result.as_ref().err().map(String::as_str);
+                    let resent = op == "steer" && error.is_some_and(steer_unsupported);
+                    self.captain_lead_answered(error, view);
+                    if resent {
                         return;
                     }
-                    if matches!(op.as_str(), "init" | "promote") {
-                        // The new project is this checkout's: select it.
-                        self.captain_focus_query = Self::panel_mut(view)
-                            .map(|panel| panel.snapshot().current_root.clone());
-                    }
-                    let mut notice = done;
-                    if op == "stop" && reply["state"] == "stopping" {
-                        notice = "Stopping. Running work is ending.".into();
-                    }
-                    if op == "delete" && reply["state"] != "deleted" {
-                        notice = "Deleting. Running work is ending.".into();
-                    }
-                    if let Some(error) = reply.get("factory_error").and_then(Value::as_str) {
-                        notice = format!("{notice} The factory did not start: {error}");
-                    }
-                    if let Some(errors) = reply.get("crew_errors").and_then(Value::as_array) {
-                        notice = format!("{notice} {} thread(s) could not join.", errors.len());
-                    }
-                    match Self::panel_mut(view) {
-                        Some(panel) => {
-                            panel.set_error(None);
-                            panel.set_notice(notice);
-                        }
-                        None if !notice.is_empty() => self.note(&notice, view),
-                        None => {}
-                    }
-                    self.refresh_captain();
-                    if let Some((project, member)) =
-                        Self::panel_mut(view).and_then(|p| p.open_thread_member())
-                    {
-                        self.load_transcript(project, member);
-                    }
-                    if let Some((project, name)) =
-                        Self::panel_mut(view).and_then(|p| p.open_factory_member())
-                    {
-                        self.load_factory(project, name, false);
-                    }
                 }
-                Err(error) => match Self::panel_mut(view) {
-                    Some(panel) => panel.set_error(Some(error)),
-                    None => self.error_row(&error, view),
-                },
-            },
+                let done = match (&result, done.is_empty()) {
+                    (Ok(reply), false) if matches!(op.as_str(), "lead" | "steer") => {
+                        captain_delivery_note(&op, reply).to_owned()
+                    }
+                    _ => done,
+                };
+                match result {
+                    Ok(reply) => {
+                        let target = if op == "new-thread" {
+                            OpenTarget::from_new_thread(&reply)
+                        } else {
+                            OpenTarget::from_reply(&reply)
+                        };
+                        if let Some(target) = target {
+                            self.open_captain_target(target, view);
+                            return;
+                        }
+                        if matches!(op.as_str(), "init" | "promote") {
+                            // The new project is this checkout's: select it.
+                            self.captain_focus_query = Self::panel_mut(view)
+                                .map(|panel| panel.snapshot().current_root.clone());
+                        }
+                        let mut notice = done;
+                        if op == "stop" && reply["state"] == "stopping" {
+                            notice = "Stopping. Running work is ending.".into();
+                        }
+                        if op == "delete" && reply["state"] != "deleted" {
+                            notice = "Deleting. Running work is ending.".into();
+                        }
+                        if let Some(error) = reply.get("factory_error").and_then(Value::as_str) {
+                            notice = format!("{notice} The factory did not start: {error}");
+                        }
+                        if let Some(errors) = reply.get("crew_errors").and_then(Value::as_array) {
+                            notice = format!("{notice} {} thread(s) could not join.", errors.len());
+                        }
+                        match Self::panel_mut(view) {
+                            Some(panel) => {
+                                panel.set_error(None);
+                                panel.set_notice(notice);
+                            }
+                            None if !notice.is_empty() => self.note(&notice, view),
+                            None => {}
+                        }
+                        self.refresh_captain();
+                        if let Some((project, member)) =
+                            Self::panel_mut(view).and_then(|p| p.open_thread_member())
+                        {
+                            self.load_transcript(project, member);
+                        }
+                        if let Some((project, name)) =
+                            Self::panel_mut(view).and_then(|p| p.open_factory_member())
+                        {
+                            self.load_factory(project, name, false);
+                        }
+                    }
+                    Err(error) => match Self::panel_mut(view) {
+                        Some(panel) => panel.set_error(Some(error)),
+                        None => self.error_row(&error, view),
+                    },
+                }
+            }
             CaptainUpdate::Choices { project, result } => {
                 let action = match (Self::panel_mut(view), result) {
                     (Some(panel), Ok(data)) => panel.apply_choices(&data, project.as_deref()),
@@ -611,14 +1247,16 @@ impl super::SessionUi {
                 self.run_captain_action(action, view);
             }
             CaptainUpdate::Opened(result) => match result {
-                Ok(reply) => match OpenTarget::from_reply(&reply) {
-                    Some(target) => self.open_captain_target(target, view),
-                    None => {
-                        if let Some(panel) = Self::panel_mut(view) {
-                            panel.set_error(Some("Captain returned nothing to open.".into()));
+                Ok(reply) => {
+                    match OpenTarget::from_reply(&reply).or_else(|| native_open_target(&reply)) {
+                        Some(target) => self.open_captain_target(target, view),
+                        None => {
+                            if let Some(panel) = Self::panel_mut(view) {
+                                panel.set_error(Some("Captain returned nothing to open.".into()));
+                            }
                         }
                     }
-                },
+                }
                 Err(error) => match Self::panel_mut(view) {
                     Some(panel) => panel.set_error(Some(error)),
                     None => self.error_row(&error, view),
@@ -637,8 +1275,48 @@ impl super::SessionUi {
                 project,
                 explicit,
                 result,
+            } => {
+                if let Some(panel) = Self::panel_mut(view) {
+                    match result {
+                        Ok(data) => {
+                            let notice = data
+                                .get("notice")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned);
+                            panel.open_factory(project, &data, explicit);
+                            if let Some(notice) = notice {
+                                panel.set_notice(notice);
+                            }
+                            self.poll_captain_status(view);
+                        }
+                        Err(error) => panel.set_error(Some(error)),
+                    }
+                }
+            }
+            CaptainUpdate::Saved {
+                project,
+                name,
+                result,
+            } => match result {
+                Ok(reply) => {
+                    if let Some(panel) = Self::panel_mut(view) {
+                        let notice = reply["notice"].as_str().unwrap_or("Saved.").to_owned();
+                        panel.set_notice(notice);
+                    }
+                    self.refresh_captain();
+                    self.load_factory(project, name, true);
+                }
+                Err(error) => match Self::panel_mut(view) {
+                    Some(panel) => panel.compose_failed(error),
+                    None => self.error_row(&error, view),
+                },
+            },
+            CaptainUpdate::History {
+                project,
+                field,
+                result,
             } => match (Self::panel_mut(view), result) {
-                (Some(panel), Ok(data)) => panel.open_factory(project, &data, explicit),
+                (Some(panel), Ok(data)) => panel.open_history(project, field, &data),
                 (Some(panel), Err(error)) => panel.set_error(Some(error)),
                 (None, _) => {}
             },
@@ -691,17 +1369,39 @@ impl super::SessionUi {
                 factory,
                 draft,
             } => {
-                self.captain_parked = None;
-                view.overlay = None;
-                self.pending_captain_open = Some((PathBuf::from(path), draft, factory));
+                if let Some(Overlay::Captain(mut panel)) = view.overlay.take() {
+                    if !panel.is_transient() {
+                        panel.park();
+                        self.captain_parked = Some(panel);
+                    }
+                }
+                // A chat the user picks replaces one still waiting for a turn to end.
+                self.captain_busy_open = None;
+                self.pending_captain_open = Some(CaptainOpen {
+                    path: PathBuf::from(path),
+                    draft,
+                    factory,
+                    retry: false,
+                });
             }
-            OpenTarget::Thread { id, .. } => {
+            OpenTarget::Thread { id, title } => {
                 let selected = Self::panel_mut(view)
                     .and_then(|p| p.selected_project().map(|p| (p.id.clone(), p.lead.clone())));
-                let (project, lead) = selected.unwrap_or_default();
-                // The lead is addressed as "lead" in Captain actions.
-                let member = if id == lead { "lead".to_owned() } else { id };
-                self.load_transcript(project, member);
+                match selected {
+                    Some((project, lead)) => {
+                        // The lead is addressed as "lead" in Captain actions.
+                        let member = if id == lead { "lead".to_owned() } else { id };
+                        self.load_transcript(project, member);
+                    }
+                    // An open from a chat (F7, F8) has no panel: the thread view mounts over it.
+                    None => {
+                        if let Some(project) =
+                            self.captain_context.as_ref().map(|c| c.project.clone())
+                        {
+                            self.open_provider_thread(view, project, id, title);
+                        }
+                    }
+                }
             }
             OpenTarget::Factory => {
                 view.overlay = None;
@@ -710,12 +1410,7 @@ impl super::SessionUi {
             OpenTarget::Draft(draft) => {
                 // The draft goes above what the chat already holds.
                 view.overlay = None;
-                let current = view.editor.get_expanded_text();
-                if current.trim().is_empty() {
-                    view.editor.set_text(&draft);
-                } else {
-                    view.editor.set_text(&format!("{draft}\n\n{current}"));
-                }
+                prepend_draft(view, &draft);
             }
         }
         self.dirty = true;
@@ -723,13 +1418,28 @@ impl super::SessionUi {
 
     /// Open a session file in this same view: the draft of the chat being left is stashed
     /// for its return, and the opened chat's own stashed draft comes back.
+    /// Open the chat a Captain action or a finished turn asked for, if any.
+    pub(crate) async fn open_pending_captain_session(
+        &mut self,
+        view: &mut AgentView,
+    ) -> anyhow::Result<()> {
+        match self.pending_captain_open.take() {
+            Some(open) => self.open_captain_session(view, open).await,
+            None => Ok(()),
+        }
+    }
+
     pub(crate) async fn open_captain_session(
         &mut self,
         view: &mut AgentView,
-        path: PathBuf,
-        draft: Option<String>,
-        factory: bool,
+        open: CaptainOpen,
     ) -> anyhow::Result<()> {
+        let CaptainOpen {
+            path,
+            draft,
+            factory,
+            retry,
+        } = open;
         if self
             .session_file
             .as_deref()
@@ -739,7 +1449,7 @@ impl super::SessionUi {
                 self.open_factory_page(view);
             }
             if let Some(draft) = draft {
-                view.editor.set_text(&draft);
+                prepend_draft(view, &draft);
             }
             return Ok(());
         }
@@ -748,24 +1458,23 @@ impl super::SessionUi {
         {
             Ok(id) => id,
             Err(error) => {
-                let busy = self
-                    .captain_context
-                    .as_ref()
-                    .and_then(|c| {
-                        c.chats.iter().find(|chat| {
-                            chat.session
-                                .as_deref()
-                                .is_some_and(|s| same_file(s, &path.to_string_lossy()))
-                        })
-                    })
-                    .is_some_and(|chat| chat.busy);
-                let message = if busy {
-                    "The Captain is running a turn in that chat. It opens when the turn ends."
-                        .to_owned()
-                } else {
-                    format!("Could not open that chat: {error:#}")
-                };
-                self.error_row(&message, view);
+                match busy_open_note(&format!("{error:#}"), retry) {
+                    BusyOpen::Wait(note) => {
+                        // The draft and the editor stay as they are; the chat opens later.
+                        self.captain_busy_open = Some(CaptainOpen {
+                            path,
+                            draft,
+                            factory,
+                            retry,
+                        });
+                        if let Some(note) = note {
+                            self.note(note, view);
+                        }
+                    }
+                    BusyOpen::Failed => {
+                        self.error_row(&format!("Could not open that chat: {error:#}"), view)
+                    }
+                }
                 return Ok(());
             }
         };
@@ -775,21 +1484,17 @@ impl super::SessionUi {
         self.rebuild_view(view, &super::RebuildKind::Rebind);
         self.restore_prompt_stash_if_editor_empty(view, true);
         if let Some(draft) = draft {
-            view.editor.set_text(&draft);
+            prepend_draft(view, &draft);
         }
         if factory {
             self.open_factory_page(view);
         }
-        // The breadcrumb follows the opened chat.
-        if let Some(context) = self.captain_context.as_mut() {
-            if let Some(chat) = context.chats.iter().find(|chat| {
-                chat.session
-                    .as_deref()
-                    .is_some_and(|s| same_file(s, &path.to_string_lossy()))
-            }) {
-                context.chat = chat.label.clone();
-            }
-        }
+        // The breadcrumb and the Captain routing follow the opened chat now, before the
+        // status call answers, so a message typed at once still reaches the Captain.
+        self.captain_context = self
+            .captain_snapshot
+            .as_ref()
+            .and_then(|snapshot| self.context_for(snapshot, &path.to_string_lossy()));
         self.sync_captain_header(view);
         self.refresh_captain();
         self.dirty = true;
@@ -824,11 +1529,25 @@ impl super::SessionUi {
             );
             return;
         };
-        view.overlay = Some(Overlay::CrewPicker(crate::captain_view::CrewPicker::new(
+        // Inside a subagent no listed chat is the open one.
+        let current = if context.subagent.is_some() {
+            String::new()
+        } else {
+            context.chat.clone()
+        };
+        let mut picker = crate::captain_view::CrewPicker::new(
             context.project_name.clone(),
-            context.chat.clone(),
+            current,
             context.chats,
-        )));
+        );
+        if let Some(project) = self
+            .captain_snapshot
+            .as_ref()
+            .and_then(|s| s.projects.iter().find(|p| p.id == context.project))
+        {
+            picker.set_project(project);
+        }
+        view.overlay = Some(Overlay::CrewPicker(picker));
         self.refresh_captain();
         self.dirty = true;
     }
@@ -851,14 +1570,7 @@ impl super::SessionUi {
         let next = (current + step).rem_euclid(count.max(1)) as usize;
         match context.chats.get(next) {
             Some(chat) if next as isize != current => {
-                let member = chat.member.clone();
-                self.run_captain_action(
-                    CaptainAction::Open {
-                        project: context.project,
-                        member,
-                    },
-                    view,
-                );
+                self.open_crew_chat(view, context.project, chat.clone());
             }
             _ => self.note("This project has no other chat.", view),
         }
@@ -870,7 +1582,7 @@ impl super::SessionUi {
             self.note("This chat is not part of a Captain project.", view);
             return;
         };
-        if context.chat == "captain" {
+        if context.chat == "captain" && context.subagent.is_none() {
             self.note("This is the Captain chat.", view);
             return;
         }
@@ -905,22 +1617,396 @@ impl super::SessionUi {
                 let Some(project) = self.captain_context.as_ref().map(|c| c.project.clone()) else {
                     return;
                 };
-                self.run_captain_action(
-                    CaptainAction::Open {
-                        project,
-                        member: chat.member,
-                    },
-                    view,
-                );
+                self.open_crew_chat(view, project, chat);
+            }
+            crate::captain_view::CrewPick::NewThread => {
+                view.overlay = None;
+                let Some(project) = self.captain_context.as_ref().map(|c| c.project.clone()) else {
+                    return;
+                };
+                self.note("Opening a new crew chat…", view);
+                self.run_captain_action(crate::captain_view::new_thread_action(project), view);
+            }
+            crate::captain_view::CrewPick::AddExisting => {
+                let Some(project) = self.captain_context.as_ref().map(|c| c.project.clone()) else {
+                    view.overlay = None;
+                    return;
+                };
+                let mut panel = self.captain_parked.take().unwrap_or_else(|| {
+                    CaptainView::new(picker_viewport_rows(view.terminal_rows()) + 8)
+                });
+                let action = panel.start_adopt(project);
+                view.overlay = Some(Overlay::Captain(panel));
+                self.refresh_captain();
+                self.run_captain_action(action, view);
             }
         }
     }
+
+    /// Open one chat of the switcher (F7, F8): a native chat in place, a provider CLI thread
+    /// in the panel's thread view, or a factory run on the live factory page. The last two
+    /// return to the chat they were opened over.
+    fn open_crew_chat(&mut self, view: &mut AgentView, project: String, chat: CrewChat) {
+        match crew_route(&chat) {
+            CrewRoute::Run(member) => {
+                self.open_captain_run(view, project, member, chat.run_id.clone());
+            }
+            CrewRoute::Thread(member) => {
+                self.open_provider_thread(view, project, member, chat.label.clone());
+            }
+            CrewRoute::Chat(member) => {
+                self.run_captain_action(CaptainAction::Open { project, member }, view);
+            }
+        }
+    }
+
+    /// Mount the panel's thread view on a provider CLI thread over the open chat; Esc closes
+    /// back to it.
+    fn open_provider_thread(
+        &mut self,
+        view: &mut AgentView,
+        project: String,
+        member: String,
+        title: String,
+    ) {
+        let mut panel = CaptainView::new(picker_viewport_rows(view.terminal_rows()) + 8);
+        panel.set_transient();
+        panel.begin_thread(project.clone(), member.clone(), title);
+        view.overlay = Some(Overlay::Captain(panel));
+        Self::mark_opened_directly(view);
+        self.load_transcript(project, member);
+        self.refresh_captain();
+        self.dirty = true;
+    }
+
+    /// Open the live factory page on a Captain-started run. From the panel, the page's
+    /// close returns to it; from a chat or the dock, to where it was opened.
+    pub(crate) fn open_captain_run(
+        &mut self,
+        view: &mut AgentView,
+        project: String,
+        member: String,
+        run_id: Option<String>,
+    ) {
+        let from_panel =
+            matches!(view.overlay, Some(Overlay::Captain(ref panel)) if !panel.is_transient());
+        if !from_panel {
+            // The page's close returns to a parked panel; with none it returns to its origin.
+            self.captain_parked = None;
+        }
+        let run_id = run_id.or_else(|| {
+            self.captain_snapshot
+                .iter()
+                .flat_map(|s| &s.projects)
+                .filter(|p| p.id == project)
+                .flat_map(|p| &p.crew)
+                .find(|m| m.id == member)
+                .and_then(|m| m.run_id.clone())
+        });
+        if let Some(Overlay::Captain(panel)) = view.overlay.as_mut() {
+            panel.park();
+        }
+        self.open_factory_page_from_captain(
+            view,
+            Some(crate::factory_view::CaptainRunOrigin {
+                project,
+                member: Some(member),
+            }),
+        );
+        if let (Some(run_id), Some(Overlay::Factory(page))) = (run_id, view.overlay.as_mut()) {
+            page.select(crate::factory_view::FactoryRow {
+                run_id,
+                state_id: None,
+            });
+            self.sync_factory_selection(view);
+        }
+        self.dirty = true;
+    }
+
+    /// `→` on a crew row with subagents: the scoped agents view on that crew chat's subtree.
+    /// The panel parks, so F6 reopens on the same row.
+    fn open_crew_subagents(&mut self, view: &mut AgentView, session: &str) {
+        let summary = self
+            .roster
+            .iter()
+            .filter_map(|entry| entry.get("summary"))
+            .find(|summary| {
+                summary
+                    .get("sessionFile")
+                    .and_then(Value::as_str)
+                    .is_some_and(|path| same_file(path, session))
+            })
+            .cloned();
+        let Some(summary) = summary else {
+            if let Some(panel) = Self::panel_mut(view) {
+                panel.set_notice("Its subagents are not in this daemon's roster yet.");
+            }
+            return;
+        };
+        if !self.return_to_agents_view {
+            if let Some(panel) = Self::panel_mut(view) {
+                panel.set_notice("The agents view needs a daemon-hosted session.");
+            }
+            return;
+        }
+        let text = |key: &str| {
+            summary
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        };
+        if let Some(Overlay::Captain(mut panel)) = view.overlay.take() {
+            panel.park();
+            self.captain_parked = Some(panel);
+        }
+        self.scoped_agents_view = Some(crate::agents_view::AgentsViewScope {
+            active_session_id: text("activeSessionId"),
+            session_id: text("sessionId"),
+            session_name: text("sessionName").or_else(|| text("name")),
+        });
+        self.open_agents_view = true;
+        self.exit_requested = true;
+        self.dirty = true;
+    }
+}
+
+/// Where a switcher chat opens.
+#[derive(Debug, PartialEq, Eq)]
+enum CrewRoute {
+    /// A Captain run: the live factory page.
+    Run(String),
+    /// A provider CLI thread: the panel's thread view over the chat.
+    Thread(String),
+    /// A native chat (the Captain when `None`): in place.
+    Chat(Option<String>),
+}
+
+fn crew_route(chat: &CrewChat) -> CrewRoute {
+    match chat.member.clone() {
+        Some(member) if chat.kind == "factory" => CrewRoute::Run(member),
+        Some(member) if chat.is_provider_thread() => CrewRoute::Thread(member),
+        member => CrewRoute::Chat(member),
+    }
+}
+
+/// The `edit` args for a Captain lead model picked in pa's shared picker. The args carry no
+/// provider, so the backend keeps the Captain's current provider (Prime, Claude, Codex, or
+/// Antigravity) and maps the `family/model` id onto it, or refuses a model it cannot run.
+/// What a failed Captain chat open shows.
+#[derive(Debug, PartialEq, Eq)]
+enum BusyOpen {
+    /// Another process holds the session for a turn: wait, with a note the first time.
+    Wait(Option<&'static str>),
+    Failed,
+}
+
+/// Put `draft` above what the editor already holds.
+fn prepend_draft(view: &mut AgentView, draft: &str) {
+    let current = view.editor.get_expanded_text();
+    view.editor.set_text(&joined_draft(draft, &current));
+}
+
+fn joined_draft(draft: &str, current: &str) -> String {
+    if current.trim().is_empty() {
+        draft.to_owned()
+    } else if draft.trim().is_empty() || current.starts_with(draft) {
+        current.to_owned()
+    } else {
+        format!("{draft}\n\n{current}")
+    }
+}
+
+/// A Captain status changed: a chat that waited for a turn is tried again, as a retry so its
+/// notice is not shown twice. A chat already waiting to open goes first.
+fn retry_busy_open(pending: &mut Option<CaptainOpen>, busy: &mut Option<CaptainOpen>) {
+    if pending.is_none() {
+        *pending = busy.take().map(|open| CaptainOpen {
+            retry: true,
+            ..open
+        });
+    }
+}
+
+/// The note for a failed open. A turn that holds the session's runtime lease (an older process
+/// that runs it outside the daemon) is not an error: the chat opens when the turn ends.
+fn busy_open_note(error: &str, retry: bool) -> BusyOpen {
+    if !error.contains("runtime lease") {
+        return BusyOpen::Failed;
+    }
+    BusyOpen::Wait((!retry).then_some("The Captain is working · opens when this turn ends"))
+}
+
+/// The `act lead` / `act steer` input for one Captain chat message.
+fn captain_lead_args(lead: &CaptainLead) -> Value {
+    let mut args = serde_json::json!({"project": lead.project, "text": lead.text});
+    if lead.op == "steer" {
+        args["request_id"] = Value::String(uuid::Uuid::new_v4().to_string());
+    }
+    if !lead.images.is_empty() {
+        args["images"] = serde_json::json!(lead.images);
+    }
+    args
+}
+
+fn captain_lead_model_args(
+    project: String,
+    full_model: String,
+    effort_edited: bool,
+    thinking: String,
+) -> Value {
+    let mut args = serde_json::json!({
+        "project": project,
+        "field": "model",
+        "value": full_model,
+    });
+    if effort_edited {
+        args["thinking"] = Value::String(thinking);
+    }
+    args
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_native_open_reply_opens_the_live_step_session() {
+        let reply = json!({"ok": true, "kind": "native", "session": "/s/step.jsonl", "cwd": "/w"});
+        assert_eq!(
+            native_open_target(&reply),
+            Some(OpenTarget::Session {
+                path: "/s/step.jsonl".into(),
+                factory: false,
+                draft: None,
+            })
+        );
+        assert_eq!(
+            native_open_target(&json!({"kind": "thread", "session": "x"})),
+            None
+        );
+        assert_eq!(
+            native_open_target(&json!({"kind": "native", "session": " "})),
+            None
+        );
+    }
+
+    #[test]
+    fn a_steer_names_its_delivery_and_an_old_backend_falls_back() {
+        assert_eq!(
+            captain_delivery_note("steer", &json!({"steered": true})),
+            STEERED_NOTE
+        );
+        assert_eq!(
+            captain_delivery_note("steer", &json!({"steered": false, "queued": true})),
+            QUEUED_NOTE
+        );
+        assert_eq!(captain_delivery_note("lead", &json!({})), QUEUED_NOTE);
+        assert!(steer_unsupported("Unknown captain action: steer"));
+        assert!(steer_unsupported("argument op: invalid choice: 'steer'"));
+        assert!(!steer_unsupported("The Captain is stopped"));
+    }
+
+    #[test]
+    fn captain_lead_args_carry_images_and_a_steer_request_id() {
+        let mut lead = CaptainLead {
+            project: "p1".into(),
+            text: "look".into(),
+            done: String::new(),
+            op: "lead",
+            images: Vec::new(),
+        };
+        assert_eq!(
+            captain_lead_args(&lead),
+            json!({"project": "p1", "text": "look"})
+        );
+        lead.op = "steer";
+        lead.images = vec!["/hub/captains/attachments/a.png".into()];
+        let args = captain_lead_args(&lead);
+        assert_eq!(args["images"], json!(["/hub/captains/attachments/a.png"]));
+        assert!(args["request_id"].as_str().is_some_and(|id| !id.is_empty()));
+    }
+
+    #[test]
+    fn captain_images_are_saved_as_hub_files() {
+        use base64::Engine as _;
+        let dir = tempfile::tempdir().unwrap();
+        let image = LoadedImage {
+            data: base64::engine::general_purpose::STANDARD.encode(b"\x89PNG"),
+            mime_type: "image/jpeg".into(),
+        };
+        let paths = save_captain_images(&dir.path().join("attachments"), &[&image]).unwrap();
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].ends_with(".jpg"));
+        assert_eq!(std::fs::read(&paths[0]).unwrap(), b"\x89PNG");
+    }
+
+    #[test]
+    fn a_lease_conflict_waits_for_the_turn_without_the_daemon_text() {
+        let error = "the daemon rejected the create request: This session is currently open in another Rust build of Prime Agent (active in pid 7420) — another daemon or window of this product holds the file's runtime lease.";
+        assert_eq!(
+            busy_open_note(error, false),
+            BusyOpen::Wait(Some("The Captain is working · opens when this turn ends"))
+        );
+        // A retry that is still blocked waits quietly.
+        assert_eq!(busy_open_note(error, true), BusyOpen::Wait(None));
+        assert_eq!(busy_open_note("No such session", false), BusyOpen::Failed);
+    }
+
+    #[test]
+    fn a_status_change_retries_a_waiting_open_once_quietly() {
+        let open = CaptainOpen {
+            path: "/s/lead.jsonl".into(),
+            draft: Some("hi".into()),
+            factory: false,
+            retry: false,
+        };
+        let mut pending = None;
+        let mut busy = Some(open.clone());
+        retry_busy_open(&mut pending, &mut busy);
+        assert_eq!(busy, None);
+        assert_eq!(
+            pending,
+            Some(CaptainOpen {
+                retry: true,
+                ..open.clone()
+            })
+        );
+        // A chat already waiting to open is not replaced.
+        let mut busy = Some(CaptainOpen {
+            path: "/s/c1.jsonl".into(),
+            ..open.clone()
+        });
+        retry_busy_open(&mut pending, &mut busy);
+        assert_eq!(pending.unwrap().path, PathBuf::from("/s/lead.jsonl"));
+        assert!(busy.is_some());
+    }
+
+    #[test]
+    fn a_draft_goes_above_the_editor_text_once() {
+        assert_eq!(joined_draft("draft", ""), "draft");
+        assert_eq!(joined_draft("draft", "typed"), "draft\n\ntyped");
+        assert_eq!(joined_draft("draft", "draft\n\ntyped"), "draft\n\ntyped");
+        assert_eq!(joined_draft("", "typed"), "typed");
+    }
+
+    #[test]
+    fn a_lead_model_pick_keeps_the_captain_provider() {
+        let args = captain_lead_model_args(
+            "p1".into(),
+            "anthropic/claude-opus-4-6".into(),
+            false,
+            "high".into(),
+        );
+        assert_eq!(
+            args,
+            json!({"project": "p1", "field": "model", "value": "anthropic/claude-opus-4-6"})
+        );
+        let args = captain_lead_model_args("p1".into(), "m".into(), true, "low".into());
+        assert_eq!(args["thinking"], "low");
+        assert!(args.get("provider").is_none());
+    }
 
     fn snapshot() -> CaptainSnapshot {
         serde_json::from_value(json!({
@@ -931,7 +2017,9 @@ mod tests {
                 "crew": [
                     {"id": "c1", "kind": "thread", "title": "parser-fix", "session": "/s/c1.jsonl", "busy": true},
                     {"id": "c2", "kind": "thread", "title": "claude review", "provider": "claude"},
-                    {"id": "f1", "kind": "factory", "title": "check · x", "session": "/s/f.jsonl"}
+                    {"id": "f1", "kind": "factory", "title": "check · x", "machine": "check",
+                     "session": "/s/f.jsonl", "run_state": "paused", "state": "needs_you", "run_id": "r1"},
+                    {"id": "f2", "kind": "factory", "title": "old · y", "run_state": "done", "state": "done"}
                 ]
             }]
         }))
@@ -940,27 +2028,90 @@ mod tests {
 
     #[test]
     fn a_crew_chat_resolves_its_project_and_breadcrumb() {
-        let context = captain_context(&snapshot(), "/s/c1.jsonl").unwrap();
+        let context = captain_context(&snapshot(), "/s/c1.jsonl", &[]).unwrap();
         assert_eq!(context.project, "p1");
         assert_eq!(context.chat, "parser-fix");
+        assert_eq!(context.subagent, None);
         assert_eq!(
             context
                 .chats
                 .iter()
-                .map(|c| c.label.as_str())
+                .map(|c| (c.label.as_str(), c.kind.as_str(), c.status.as_str()))
                 .collect::<Vec<_>>(),
-            ["captain", "parser-fix", "claude review"],
-            "factory runs are not chats"
+            [
+                ("captain", "captain", "idle"),
+                ("parser-fix", "chat", "working"),
+                ("claude review", "claude", "idle"),
+                ("check", "factory", "paused"),
+            ],
+            "provider threads and live runs are switchable"
+        );
+        assert!(context.chats[2].is_provider_thread());
+        assert!(!context.chats[3].is_provider_thread());
+        assert_eq!(
+            context.chats[3].session, None,
+            "a run opens its factory page"
         );
         assert_eq!(
-            breadcrumb(&context, "F7", "Shift+F7"),
-            "captain › parser-fix · F7 switch chat · Shift+F7 captain"
+            breadcrumb(&context, "F7", "Shift+F7", "F6"),
+            "parser › parser-fix · F7 switch · Shift+F7 captain · F6 overview"
         );
-        let lead = captain_context(&snapshot(), "/s/lead.jsonl").unwrap();
+        let lead = captain_context(&snapshot(), "/s/lead.jsonl", &[]).unwrap();
         assert_eq!(
-            breadcrumb(&lead, "F7", "Shift+F7"),
-            "parser › captain · F7 switch chat · Shift+F7 captain"
+            breadcrumb(&lead, "F7", "Shift+F7", "F6"),
+            "parser › captain · F7 switch · F6 overview",
+            "the Captain chat names no return-to-Captain key"
         );
-        assert!(captain_context(&snapshot(), "/s/other.jsonl").is_none());
+        assert!(captain_context(&snapshot(), "/s/other.jsonl", &[]).is_none());
+    }
+
+    #[test]
+    fn the_switcher_routes_runs_provider_threads_and_chats() {
+        let context = captain_context(&snapshot(), "/s/lead.jsonl", &[]).unwrap();
+        let routes: Vec<CrewRoute> = context.chats.iter().map(crew_route).collect();
+        assert_eq!(
+            routes,
+            [
+                CrewRoute::Chat(None),
+                CrewRoute::Chat(Some("c1".into())),
+                CrewRoute::Thread("c2".into()),
+                CrewRoute::Run("f1".into()),
+            ]
+        );
+        assert_eq!(context.chats[3].run_id.as_deref(), Some("r1"));
+    }
+
+    #[test]
+    fn a_subagent_of_a_crew_chat_keeps_its_captain_context() {
+        let roster = vec![
+            json!({"summary": {"sessionFile": "/s/sub2.jsonl", "sessionName": "grammar-check",
+                "parentSessionPath": "/s/sub1.jsonl"}}),
+            json!({"summary": {"sessionFile": "/s/sub1.jsonl", "sessionName": "lexer",
+                "parentSessionPath": "/s/c1.jsonl"}}),
+            json!({"summary": {"sessionFile": "/s/c1.jsonl"}}),
+        ];
+        let ancestors = session_ancestors(&roster, "/s/sub2.jsonl");
+        assert_eq!(
+            ancestors,
+            [
+                ("/s/sub1.jsonl".to_owned(), "grammar-check".to_owned()),
+                ("/s/c1.jsonl".to_owned(), "lexer".to_owned()),
+            ]
+        );
+        let context = captain_context(&snapshot(), "/s/sub2.jsonl", &ancestors).unwrap();
+        assert_eq!(context.project, "p1");
+        assert_eq!(context.chat, "parser-fix");
+        assert_eq!(context.subagent.as_deref(), Some("grammar-check"));
+        assert_eq!(
+            breadcrumb(&context, "F7", "Shift+F7", "F6"),
+            "parser › parser-fix › grammar-check · F7 switch · Shift+F7 captain · F6 overview"
+        );
+        // A subagent of the Captain chat still offers the way back to the Captain.
+        let roster = vec![json!({"summary": {"sessionFile": "/s/x.jsonl",
+            "parentSessionPath": "/s/lead.jsonl"}})];
+        let ancestors = session_ancestors(&roster, "/s/x.jsonl");
+        let context = captain_context(&snapshot(), "/s/x.jsonl", &ancestors).unwrap();
+        assert_eq!(context.chat, "captain");
+        assert!(breadcrumb(&context, "F7", "Shift+F7", "F6").contains("Shift+F7 captain"));
     }
 }

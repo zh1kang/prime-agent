@@ -8,6 +8,7 @@ use super::click::{
 use super::FULLSCREEN_MIN_TRANSCRIPT_ROWS;
 use super::{AgentView, Overlay};
 use crate::chrome::{render_prompt_context, render_top_bar};
+use crate::theme::{Theme, ThemeColor};
 use crate::width::str_width;
 use crate::{Line, Span};
 use ratatui::style::{Modifier, Style};
@@ -47,6 +48,37 @@ impl AgentView {
                 self.frame_rows = frame.len();
                 self.apply_frame_selection(&mut frame, 0, width);
                 return frame;
+            }
+            Some(Overlay::ModelPicker(picker)) if self.modal_backdrop.is_some() => {
+                // A machine-editor or Captain pick floats over its page instead of the chat.
+                let page_rows =
+                    height.saturating_sub(FULLSCREEN_MIN_TRANSCRIPT_ROWS + 1 + pane_row);
+                let backdrop = match self.modal_backdrop.as_deref_mut() {
+                    Some(Overlay::Captain(panel)) => {
+                        panel.set_viewport_rows(page_rows);
+                        panel.render(&self.theme, width, kb)
+                    }
+                    Some(Overlay::Workspace(page)) => {
+                        page.set_viewport_rows(page_rows);
+                        page.render(&self.theme, width, kb)
+                    }
+                    _ => Vec::new(),
+                };
+                let inset = if width >= 48 { 4 } else { 0 };
+                let card_width = width.saturating_sub(2 * inset + 2);
+                let card = picker.render(&self.theme, card_width, kb);
+                let (rows, card_top) =
+                    float_card(&self.theme, backdrop, card, width, inset, page_rows);
+                self.click.record_picker(PickerClickSurface {
+                    dock_row: pane_row + card_top + 1,
+                    chrome_rows: MODEL_PICKER_CHROME_ROWS
+                        + usize::from(picker.header().is_some())
+                        + usize::from(picker.has_scoped_models()),
+                    items: picker.filtered_window(),
+                    kind: PickerKind::Model,
+                });
+                dock.extend(rows);
+                Some(dock)
             }
             Some(Overlay::ModelPicker(picker)) => {
                 dock.extend(picker.render(&self.theme, width, kb));
@@ -385,4 +417,67 @@ pub(super) fn composite_follow_hint(row: &Line, label: &str, width: usize) -> Li
         true,
     ));
     out
+}
+
+/// Float a framed card over a page: the page's rows dim, and the card replaces the middle rows
+/// between `inset` columns of the page on each side. Returns the rows and the card's top row.
+pub(super) fn float_card(
+    theme: &Theme,
+    page: Vec<Line>,
+    card: Vec<Line>,
+    width: usize,
+    inset: usize,
+    page_rows: usize,
+) -> (Vec<Line>, usize) {
+    let card_width = width.saturating_sub(2 * inset + 2);
+    let card_height = card.len() + 2;
+    let total = page.len().max(page_rows).max(card_height);
+    let top = (total - card_height) / 2;
+    let mut rows: Vec<Line> = page
+        .into_iter()
+        .map(|line| {
+            line.into_iter()
+                .map(|mut span| {
+                    span.style = span.style.add_modifier(Modifier::DIM);
+                    span
+                })
+                .collect()
+        })
+        .collect();
+    rows.resize_with(total, Vec::new);
+    let border = |text: String| theme.fg_span(ThemeColor::BorderAccent, text);
+    let mut framed: Vec<Line> = Vec::with_capacity(card_height);
+    framed.push(vec![border(format!(
+        "\u{256d}{}\u{256e}",
+        "\u{2500}".repeat(card_width)
+    ))]);
+    for line in card {
+        let mut row = vec![border("\u{2502}".to_owned())];
+        row.extend(pad_row(
+            crate::width::truncate_line(&line, card_width, "\u{2026}"),
+            card_width,
+        ));
+        row.push(border("\u{2502}".to_owned()));
+        framed.push(row);
+    }
+    framed.push(vec![border(format!(
+        "\u{2570}{}\u{256f}",
+        "\u{2500}".repeat(card_width)
+    ))]);
+    for (offset, card_row) in framed.into_iter().enumerate() {
+        let page_row = &rows[top + offset];
+        let mut out = pad_row(
+            crate::width::slice_line_by_column_strict(page_row, 0, inset, true),
+            inset,
+        );
+        out.extend(card_row);
+        out.extend(crate::width::slice_line_by_column_strict(
+            page_row,
+            width.saturating_sub(inset),
+            inset,
+            true,
+        ));
+        rows[top + offset] = out;
+    }
+    (rows, top)
 }

@@ -437,16 +437,39 @@ pub(crate) struct SessionUi {
     captain_compose: Option<captain::CaptainCompose>,
     /// The Captain project this chat belongs to: the breadcrumb and the crew picker.
     captain_context: Option<captain::CaptainContext>,
-    /// The Captain panel kept while a text step uses the editor.
+    /// The Captain panel kept while a text step or shared model picker is open.
     captain_parked: Option<crate::captain_view::CaptainView>,
+    /// The workspace page kept while the shared model picker is open.
+    workspace_parked: Option<crate::workspace_view::WorkspaceView>,
+    /// What an open `Overlay::ModelPicker` applies to on Enter or Cancel.
+    model_pick_target: model_picker::ModelPickTarget,
     /// The crew and factory states of the last Captain status, for the change toasts.
     captain_states: Option<crate::captain_view::CrewStates>,
+    /// Stat-cached reader for `<hub>/captains/status/<project-id>.json` (no subprocess per tick).
+    captain_status_watcher: crate::interactive::captain_hint::CaptainStatusWatcher,
+    /// Current project's Captain summary for the bottom activity dock.
+    captain_dock: Option<crate::chrome::CaptainDockState>,
+    /// Last observed `(sqlite_stamp, status_stamp)` for skipping redundant F6 polls.
+    captain_db_stamp: Option<(
+        Option<crate::interactive::captain_hint::FileStamp>,
+        Option<crate::interactive::captain_hint::FileStamp>,
+    )>,
     /// `/captain <name>`: the project to focus when the first status arrives.
     captain_focus_query: Option<String>,
     /// `/captain stop|resume|delete`: the panel key to press once the status arrives.
     captain_pending_key: Option<&'static str>,
     /// A chat the panel asked to open; the run loop opens it in place.
-    pub(crate) pending_captain_open: Option<(PathBuf, Option<String>, bool)>,
+    pub(crate) pending_captain_open: Option<captain::CaptainOpen>,
+    /// A Captain chat that could not open because another process holds its session; it
+    /// opens on the next Captain status change once that process lets go.
+    pub(crate) captain_busy_open: Option<captain::CaptainOpen>,
+    /// The daemon socket this chat runs on; Captain turns use the same daemon.
+    pub(crate) daemon_socket: PathBuf,
+    /// The last Captain status, so an opened chat finds its project before the next one.
+    captain_snapshot: Option<crate::captain_view::CaptainSnapshot>,
+    /// The message whose `lead` call has not answered yet, and the messages typed after it.
+    captain_lead_inflight: Option<captain::CaptainLead>,
+    captain_lead_queue: std::collections::VecDeque<captain::CaptainLead>,
     external_editor_request: Option<String>,
     /// The `/mcp` view's internal auth resolution: the loop mounts the panel
     /// and spawns the command through the auth seam, never the typed-command path.

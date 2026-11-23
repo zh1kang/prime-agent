@@ -457,7 +457,7 @@ impl SessionUi {
                 self.note(&format!("Unknown skill: {}", unknown.join(", ")), view);
             }
         }
-        if self.send_to_captain(text, view) {
+        if self.send_to_captain(text, behavior, view) {
             return Ok(());
         }
         self.send_prompt(text, behavior, view)

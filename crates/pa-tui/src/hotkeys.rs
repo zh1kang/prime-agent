@@ -60,6 +60,11 @@ pub fn hotkeys_guide(kb: &KeybindingsManager) -> String {
     let expand_tools = key_display(kb, "app.tools.expand");
     let focus_subagents = key_display(kb, "app.subagents.focus");
     let factory_toggle = key_display(kb, "app.factory.toggle");
+    let captain_crew = key_display(kb, "app.captain.crew");
+    let captain_parent = key_display(kb, "app.captain.parent");
+    let captain_next = key_display(kb, "app.captain.next");
+    let captain_previous = key_display(kb, "app.captain.previous");
+    let agents_back = key_display(kb, "app.agents.back");
     let external_editor = key_display(kb, "app.editor.external");
     let prompt_stash = key_display(kb, "app.prompt.stash");
     let follow_up = key_display(kb, "app.message.followUp");
@@ -143,8 +148,12 @@ pub fn hotkeys_guide(kb: &KeybindingsManager) -> String {
     );
     let _ = writeln!(
         hotkeys,
-        r"| `{focus_subagents}` | Focus activity (←/→ select group, Enter open) |
-| `{factory_toggle}` | Open or close the live factory |
+        r"| `{focus_subagents}` | Focus activity dock (↑/↓ select, Enter open) |
+| `{factory_toggle}` | Open or close the Captain |
+| `{captain_crew}` | Switch Captain/crew chat |
+| `{captain_parent}` | Return to Captain chat |
+| `{captain_next}` / `{captain_previous}` | Next/previous Captain chat |
+| `{agents_back}` | Agents view (when editor is empty) |
 | `{external_editor}` | Edit message in external editor |
 | `{prompt_stash}` | Stash or restore draft prompt |
 | `{follow_up}` | Queue follow-up message |
@@ -211,6 +220,24 @@ mod tests {
             )),
             "{guide}"
         );
+    }
+
+    #[test]
+    fn guide_matches_the_captain_and_activity_bindings() {
+        let kb = KeybindingsManager::new();
+        let guide = hotkeys_guide(&kb);
+        let alt = crate::keybindings::format_key_text("alt");
+        for row in [
+            "| `F6` | Open or close the Captain |".to_string(),
+            "| `F7` | Switch Captain/crew chat |".to_string(),
+            "| `Shift+F7` | Return to Captain chat |".to_string(),
+            "| `F8` / `Shift+F8` | Next/previous Captain chat |".to_string(),
+            "| `\u{2190}` | Agents view (when editor is empty) |".to_string(),
+            format!("| `{alt}+A` | Focus activity dock (\u{2191}/\u{2193} select, Enter open) |"),
+        ] {
+            assert!(guide.contains(&row), "missing {row}: {guide}");
+        }
+        assert!(!guide.contains("live factory"), "{guide}");
     }
 
     #[test]

@@ -70,6 +70,9 @@ pub struct ModelPickerOptions {
     pub thinking_level: Option<ModelThinkingLevel>,
     /// The viewport height the list sizes itself against (already the `getRows` value).
     pub viewport_rows: usize,
+    /// A one-line context header rendered above the search field (what the pick
+    /// changes, e.g. `model › ship · review-bugs`); `None` for the chat's own model.
+    pub header: Option<String>,
 }
 
 mod scope;
@@ -128,6 +131,7 @@ pub struct ModelPicker {
     /// The version runs parsed from each `all_models` entry's id, indexed alike
     /// (the search sort's recency tier: the ids' versions stand in for release recency).
     version_keys: Vec<Vec<String>>,
+    header: Option<String>,
 }
 
 impl ModelPicker {
@@ -158,6 +162,7 @@ impl ModelPicker {
             scoped_positions: Vec::new(),
             scope: ModelScope::All,
             version_keys: Vec::new(),
+            header: options.header.filter(|header| !header.trim().is_empty()),
         };
         picker.load_models(options.models);
         picker.resolve_scope_positions();
@@ -319,9 +324,11 @@ impl ModelPicker {
             Some(self.viewport_rows),
             8,
             self.filtered.len(),
-            // The frame's fixed rows plus the scope row when the session has
-            // scoped models.
-            4 + usize::from(self.has_scoped_models()) + detail_rows,
+            // The frame's fixed rows (thinking bar included) plus the scope row when the
+            // session has scoped models.
+            5 + usize::from(self.has_scoped_models())
+                + usize::from(self.header.is_some())
+                + detail_rows,
             1,
         )
     }
@@ -335,6 +342,10 @@ impl ModelPicker {
         } else {
             0
         }
+    }
+
+    pub(crate) fn header(&self) -> Option<&str> {
+        self.header.as_deref()
     }
 
     pub(crate) fn set_render_width(&mut self, width: usize) {

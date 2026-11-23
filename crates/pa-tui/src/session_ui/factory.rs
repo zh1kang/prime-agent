@@ -13,8 +13,8 @@ use pa_types::daemon::DaemonCommand;
 use super::{AgentView, Overlay};
 
 use crate::factory_view::{
-    factory_reply_lists_runs, live_run_count, parse_factory_runs, FactoryView, FactoryViewAction,
-    FACTORY_WATCH_TICK_MS,
+    factory_reply_lists_runs, live_run_count, parse_factory_runs, CaptainRunOrigin, FactoryView,
+    FactoryViewAction, FACTORY_WATCH_TICK_MS,
 };
 use crate::interactive::{SelectionOrigin, SessionPanel, SessionSelection};
 use crate::session_ui::{picker_viewport_rows, UI_REQUEST_TIMEOUT_MS};
@@ -50,19 +50,184 @@ pub(crate) enum FactoryUpdate {
     },
 }
 
+/// The daemon sockets whose factory lane `/fsm` turned on after the hello:
+/// the daemon and the kernel read `factory.enabled` per request, so the lane
+/// answers on the live connection even though its hello hid the capability.
+static HOT_ENABLED_FACTORY_LANES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// The capability every daemon that ships the factory lane advertises
+/// whatever `factory.enabled` reads (the hello hides only the factory pair).
+const FACTORY_ERA_CAPABILITY: &str = "kernel_bash_activity";
+
+fn hot_enabled_lanes() -> std::sync::MutexGuard<'static, Vec<String>> {
+    HOT_ENABLED_FACTORY_LANES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 impl super::SessionUi {
     /// Whether the daemon advertises the factory lane (older daemons never
-    /// see the command): the open and every refresh tick key on the same
-    /// gate, so an unsupported daemon spends no wakeups.
+    /// see the command), or `/fsm` turned it on for this daemon since the
+    /// hello: the open and every refresh tick key on the same gate, so an
+    /// unsupported daemon spends no wakeups.
     pub(crate) fn factory_activity_supported(&self) -> bool {
+        self.hello_advertises("factory_activity")
+            || self
+                .factory_lane_key()
+                .is_some_and(|key| hot_enabled_lanes().contains(&key))
+    }
+
+    fn hello_advertises(&self, capability: &str) -> bool {
         self.client
             .hello()
             .get("serverCapabilities")
             .and_then(Value::as_array)
-            .is_some_and(|caps| {
-                caps.iter()
-                    .any(|cap| cap.as_str() == Some("factory_activity"))
-            })
+            .is_some_and(|caps| caps.iter().any(|cap| cap.as_str() == Some(capability)))
+    }
+
+    /// The hot-enable registry's key for this connection's daemon.
+    fn factory_lane_key(&self) -> Option<String> {
+        self.client
+            .hello()
+            .get("socketPath")
+            .and_then(Value::as_str)
+            .filter(|path| !path.is_empty())
+            .map(str::to_string)
+    }
+
+    /// Turn the factory lane on without a client restart (`/fsm` while
+    /// `factory.enabled` is off): persist the setting, then mark this
+    /// daemon's lane live. Returns whether the lane is now usable.
+    pub(crate) fn hot_enable_factory_lane(&mut self) -> Result<bool> {
+        if self.factory_activity_supported() {
+            return Ok(true);
+        }
+        let Some(settings) = &self.client_settings else {
+            return Ok(false);
+        };
+        let Some(key) = self.factory_lane_key() else {
+            return Ok(false);
+        };
+        if !self.hello_advertises(FACTORY_ERA_CAPABILITY) {
+            return Ok(false);
+        }
+        if !settings.factory_enabled() {
+            settings.set_factory_enabled(true)?;
+        }
+        let mut lanes = hot_enabled_lanes();
+        if !lanes.contains(&key) {
+            lanes.push(key);
+        }
+        Ok(true)
+    }
+
+    /// Forget a hot-enabled lane (`/factory off`): the gate falls back to the hello.
+    pub(crate) fn hot_disable_factory_lane(&self) {
+        if let Some(key) = self.factory_lane_key() {
+            hot_enabled_lanes().retain(|lane| *lane != key);
+        }
+    }
+
+    /// `/fsm`: open the live factory page, turning the factory lane on first
+    /// when `factory.enabled` is off (no `/factory on` plus restart needed).
+    pub(crate) fn open_fsm_page(&mut self, view: &mut AgentView) {
+        let was_supported = self.factory_activity_supported();
+        match self.hot_enable_factory_lane() {
+            Ok(true) if !was_supported => {
+                self.note("The factory is enabled for this daemon.", view);
+                self.spawn_factory_refresh();
+            }
+            Ok(_) => {}
+            Err(error) => self.error_row(&format!("{error:#}"), view),
+        }
+        self.open_factory_page(view);
+    }
+
+    /// Open the factory page from the Captain panel: the panel parks, and the
+    /// page's close returns to it. `run` names the Captain run it opened on.
+    pub(crate) fn open_factory_page_from_captain(
+        &mut self,
+        view: &mut AgentView,
+        run: Option<CaptainRunOrigin>,
+    ) {
+        if let Some(Overlay::Captain(panel)) = view.overlay.take() {
+            self.captain_parked = Some(panel);
+        }
+        self.open_factory_page(view);
+        if let Some(Overlay::Factory(page)) = view.overlay.as_mut() {
+            page.set_captain_origin(run);
+        }
+    }
+
+    /// Close the factory page to where it came from: the parked Captain
+    /// panel, the agents view that requested it, the dock, or the editor.
+    fn close_factory_page(&mut self, view: &mut AgentView) {
+        let returns_to_captain = matches!(
+            view.overlay.as_ref(),
+            Some(Overlay::Factory(page)) if page.returns_to_captain()
+        );
+        self.factory_selected_run = None;
+        self.factory_view_session = None;
+        if returns_to_captain {
+            if let Some(panel) = self.captain_parked.take() {
+                view.overlay = Some(Overlay::Captain(panel));
+                self.refresh_captain();
+                self.dirty = true;
+                return;
+            }
+        }
+        if self.close_panel_to_agents_view() {
+            view.overlay = None;
+            self.dirty = true;
+            return;
+        }
+        self.close_overlay_to_origin(view);
+    }
+
+    /// Resume a paused run with a reviewer note: a Captain run answers
+    /// through the Captain (the retried step gets the note), a session run
+    /// through the lane's resume.
+    async fn resume_factory_run_with_note(
+        &mut self,
+        view: &mut AgentView,
+        run_id: String,
+        note: String,
+    ) -> Result<()> {
+        let captain_member = match view.overlay.as_ref() {
+            Some(Overlay::Factory(page)) => page.captain_run().and_then(|run| {
+                run.member
+                    .clone()
+                    .map(|member| (run.project.clone(), member))
+            }),
+            _ => None,
+        };
+        if let Some((project, member)) = captain_member {
+            let text = if note.is_empty() {
+                "resume".to_string()
+            } else {
+                note
+            };
+            self.run_captain_action(
+                crate::captain_view::CaptainAction::Act {
+                    op: "answer".into(),
+                    args: serde_json::json!({
+                        "project": project,
+                        "member": member,
+                        "text": text,
+                        "decision": "resume",
+                    }),
+                    done: "Answer sent. The run resumes.".into(),
+                },
+                view,
+            );
+            return Ok(());
+        }
+        let mut rest = Map::default();
+        if !note.is_empty() {
+            rest.insert("note".into(), Value::String(note));
+        }
+        self.factory_control_with(view, "resume", run_id, rest)
+            .await
     }
 
     /// Open the factory page: the activity dock's factory group's
@@ -73,6 +238,7 @@ impl super::SessionUi {
     /// refresh cadence keeps it current; a daemon without the lane
     /// reports exactly that instead of mounting nothing silently.
     pub(crate) fn open_factory_page(&mut self, view: &mut AgentView) {
+        Self::mark_opened_directly(view);
         if !self.factory_activity_supported() {
             let mut page = FactoryView::new(Vec::new(), picker_viewport_rows(view.terminal_rows()));
             page.set_error(Some(
@@ -211,13 +377,7 @@ impl super::SessionUi {
             Some(FactoryViewAction::Edit(name)) => {
                 self.open_workspace(crate::workspace_view::WorkspaceView::machines(&name), view);
             }
-            Some(FactoryViewAction::Close) => {
-                self.factory_selected_run = None;
-                self.factory_view_session = None;
-                view.overlay = None;
-                self.close_panel_to_agents_view();
-                self.dirty = true;
-            }
+            Some(FactoryViewAction::Close) => self.close_factory_page(view),
             Some(FactoryViewAction::Open { child_id }) => self.open_factory_child(view, &child_id),
             Some(FactoryViewAction::OpenNode {
                 run_id,
@@ -234,6 +394,10 @@ impl super::SessionUi {
             }
             Some(FactoryViewAction::Resume { run_id }) => {
                 self.factory_control(view, "resume", run_id).await?;
+            }
+            Some(FactoryViewAction::ResumeWithNote { run_id, note }) => {
+                self.resume_factory_run_with_note(view, run_id, note)
+                    .await?;
             }
         }
         Ok(())
@@ -321,6 +485,17 @@ impl super::SessionUi {
         action: &str,
         run_id: String,
     ) -> Result<()> {
+        self.factory_control_with(view, action, run_id, Map::default())
+            .await
+    }
+
+    async fn factory_control_with(
+        &mut self,
+        view: &mut AgentView,
+        action: &str,
+        run_id: String,
+        rest: Map<String, Value>,
+    ) -> Result<()> {
         match self
             .bounded_request(
                 Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
@@ -331,7 +506,7 @@ impl super::SessionUi {
                     run_id: Some(run_id.clone()),
                     spec_id: None,
                     timeout_ms: None,
-                    rest: Map::default(),
+                    rest,
                 },
             )
             .await

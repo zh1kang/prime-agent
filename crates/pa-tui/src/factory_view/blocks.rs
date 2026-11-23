@@ -9,7 +9,9 @@
 //! target arrow. Back edges leave their source labelled, climb the
 //! right-hand gutter, and drop into their target.
 
-use super::diagram::{FactoryState, FactoryTransition};
+use std::collections::HashMap;
+
+use super::diagram::{node_glyph, FactoryNodeState, FactoryState, FactoryTransition};
 use crate::theme::{Theme, ThemeColor};
 use crate::{Line, Span};
 
@@ -25,12 +27,34 @@ const DOWN: u8 = 2;
 const LEFT: u8 = 4;
 const RIGHT: u8 = 8;
 
+/// Interactive/live rendering options for [`block_diagram_with_options`].
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct DiagramRenderOptions<'a> {
+    /// Selected state id: paints its box border, bold title, and detail in
+    /// cyan (`ThemeColor::Accent`).
+    pub selected_state: Option<&'a str>,
+    /// Optional live run node map: overlays status glyphs and border colors.
+    pub live_nodes: Option<&'a HashMap<String, FactoryNodeState>>,
+    /// Optional viewport width budget: when narrower than the natural layout,
+    /// tightens box text width and inter-box gaps so 80-col terminals keep
+    /// multi-column fan-outs and back-edge gutters unclipped.
+    pub max_width: Option<usize>,
+    /// The model of agent states that name no model or role (the run's host model), shown as
+    /// `inherit (<model>)`; empty means pa's default model.
+    pub inherit_model: Option<&'a str>,
+}
+
 /// What one canvas cell paints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Role {
     Border,
     Title,
     Detail,
+    SelectedBorder,
+    SelectedTitle,
+    SelectedDetail,
+    StatusBorder(ThemeColor),
+    StatusTitle(ThemeColor),
     Arrow,
     Label,
 }
@@ -44,11 +68,13 @@ enum Cell {
     Char(char, Role),
 }
 
-/// The rendered diagram. Tests also keep each state's first box row to
-/// check the layout.
+/// The rendered diagram. `node_spans` records each state's `(id, top_row,
+/// bottom_row)` in visual order (top-to-bottom, left-to-right) so callers
+/// can step nodes with `↑`/`↓` and auto-scroll the selected box into view.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct BlockDiagram {
     pub lines: Vec<Line>,
+    pub node_spans: Vec<(String, usize, usize)>,
     #[cfg(test)]
     pub node_rows: Vec<usize>,
 }
@@ -93,9 +119,24 @@ fn detail(state: &FactoryState) -> String {
         return "resident".to_string();
     }
     match (&state.model, &state.subagent) {
+        // An inheriting step shows the model it resolves to; the box has no room for a prefix.
+        (Some(model), _) if model.starts_with("inherit (") => model.clone(),
         (Some(model), _) => format!("agent · {}", model.rsplit('/').next().unwrap_or(model)),
         (None, Some(subagent)) => format!("agent · {subagent}"),
         (None, None) => "agent".to_string(),
+    }
+}
+
+/// Clip a box's detail line; an `agent · <model> · <thinking>` badge drops its `agent` prefix,
+/// then clips its model, so the thinking level stays readable.
+fn clip_detail(text: &str, max: usize) -> String {
+    match text.rsplit_once(" · ") {
+        Some((head, level)) if head.contains(" · ") && text.chars().count() > max => {
+            let model = head.strip_prefix("agent · ").unwrap_or(head);
+            let room = max.saturating_sub(level.chars().count() + 3);
+            format!("{} · {level}", clip(model, room))
+        }
+        _ => clip(text, max),
     }
 }
 
@@ -178,20 +219,68 @@ fn order_layers(
     }
 }
 
-/// Lay out and draw the diagram.
-#[expect(
-    clippy::too_many_lines,
-    reason = "one layout pass: edges, layers, order, positions, rows, then the drawing; split, each step would only pass the same tables along"
-)]
+/// Lay out and draw the diagram with default options.
 pub(crate) fn block_diagram(
     theme: &Theme,
     states: &[FactoryState],
     transitions: &[FactoryTransition],
 ) -> BlockDiagram {
+    block_diagram_with_options(theme, states, transitions, &DiagramRenderOptions::default())
+}
+
+/// Lay out and draw the diagram with optional selection highlight, live node
+/// status overlay, and adaptive width fitting.
+pub(crate) fn block_diagram_with_options(
+    theme: &Theme,
+    states: &[FactoryState],
+    transitions: &[FactoryTransition],
+    options: &DiagramRenderOptions<'_>,
+) -> BlockDiagram {
+    let presets: &[(usize, usize, usize)] = match options.max_width {
+        Some(_) => &[(TEXT_MAX, GAP, MARGIN), (20, 2, 1), (16, 1, 1), (13, 1, 0)],
+        None => &[(TEXT_MAX, GAP, MARGIN)],
+    };
+    let mut best: Option<BlockDiagram> = None;
+    for &(text_max, gap, margin) in presets {
+        let diagram =
+            render_diagram_pass(theme, states, transitions, options, text_max, gap, margin);
+        let max_line = diagram
+            .lines
+            .iter()
+            .map(|row| crate::width::line_width(row))
+            .max()
+            .unwrap_or(0);
+        if options.max_width.is_none_or(|limit| max_line <= limit) {
+            return diagram;
+        }
+        best = Some(diagram);
+    }
+    best.unwrap_or_else(|| BlockDiagram {
+        lines: Vec::new(),
+        node_spans: Vec::new(),
+        #[cfg(test)]
+        node_rows: Vec::new(),
+    })
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "one layout pass: edges, layers, order, positions, rows, then the drawing; split, each step would only pass the same tables along"
+)]
+fn render_diagram_pass(
+    theme: &Theme,
+    states: &[FactoryState],
+    transitions: &[FactoryTransition],
+    options: &DiagramRenderOptions<'_>,
+    text_max: usize,
+    gap: usize,
+    margin: usize,
+) -> BlockDiagram {
     let n = states.len();
     if n == 0 {
         return BlockDiagram {
             lines: Vec::new(),
+            node_spans: Vec::new(),
             #[cfg(test)]
             node_rows: Vec::new(),
         };
@@ -290,6 +379,7 @@ pub(crate) fn block_diagram(
                 transitions.len()
             ),
         )]],
+        node_spans: Vec::new(),
         #[cfg(test)]
         node_rows: Vec::new(),
     };
@@ -353,11 +443,30 @@ pub(crate) fn block_diagram(
     // Box text and widths; dummies are one column.
     let titles: Vec<String> = states
         .iter()
-        .map(|state| clip(&state.id, TEXT_MAX))
+        .map(|state| {
+            let raw = match options.live_nodes.and_then(|nodes| nodes.get(&state.id)) {
+                Some(node) => {
+                    let glyph = if node.is_active() {
+                        "●"
+                    } else {
+                        node_glyph(&node.status).0
+                    };
+                    let occ = node.occupancy_label();
+                    if occ.is_empty() {
+                        format!("{glyph} {}", state.id)
+                    } else {
+                        format!("{glyph} {} ({occ})", state.id)
+                    }
+                }
+                None if options.live_nodes.is_some() => format!("○ {}", state.id),
+                None => state.id.clone(),
+            };
+            clip(&raw, text_max)
+        })
         .collect();
     let details: Vec<String> = states
         .iter()
-        .map(|state| clip(&detail(state), TEXT_MAX))
+        .map(|state| clip_detail(&detail(state), text_max))
         .collect();
     let width: Vec<usize> = (0..items)
         .map(|item| {
@@ -407,31 +516,82 @@ pub(crate) fn block_diagram(
         })
         .collect();
     let row_width = |row: &Vec<usize>| -> usize {
-        row.iter().map(|&item| occupied[item]).sum::<usize>() + GAP * row.len().saturating_sub(1)
+        row.iter().map(|&item| occupied[item]).sum::<usize>() + gap * row.len().saturating_sub(1)
     };
     let widest = layers.iter().map(row_width).max().unwrap_or(0);
     let mut x = vec![0usize; items];
     for row in &layers {
-        let mut at = MARGIN + (widest - row_width(row)) / 2;
+        let mut at = margin + (widest - row_width(row)) / 2;
         for &item in row {
             x[item] = at;
-            at += occupied[item] + GAP;
+            at += occupied[item] + gap;
         }
     }
     let center = |item: usize| x[item] + width[item] / 2;
 
     // Back edges take gutter columns, the shortest span innermost.
     backs.sort_by_key(|back| layer[back.from] - layer[back.to]);
+    // Each back edge costs at least a departure row, an arrival row, and
+    // two gutter columns, so 4 * backs^2 cells is a floor. Reject before
+    // the label pass when that floor alone exceeds the canvas bound.
+    if 4usize
+        .saturating_mul(backs.len())
+        .saturating_mul(backs.len())
+        > MAX_DIAGRAM_CELLS
+    {
+        return too_large();
+    }
+    // A back-edge label shares its departure row with the band's forward
+    // wires and with the vertical drops of later back edges; a crossing
+    // cell would replace a label character. Start each label past the last
+    // wire it would cross, and put the gutter beyond the shifted label.
+    let crossing_columns = |band: usize| -> Vec<usize> {
+        #[cfg(test)]
+        tests::count_label_scan();
+        let mut columns: Vec<usize> = layers[band - 1]
+            .iter()
+            .filter(|&&item| !outgoing[item].is_empty())
+            .map(|&item| center(item))
+            .collect();
+        columns.extend(
+            backs
+                .iter()
+                .filter(|back| layer[back.from] + 1 == band)
+                .map(|back| center(back.from)),
+        );
+        columns
+    };
+    let label_starts: Vec<Option<usize>> = backs
+        .iter()
+        .map(|back| {
+            back.label.as_ref().map(|label| {
+                let text_width = label.chars().count() + 2;
+                let mut start = center(back.from) + 2;
+                loop {
+                    let crossing = crossing_columns(layer[back.from] + 1)
+                        .into_iter()
+                        .filter(|column| *column >= start && *column < start + text_width)
+                        .max();
+                    match crossing {
+                        Some(column) => start = column + 1,
+                        None => break,
+                    }
+                }
+                start
+            })
+        })
+        .collect();
     let gutter_start = backs
         .iter()
-        .filter_map(|back| {
-            back.label
-                .as_ref()
-                .map(|label| center(back.from) + 4 + label.chars().count())
+        .zip(&label_starts)
+        .filter_map(|(back, start)| {
+            start.map(|start| {
+                start + back.label.as_ref().map_or(0, |label| label.chars().count()) + 2
+            })
         })
         .max()
         .unwrap_or(0)
-        .max(MARGIN + widest + 2);
+        .max(margin + widest + 2);
     let gutter = |k: usize| gutter_start + 2 * k;
 
     // Rows: band b sits above layer b (band `depth` below the last).
@@ -519,7 +679,7 @@ pub(crate) fn block_diagram(
         .filter_map(|(_, _, label)| label.as_ref().map(|label| label.chars().count()))
         .max()
         .unwrap_or(0);
-    let canvas_width = (MARGIN + widest + label_room + 4).max(if backs.is_empty() {
+    let canvas_width = (margin + widest + label_room + 4).max(if backs.is_empty() {
         0
     } else {
         gutter(backs.len() - 1) + 2
@@ -530,6 +690,7 @@ pub(crate) fn block_diagram(
     let mut canvas = Canvas(vec![vec![Cell::Empty; canvas_width]; height]);
 
     // Boxes and dummy columns.
+    let mut node_spans: Vec<(String, usize, usize)> = Vec::with_capacity(n);
     for (b, row) in layers.iter().enumerate() {
         let top = layer_top[b];
         for &item in row {
@@ -542,19 +703,41 @@ pub(crate) fn block_diagram(
                 canvas.vertical(center(item), top, top + rows - 1);
                 continue;
             }
+            node_spans.push((states[item].id.clone(), top, top + BOX_ROWS));
+            let is_selected = options.selected_state == Some(states[item].id.as_str());
+            let (border_role, title_role, detail_role) = if is_selected {
+                (
+                    Role::SelectedBorder,
+                    Role::SelectedTitle,
+                    Role::SelectedDetail,
+                )
+            } else if let Some(live_nodes) = options.live_nodes {
+                let color = match live_nodes.get(&states[item].id) {
+                    Some(node) if node.is_active() => ThemeColor::Accent,
+                    Some(node) => node_glyph(&node.status).1,
+                    None => ThemeColor::Dim,
+                };
+                (
+                    Role::StatusBorder(color),
+                    Role::StatusTitle(color),
+                    Role::Detail,
+                )
+            } else {
+                (Role::Border, Role::Title, Role::Detail)
+            };
             let inner = width[item] - 2;
             let stroke: String = std::iter::repeat_n('─', inner).collect();
-            canvas.put(x[item], top, &format!("┌{stroke}┐"), Role::Border);
-            canvas.put(x[item], top + 3, &format!("└{stroke}┘"), Role::Border);
+            canvas.put(x[item], top, &format!("┌{stroke}┐"), border_role);
+            canvas.put(x[item], top + 3, &format!("└{stroke}┘"), border_role);
             for (offset, (text, text_role)) in
-                [(&titles[item], Role::Title), (&details[item], Role::Detail)]
+                [(&titles[item], title_role), (&details[item], detail_role)]
                     .into_iter()
                     .enumerate()
             {
                 let line_y = top + 1 + offset;
-                canvas.put(x[item], line_y, "│", Role::Border);
+                canvas.put(x[item], line_y, "│", border_role);
                 canvas.put(x[item] + 2, line_y, text, text_role);
-                canvas.put(x[item] + width[item] - 1, line_y, "│", Role::Border);
+                canvas.put(x[item] + width[item] - 1, line_y, "│", border_role);
             }
             if !self_loops[item].is_empty() {
                 canvas.put(
@@ -583,7 +766,12 @@ pub(crate) fn block_diagram(
             let mut line_start = start;
             if from < n {
                 let tee_row = (layer_top[item_layer[from]] + BOX_ROWS - 1).min(start);
-                canvas.put(center(from), tee_row, "┬", Role::Border);
+                let tee_role = if options.selected_state == Some(states[from].id.as_str()) {
+                    Role::SelectedBorder
+                } else {
+                    Role::Border
+                };
+                canvas.put(center(from), tee_row, "┬", tee_role);
                 line_start = tee_row;
             }
             let end = if to < n {
@@ -675,7 +863,12 @@ pub(crate) fn block_diagram(
         };
         let column = gutter(k);
         let bottom = layer_top[layer[back.from]] + BOX_ROWS - 1;
-        canvas.put(center(back.from), bottom, "┬", Role::Border);
+        let tee_role = if options.selected_state == Some(states[back.from].id.as_str()) {
+            Role::SelectedBorder
+        } else {
+            Role::Border
+        };
+        canvas.put(center(back.from), bottom, "┬", tee_role);
         canvas.vertical(center(back.from), bottom, departure);
         canvas.horizontal(departure, center(back.from), column);
         canvas.vertical(column, arrival, departure);
@@ -684,7 +877,8 @@ pub(crate) fn block_diagram(
         canvas.vertical(center(back.to), arrival, arrow);
         canvas.put(center(back.to), arrow, "▼", Role::Arrow);
         if let Some(label) = &back.label {
-            canvas.label(center(back.from) + 2, departure, &format!(" {label} "));
+            let start = label_starts[k].unwrap_or_else(|| center(back.from) + 2);
+            canvas.label(start, departure, &format!(" {label} "));
         }
     }
 
@@ -696,34 +890,37 @@ pub(crate) fn block_diagram(
         .map(|row| {
             let mut line: Line = Vec::new();
             let mut run = String::new();
-            let mut run_color: Option<ThemeColor> = None;
+            let mut run_style: Option<(ThemeColor, bool)> = None;
             for cell in row {
-                let (ch, color) = match cell {
-                    Cell::Empty => (' ', ThemeColor::Text),
-                    Cell::Line(bits) => (line_char(bits), ThemeColor::Dim),
-                    Cell::Crossing => ('┊', ThemeColor::Dim),
-                    Cell::Char(ch, role) => (
-                        ch,
-                        match role {
-                            Role::Border | Role::Detail => ThemeColor::Muted,
-                            Role::Title => ThemeColor::ToolTitle,
-                            Role::Arrow => ThemeColor::Text,
-                            Role::Label => ThemeColor::Warning,
-                        },
-                    ),
+                let (ch, color, bold) = match cell {
+                    Cell::Empty => (' ', ThemeColor::Text, false),
+                    Cell::Line(bits) => (line_char(bits), ThemeColor::Dim, false),
+                    Cell::Crossing => ('┊', ThemeColor::Dim, false),
+                    Cell::Char(ch, role) => match role {
+                        Role::Border | Role::Detail => (ch, ThemeColor::Muted, false),
+                        Role::Title => (ch, ThemeColor::ToolTitle, false),
+                        Role::SelectedBorder | Role::SelectedDetail => {
+                            (ch, ThemeColor::Accent, false)
+                        }
+                        Role::SelectedTitle => (ch, ThemeColor::Accent, true),
+                        Role::StatusBorder(color) | Role::StatusTitle(color) => (ch, color, false),
+                        Role::Arrow => (ch, ThemeColor::Text, false),
+                        Role::Label => (ch, ThemeColor::Warning, false),
+                    },
                 };
-                if run_color != Some(color) && !run.is_empty() {
-                    line.push(theme.fg_span(
-                        run_color.unwrap_or(ThemeColor::Text),
-                        std::mem::take(&mut run),
-                    ));
+                if run_style != Some((color, bold)) && !run.is_empty() {
+                    let (rc, rb) = run_style.unwrap_or((ThemeColor::Text, false));
+                    let span = theme.fg_span(rc, std::mem::take(&mut run));
+                    line.push(if rb { theme.bold(span) } else { span });
                 }
-                run_color = Some(color);
+                run_style = Some((color, bold));
                 run.push(ch);
             }
             let trimmed = run.trim_end().to_string();
             if !trimmed.is_empty() {
-                line.push(theme.fg_span(run_color.unwrap_or(ThemeColor::Text), trimmed));
+                let (rc, rb) = run_style.unwrap_or((ThemeColor::Text, false));
+                let span = theme.fg_span(rc, trimmed);
+                line.push(if rb { theme.bold(span) } else { span });
             }
             if line.is_empty() {
                 line.push(Span::raw(""));
@@ -733,6 +930,7 @@ pub(crate) fn block_diagram(
         .collect();
     BlockDiagram {
         lines,
+        node_spans,
         #[cfg(test)]
         node_rows,
     }

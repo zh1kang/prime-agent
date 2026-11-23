@@ -381,3 +381,35 @@ fn a_round_trip_returns_to_the_origin_when_its_row_lands_late() {
         SessionSelection::Attach("s2-live".to_string())
     );
 }
+
+/// Global Esc with an empty search returns to the chat the view was opened from instead of
+/// exiting `pa`; with no anchor to return to it still leaves the view.
+#[test]
+fn global_escape_returns_to_the_anchor_chat() {
+    let mut mode = mode_with_anchor(
+        Some("s2"),
+        vec![
+            roster_entry("s1", "idle", &parent_summary("s1")),
+            roster_entry("s2", "idle", &parent_summary("s2")),
+        ],
+    );
+    mode.handle_key("down");
+    mode.handle_key("escape");
+    let opened = mode
+        .opened
+        .as_ref()
+        .expect("escape reopened the anchor chat");
+    assert_eq!(
+        opened.selection,
+        SessionSelection::Attach("s2-live".to_string())
+    );
+    assert!(!mode.running);
+
+    let mut mode = mode_with_anchor(
+        None,
+        vec![roster_entry("s1", "idle", &parent_summary("s1"))],
+    );
+    mode.handle_key("escape");
+    assert!(mode.opened.is_none());
+    assert!(!mode.running);
+}

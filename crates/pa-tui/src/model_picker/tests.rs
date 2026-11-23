@@ -121,6 +121,7 @@ fn picker_options(catalog: Vec<Model>) -> ModelPickerOptions {
         scoped_models: Vec::new(),
         thinking_level: Some(ModelThinkingLevel::Medium),
         viewport_rows: 19,
+        header: None,
     }
 }
 
@@ -242,6 +243,22 @@ fn a_scope_the_catalog_cannot_resolve_still_scopes() {
 /// The frame matches the TS inline menu panel row for row (the f17 model-selector capture
 /// geometry): bordered search field, `›` rows with the effort cluster centered (squares at column
 /// 54, label at 62), trailing flush right, scroll indicator, price detail, key hint.
+/// A non-chat target names what the pick changes on a header row above the search field.
+#[test]
+fn header_renders_above_the_search_field() {
+    let mut options = picker_options(battery_catalog());
+    options.header = Some("model \u{203a} ship \u{b7} review-bugs".to_string());
+    let mut picker = ModelPicker::new(options);
+    let rows = frame_text(&mut picker);
+    assert_eq!(rows[0], " model \u{203a} ship \u{b7} review-bugs");
+    assert_eq!(rows[2], " >  Search models");
+
+    let mut options = picker_options(battery_catalog());
+    options.header = Some("  ".to_string());
+    let mut picker = ModelPicker::new(options);
+    assert_eq!(frame_text(&mut picker)[1], " >  Search models");
+}
+
 #[test]
 fn renders_the_ts_inline_panel_shape() {
     let mut picker = ModelPicker::new(picker_options(battery_catalog()));
@@ -292,9 +309,10 @@ fn renders_the_ts_inline_panel_shape() {
         )
     );
     assert_eq!(rows[11], "  (1/9)");
-    assert_eq!(rows[12], "");
+    assert_eq!(rows[12], " thinking: none");
+    assert_eq!(rows[13], "");
     assert_eq!(
-        rows[13],
+        rows[14],
         format!(
             " Input{}Cached input{}Output {}$ / 1M tokens",
             " ".repeat(34 - 5),
@@ -303,17 +321,17 @@ fn renders_the_ts_inline_panel_shape() {
         )
     );
     assert_eq!(
-        rows[14],
+        rows[15],
         format!(" $0{}$0{}$0", " ".repeat(32), " ".repeat(32))
     );
-    assert_eq!(rows[15], "");
+    assert_eq!(rows[16], "");
     assert_eq!(
-        rows[16],
+        rows[17],
         " \u{2191}/\u{2193} model \u{b7} \u{2190}/\u{2192} effort \u{b7} Enter select \u{b7} Esc close"
     );
 
-    assert_eq!(rows.len(), 18, "the frame ends on the blank: {rows:?}");
-    assert_eq!(rows[17], "");
+    assert_eq!(rows.len(), 19, "the frame ends on the blank: {rows:?}");
+    assert_eq!(rows[18], "");
 }
 
 #[test]
@@ -954,4 +972,25 @@ fn prime_rows_name_the_serving_class_without_moving_other_rows() {
     assert_eq!(filtered_ids(&picker), vec!["anthropic/claude-fable-5"]);
     picker.set_query("hosted");
     assert_eq!(filtered_ids(&picker), vec!["z-ai/glm-5.3"]);
+}
+
+/// The thinking bar names the selected model's level, `none` for a model without reasoning.
+#[test]
+fn the_thinking_bar_names_the_selected_models_level() {
+    let mut picker = ModelPicker::new(picker_options(battery_catalog()));
+    let rows = frame_text(&mut picker);
+    assert!(rows.iter().any(|row| row == " thinking: none"), "{rows:#?}");
+    picker.handle_key("down", &kb());
+    let rows = frame_text(&mut picker);
+    assert!(
+        rows.iter()
+            .any(|row| row.starts_with(" thinking: medium  [") && row.ends_with(" change]")),
+        "{rows:#?}"
+    );
+    picker.handle_key("right", &kb());
+    let rows = frame_text(&mut picker);
+    assert!(
+        rows.iter().any(|row| row.starts_with(" thinking: high")),
+        "{rows:#?}"
+    );
 }
