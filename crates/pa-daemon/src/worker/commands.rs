@@ -132,6 +132,7 @@ impl Worker {
                     .await
             }
             "append_custom_message" => self.handle_append_custom_message(payload),
+            "absorb_context" => self.handle_absorb_context(payload).await,
             "restore_next_turn" => self.handle_restore_next_turn(payload),
             "restore_actions" => self.handle_restore_actions(payload),
             "refine" => self.handle_refine(payload).await,

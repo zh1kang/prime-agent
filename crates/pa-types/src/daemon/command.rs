@@ -435,6 +435,23 @@ pub enum DaemonCommand {
         #[serde(flatten)]
         rest: JsonMap,
     },
+    /// Distill earlier chats (any local provider) into one `absorbed_context`
+    /// custom row appended to this session. Each source is
+    /// `{provider, path?, id?}`: `provider` is `prime`, `claude`, `codex`,
+    /// `cursor`, `antigravity`, `t3`, or `pa`; `path` names the transcript
+    /// file, `id` a T3 or pa thread.
+    AbsorbContext {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        sources: Vec<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        focus: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        budget_tokens: Option<u64>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
     ResumeQueue {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
@@ -1373,6 +1390,13 @@ mod tests {
     fn worker_register_roundtrip() {
         rt::<DaemonCommand>(
             r#"{"type":"worker_register","activeSessionId":"abc123def456","sessionId":"s-uuid","socketPath":"/tmp/w.sock","workerInstanceId":"inst-1","token":"tok","pid":4242}"#,
+        );
+    }
+
+    #[test]
+    fn absorb_context_roundtrip() {
+        rt::<DaemonCommand>(
+            r#"{"type":"absorb_context","activeSessionId":"s1","sources":[{"provider":"claude","path":"/tmp/a.jsonl"},{"provider":"t3","id":"t-1"}],"focus":"auth","budgetTokens":6000}"#,
         );
     }
 

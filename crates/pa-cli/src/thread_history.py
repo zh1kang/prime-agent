@@ -1,16 +1,16 @@
 """Read the local conversation indexes. No provider connection is required.
 
 `pa thread history [QUERY]` prints the list. pa's native history panel calls
-`pa thread history --json` for the rows and `pa thread history --open` (target JSON on
-stdin) to turn a row into a native session it can resume."""
+`pa thread history --json` for the rows (with `rawBytes` and the `cachedTokens` of an absorbed
+digest, for cost previews) and `pa thread history --open` (target JSON on stdin) for the path of
+a Prime session it can resume. Other providers' chats are absorbed (`pa thread absorb`)."""
 import datetime
+import hashlib
 import json
 import os
 from pathlib import Path
 import sqlite3
 import sys
-import tempfile
-import subprocess
 import uuid
 from collections import defaultdict
 import unicodedata
@@ -36,6 +36,7 @@ def add(source, thread, title, stamp, target):
             "claude": "Claude",
             "codex": "Codex",
             "antigravity": "Antigravity",
+            "cursor": "Cursor",
         }.get(source[3:], source)
     title = clean(title) or "Untitled thread"
     rows.append((stamp, group, title, f"{source} {thread} {date} {title}".casefold(), target))
@@ -136,6 +137,22 @@ def antigravity_history(root):
                 add("Antigravity", cid, title or preview or "Untitled thread", log.stat().st_mtime, ("antigravity", cid, str(log)))
 
 
+def cursor_history(root):
+    for log in root.glob("projects/*/agent-transcripts/*.jsonl"):
+        try:
+            cid = str(uuid.UUID(log.stem))
+            title = ""
+            with log.open("rb") as handle:
+                first = json.loads(handle.readline() or b"{}")
+            content = (first.get("message") or {}).get("content") or first.get("content") or ""
+            if isinstance(content, list):
+                content = " ".join(part.get("text", "") for part in content if isinstance(part, dict))
+            title = str(content).replace("<user_query>", "").replace("</user_query>", "")
+            add("Cursor", cid, title[:200] or "Untitled thread", log.stat().st_mtime, ("cursor", cid, str(log)))
+        except (OSError, ValueError, AttributeError) as err:
+            errors.append(f"cursor: {err}")
+
+
 for path, codex in [(home / ".t3/userdata/statev2.sqlite", False),
                     (Path(os.getenv("CODEX_HOME", home / ".codex")) / "state_5.sqlite", True)]:
     try:
@@ -146,6 +163,10 @@ try:
     antigravity_history(home / ".gemini/antigravity-cli")
 except (OSError, ValueError, sqlite3.Error) as err:
     errors.append(f"antigravity: {err}")
+try:
+    cursor_history(home / ".cursor")
+except OSError as err:
+    errors.append(f"cursor: {err}")
 prime = Path(os.getenv("PRIME_AGENT_CODING_AGENT_DIR", home / ".prime/agent"))
 roots = {prime, home / ".prime/harness", home / ".prime/agent"}
 for root in roots:
@@ -167,80 +188,57 @@ providers = sorted(groups, key=lambda name: (name != "T3/Flock", name))
 
 
 def native_session(provider, selector, location, title):
+    """Only Prime sessions resume natively; other chats are absorbed into the current one."""
     if provider == "prime":
-        path = Path(selector).resolve(strict=True)
-        return path
-    uuid.UUID(selector)
-    destination = Path(os.environ.get("PRIME_AGENT_SESSION_DIR", prime / "sessions"))
-    destination.mkdir(mode=0o700, parents=True, exist_ok=True)
-    sid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"prime-agent/import/{provider}/{selector}"))
-    path = destination / (sid + ".jsonl")
-    if path.is_file():
-        return path
-    if provider in ("codex", "claude", "antigravity"):
-        data = json.loads(subprocess.check_output([os.environ["PA_HISTORY_EXECUTABLE"], "thread",
-            "read-transcript", provider, location], text=True))
-        cwd, messages = data["cwd"], data["messages"]
-    elif provider == "pa":
-        data = json.loads((Path(location) / "threads" / (selector + ".json")).read_bytes())
-        cwd, messages = data["cwd"], data["messages"]
-    else:
-        dbpath = home / ".t3/userdata/statev2.sqlite"
-        modern = location == "orchestration_v2_projection_threads"
-        msgtable = "orchestration_v2_projection_messages" if modern else "projection_thread_messages"
-        column = "json_extract(payload_json,'$.text')" if modern else "text"
-        directory = "json_extract(t.payload_json,'$.worktreePath')" if modern else "t.worktree_path"
-        with sqlite3.connect(dbpath.as_uri() + "?mode=ro", uri=True) as db:
-            messages = list(db.execute(f"SELECT role,{column} FROM {msgtable} WHERE thread_id=? AND role IN ('user','assistant') ORDER BY created_at,rowid", (selector,)))
-            row = db.execute(f"SELECT coalesce({directory},p.workspace_root) FROM {location} t LEFT JOIN projection_projects p ON p.project_id=t.project_id WHERE t.thread_id=?", (selector,)).fetchone()
-            cwd = row[0] if row else None
-    if cwd and not Path(cwd).is_dir():
-        raise ValueError("Original worktree is unavailable: " + str(cwd))
-    now = datetime.datetime.now(datetime.timezone.utc)
-    stamp = now.isoformat()
-    millis = int(now.timestamp() * 1000)
-    previous = None
-    with tempfile.NamedTemporaryFile(mode="w", dir=destination, prefix=".import-", delete=False) as tmp:
-        try:
-            def write(record):
-                print(json.dumps(record, ensure_ascii=False), file=tmp)
-            write(dict(type="session", version=3, id=sid, timestamp=stamp, cwd=str(cwd or Path.cwd())))
-            for role, body in messages:
-                if role not in ("user", "assistant") or not isinstance(body, str) or not body.strip():
-                    continue
-                msg = dict(role=role, timestamp=millis, content=[dict(type="text", text=body)])
-                if role == "assistant":
-                    usage = dict(input=0, output=0, cacheRead=0, cacheWrite=0, totalTokens=0,
-                                 cost=dict(input=0, output=0, cacheRead=0, cacheWrite=0, total=0))
-                    msg.update(api="openai-responses", provider=provider, model="imported", usage=usage, stopReason="stop")
-                entry = str(uuid.uuid4())
-                write(dict(type="message", id=entry, parentId=previous, timestamp=stamp, message=msg))
-                previous = entry
-            if previous is None:
-                raise ValueError("No saved text messages to resume")
-            write(dict(type="session_info", id=str(uuid.uuid4()), parentId=previous, timestamp=stamp, name=title))
-            tmp.flush()
-            os.fsync(tmp.fileno())
-            try:
-                os.link(tmp.name, path)
-            except FileExistsError:
-                pass
-        finally:
-            os.unlink(tmp.name)
-    return path
+        return Path(selector).resolve(strict=True)
+    raise ValueError(f"{provider} chats are absorbed, not resumed: use /absorb or "
+                     f"`pa thread absorb {provider} {location if provider != 't3' else selector}`")
+
+
+def source_file(provider, selector, location):
+    """The transcript file `pa thread absorb` reads for a row, or None (T3 lives in SQLite)."""
+    if provider == "pa":
+        return Path(location) / "threads" / (selector + ".json")
+    if provider == "t3":
+        return None
+    return Path(selector if provider == "prime" else location).resolve()
+
+
+def cost(target):
+    """`rawBytes` on disk and `cachedTokens` of an unfocused digest that is still current."""
+    provider, selector, location = target
+    path = source_file(provider, selector, location)
+    if path is None or not path.is_file():
+        return 0, None
+    stat = path.stat()
+    key = hashlib.sha256(f"{provider}\0{path}".encode()).hexdigest()
+    pointer = prime / "absorbed" / "sources" / (key + ".json")
+    try:
+        record = json.loads(pointer.read_bytes())
+        if (int(record["mtimeNs"]) == stat.st_mtime_ns and record["sizeBytes"] == stat.st_size
+                and (prime / "absorbed" / record["key"] / "digest.json").is_file()):
+            return stat.st_size, record["tokens"]
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return stat.st_size, None
+
+
+def row_json(title, search, target):
+    raw, cached = cost(target)
+    return {"title": title, "search": search, "target": list(target), "rawBytes": raw, "cachedTokens": cached}
 
 
 if mode == "--open":
     request = json.load(sys.stdin)
     try:
         path = native_session(*request["target"], request.get("title") or "")
-    except (OSError, ValueError, KeyError, TypeError, sqlite3.Error, subprocess.CalledProcessError) as err:
+    except (OSError, ValueError, KeyError, TypeError) as err:
         sys.exit("Could not resume: " + clean(err))
     print(json.dumps({"path": str(path)}))
 elif mode == "--json":
     print(json.dumps({
         "groups": [
-            {"name": name, "rows": [{"title": t, "search": q, "target": list(target)} for t, q, target in groups[name]]}
+            {"name": name, "rows": [row_json(t, q, target) for t, q, target in groups[name]]}
             for name in providers
         ],
         "errors": [clean(error) for error in errors],

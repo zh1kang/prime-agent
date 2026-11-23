@@ -28,6 +28,7 @@ pub fn command_plane(command_type: &str) -> DaemonCommandPlane {
         | "restore_next_turn"
         | "restore_actions"
         | "append_custom_message"
+        | "absorb_context"
         | "resume_queue"
         | "abort"
         | "abort_and_send_queued"

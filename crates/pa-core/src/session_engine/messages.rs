@@ -62,6 +62,10 @@ pub const BASH_WAITING_PREVIEW_LABEL: &str = "Waiting on background commands";
 pub const TURN_HELD_NOTICE_CUSTOM_TYPE: &str = "turn_held_notice";
 /// The queue-strip label the turn-held notice's queued row carries.
 pub const TURN_HELD_PREVIEW_LABEL: &str = "Turn held";
+/// The displayed row `absorb_context` appends: distilled earlier chats the
+/// model reads as one user turn. It must stay out of `convert_to_llm`'s
+/// bookkeeping exclusions.
+pub const ABSORBED_CONTEXT_CUSTOM_TYPE: &str = "absorbed_context";
 
 /// Why an unsuccessful compaction ran.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

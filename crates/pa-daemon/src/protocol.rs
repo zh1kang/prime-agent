@@ -70,6 +70,7 @@ pub const KNOWN_COMMAND_TYPES: &[&str] = &[
     "restore_next_turn",
     "restore_actions",
     "append_custom_message",
+    "absorb_context",
     "resume_queue",
     "send_message",
     "agent_messages_status",
@@ -650,6 +651,9 @@ pub fn command_active_session_id(command: &DaemonCommand) -> Option<&str> {
         | DaemonCommand::AppendCustomMessage {
             active_session_id, ..
         }
+        | DaemonCommand::AbsorbContext {
+            active_session_id, ..
+        }
         | DaemonCommand::ResumeQueue {
             active_session_id, ..
         }
@@ -974,6 +978,7 @@ pub fn command_type_name(command: &DaemonCommand) -> &'static str {
         DaemonCommand::RestoreNextTurn { .. } => "restore_next_turn",
         DaemonCommand::RestoreActions { .. } => "restore_actions",
         DaemonCommand::AppendCustomMessage { .. } => "append_custom_message",
+        DaemonCommand::AbsorbContext { .. } => "absorb_context",
         DaemonCommand::ResumeQueue { .. } => "resume_queue",
         DaemonCommand::SendMessage { .. } => "send_message",
         DaemonCommand::AgentMessagesStatus { .. } => "agent_messages_status",

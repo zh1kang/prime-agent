@@ -37,6 +37,156 @@ impl Worker {
         response_success(None, "append_custom_message", None)
     }
 
+    /// `absorb_context { sources, focus?, budgetTokens? }`: distill earlier
+    /// chats (cached by content; one summarizer call on the auxiliary model
+    /// at most per uncached long chat, an offline card without a model) and
+    /// append ONE displayed `absorbed_context` row the model reads as a user
+    /// turn. Refused while a turn runs and for the session's own file.
+    pub(crate) async fn handle_absorb_context(&self, payload: &Value) -> DaemonResponse {
+        const COMMAND: &str = "absorb_context";
+        if let Err(response) = self.require_created(COMMAND) {
+            return response;
+        }
+        let fail = |message: &str| response_failure(None, COMMAND, message, None);
+        let Some(raw_sources) = payload
+            .get("sources")
+            .and_then(Value::as_array)
+            .filter(|sources| !sources.is_empty())
+        else {
+            return fail("absorb_context requires a non-empty sources array");
+        };
+        let mut sources = Vec::with_capacity(raw_sources.len());
+        for source in raw_sources {
+            let provider = source.get("provider").and_then(Value::as_str);
+            let location = source
+                .get("path")
+                .and_then(Value::as_str)
+                .or_else(|| source.get("id").and_then(Value::as_str));
+            let (Some(provider), Some(location)) = (provider, location) else {
+                return fail("absorb_context sources need a provider and a path or id");
+            };
+            sources.push(pa_core::absorb::SourceRef {
+                provider: provider.to_owned(),
+                location: location.to_owned(),
+            });
+        }
+        let (busy, session_file, session_id, cwd) = {
+            let core = self.core.lock().unwrap();
+            (
+                core.busy,
+                core.store.as_ref().map(|store| store.path.clone()),
+                core.store
+                    .as_ref()
+                    .map(|store| store.session_id().to_string())
+                    .unwrap_or_else(|| core.active_session_id.clone()),
+                std::path::PathBuf::from(&core.cwd),
+            )
+        };
+        if busy {
+            return fail("Wait for the current turn to finish before absorbing context.");
+        }
+        let agent_dir = self.config.agent_dir.clone();
+        if let Some(own) = session_file.as_deref().map(pa_core::absorb::canonical) {
+            for source in &sources {
+                let Ok(resolved) = pa_core::absorb::sources::resolve(source, &agent_dir) else {
+                    continue;
+                };
+                if pa_core::absorb::canonical(&resolved.path) == own {
+                    return fail("Cannot absorb the current chat into itself.");
+                }
+            }
+        }
+        let focus = payload
+            .get("focus")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let budget_tokens = payload
+            .get("budgetTokens")
+            .and_then(Value::as_u64)
+            .filter(|budget| *budget > 0)
+            .unwrap_or(pa_core::absorb::DEFAULT_BUDGET_TOKENS);
+        let engine = self.agent_engine.clone();
+        let handle = tokio::runtime::Handle::current();
+        let run = tokio::task::spawn_blocking(move || {
+            // The summarizer routes through `auxiliaryModel` (the session
+            // model when unset) and only runs when a digest needs it.
+            let mut summarizer = engine.and_then(|engine| {
+                let model = engine.session_model().ok()?;
+                let (model, api_key) = engine.resolve_request_target(model);
+                let context = pa_core::session_engine::auxiliary_model::AuxiliaryModelContext {
+                    cwd: cwd.clone(),
+                    agent_dir: agent_dir.clone(),
+                };
+                let target = pa_core::session_engine::auxiliary_model::resolve_auxiliary_model(
+                    &context,
+                    "absorb context",
+                    &model,
+                    api_key.as_deref(),
+                    None,
+                );
+                let label = format!("{}/{}", target.model.provider, target.model.id);
+                let window = target.model.context_window;
+                Some(pa_core::absorb::Summarizer::new(
+                    label,
+                    window,
+                    move |prompt| {
+                        handle.block_on(pa_core::absorb::distill::summary_call(
+                            &target,
+                            &session_id,
+                            prompt,
+                        ))
+                    },
+                ))
+            });
+            let request = pa_core::absorb::AbsorbRequest {
+                agent_dir: &agent_dir,
+                cwd: &cwd,
+                sources,
+                focus,
+                budget_tokens,
+                now_ms: crate::util::now_ms(),
+            };
+            pa_core::absorb::absorb(&request, summarizer.as_mut())
+        });
+        let outcome = match run.await {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(error)) => return fail(&format!("{error:#}")),
+            Err(error) => return fail(&format!("absorb task failed: {error}")),
+        };
+        let keys: Vec<&str> = outcome.sources.iter().map(|s| s.key.as_str()).collect();
+        let message = json!({
+            "customType": pa_core::session_engine::messages::ABSORBED_CONTEXT_CUSTOM_TYPE,
+            "content": outcome.content,
+            "display": true,
+            "details": {
+                "sources": outcome.sources,
+                "keys": keys,
+                "tokens": outcome.tokens,
+                "changedFiles": outcome.changed_files,
+                "method": outcome.method,
+                "compact": outcome.compact,
+            },
+        });
+        let Some(row) = custom_message_value(Some(&message)) else {
+            return fail("absorb_context built an invalid row");
+        };
+        self.emit_custom_row(&row);
+        response_success(
+            None,
+            COMMAND,
+            Some(json!({
+                "ok": true,
+                "sources": outcome.sources,
+                "tokens": outcome.tokens,
+                "method": outcome.method,
+                "changedFiles": outcome.changed_files,
+                "compact": outcome.compact,
+                "duplicates": outcome.duplicates,
+                "contentPreview": pa_core::absorb::sources::clip(&outcome.content, 600),
+            })),
+        )
+    }
+
     /// `restore_next_turn { messages }`: park the custom rows; the next delivered
     /// turn replays them as prefix rows, in order, before the accepted prompt.
     pub(crate) fn handle_restore_next_turn(&self, payload: &Value) -> DaemonResponse {
@@ -581,6 +731,105 @@ mod tests {
             let response = worker.dispatch("append_custom_message", &bad).await;
             assert!(!response.success, "must reject: {bad}");
         }
+    }
+
+    #[tokio::test]
+    async fn absorb_context_appends_one_user_facing_row() {
+        let worker = created_worker().await;
+        let dir = tempfile::tempdir().unwrap();
+        let chat = dir.path().join("chat.jsonl");
+        let rows = [
+            json!({"type":"user","uuid":"a","parentUuid":null,"sessionId":"c1","cwd":"/gone/app","message":{"role":"user","content":"fix the login bug"}}),
+            json!({"type":"assistant","uuid":"b","parentUuid":"a","sessionId":"c1","message":{"role":"assistant","content":[{"type":"tool_use","id":"e","name":"Edit","input":{"file_path":"/gone/app/src/login.rs"}},{"type":"text","text":"Fixed in login.rs"}]}}),
+        ];
+        let body: String = rows.iter().map(|row| format!("{row}\n")).collect();
+        std::fs::write(&chat, body).unwrap();
+        let request = json!({
+            "activeSessionId": "custom-session",
+            "sources": [{ "provider": "claude", "path": chat.display().to_string() }],
+        });
+
+        worker.core.lock().unwrap().busy = true;
+        let refused = worker.dispatch("absorb_context", &request).await;
+        assert_eq!(
+            refused.error.as_deref(),
+            Some("Wait for the current turn to finish before absorbing context.")
+        );
+        worker.core.lock().unwrap().busy = false;
+
+        let response = worker.dispatch("absorb_context", &request).await;
+        assert!(response.success, "failed: {response:?}");
+        let data = response.data.unwrap();
+        assert_eq!(data["ok"], true);
+        assert_eq!(data["method"], "verbatim");
+        assert_eq!(data["changedFiles"], json!(["src/login.rs"]));
+        let rows = custom_entries(&worker);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "absorbed_context");
+        let content = rows[0].1.as_str().unwrap();
+        assert!(content.starts_with("[absorbed-context]"));
+        assert!(content.contains("<modified-files>\nsrc/login.rs\n</modified-files>"));
+
+        let message: pa_types::session::AgentMessage = serde_json::from_value(json!({
+            "role": "custom",
+            "customType": rows[0].0,
+            "content": content,
+            "display": true,
+            "timestamp": 0,
+        }))
+        .unwrap();
+        let llm = pa_core::session_engine::messages::convert_to_llm(&[message]);
+        assert!(
+            matches!(llm.as_slice(), [pa_types::session::AgentMessage::User(_)]),
+            "the absorbed row reaches the model as a user turn: {llm:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn absorb_context_refuses_the_current_chat() {
+        let dir = std::env::temp_dir().join(format!("pa-worker-ab-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("sessions")).unwrap();
+        let config = crate::worker::WorkerConfig {
+            socket_path: dir.join("worker.sock"),
+            supervisor_socket_path: std::path::PathBuf::new(),
+            token: "token".to_string(),
+            worker_instance_id: String::new(),
+            active_session_id: "absorb-session".to_string(),
+            agent_dir: dir.join("agent"),
+            recovery_journal_path: dir.join("recovery.jsonl"),
+            telemetry_disabled: None,
+            script: Some(json!({ "responses": ["ack"] })),
+        };
+        let worker = Arc::new(Worker::new(config, None));
+        let created = worker
+            .dispatch(
+                "create",
+                &json!({ "cwd": "/tmp", "sessionDir": dir.join("sessions").display().to_string() }),
+            )
+            .await;
+        assert!(created.success, "create failed: {created:?}");
+        let own = worker
+            .core
+            .lock()
+            .unwrap()
+            .store
+            .as_ref()
+            .map(|store| store.path.clone())
+            .expect("a session file");
+        let response = worker
+            .dispatch(
+                "absorb_context",
+                &json!({
+                    "activeSessionId": "absorb-session",
+                    "sources": [{ "provider": "prime", "path": own.display().to_string() }],
+                }),
+            )
+            .await;
+        assert_eq!(
+            response.error.as_deref(),
+            Some("Cannot absorb the current chat into itself.")
+        );
+        assert!(custom_entries(&worker).is_empty());
     }
 
     /// The reserved custom kinds are daemon provenance: an appended row

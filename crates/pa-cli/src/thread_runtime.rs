@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
+use pa_ai::types::ModelThinkingLevel;
 use serde_json::Value;
 
 const MAX_RECORD: usize = 16 * 1024 * 1024;
@@ -242,13 +243,74 @@ pub(crate) fn antigravity_models() -> Result<Vec<(String, String, Vec<String>)>>
     )))
 }
 
+/// Resolve the Cursor CLI executable (`PA_CURSOR_BIN`, `cursor-agent`, `~/.local/bin/cursor-agent`,
+/// or `~/.local/bin/agent`).
+pub(crate) fn cursor_bin() -> Option<PathBuf> {
+    pa_ai::cursor_cli::cursor_bin()
+}
+
+/// `cursor-agent --list-models` as deduplicated `(base_id, label, efforts)` entries.
+pub(crate) fn cursor_models() -> Result<Vec<(String, String, Vec<String>)>> {
+    let bin = cursor_bin().context("Cursor CLI (cursor-agent) is not installed")?;
+    let output = Command::new(bin)
+        .arg("--list-models")
+        .stdin(Stdio::null())
+        .output()
+        .context("Could not query Cursor models")?;
+    ensure!(
+        output.status.success(),
+        "Cursor models failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(parse_cursor_models(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+fn parse_cursor_models(raw: &str) -> Vec<(String, String, Vec<String>)> {
+    let cleaned = strip_ansi(raw).replace('\u{200b}', "");
+    pa_ai::cursor_cli::parse_models_output(&cleaned)
+        .into_iter()
+        .map(|model| {
+            let efforts = model
+                .thinking_level_map
+                .iter()
+                .flatten()
+                .filter(|(_, wire)| wire.is_some())
+                .map(|(level, _)| level.wire_name().to_owned())
+                .collect();
+            (model.id, model.name, efforts)
+        })
+        .collect()
+}
+
+/// The `--model` ID cursor-agent expects for a thread's base model and thinking level.
+fn cursor_wire_model(model: &str, thinking: Option<&str>) -> String {
+    let level = match provider_effort("antigravity", thinking) {
+        Some("low") => Some(ModelThinkingLevel::Low),
+        Some("medium") => Some(ModelThinkingLevel::Medium),
+        Some("high") => Some(ModelThinkingLevel::High),
+        Some("xhigh") => Some(ModelThinkingLevel::Xhigh),
+        Some("max") => Some(ModelThinkingLevel::Max),
+        _ => None,
+    };
+    pa_ai::cursor_cli::refresh_models(false)
+        .iter()
+        .find(|known| known.id == model)
+        .map_or_else(
+            || model.to_owned(),
+            |known| pa_ai::cursor_cli::wire_model_for_level(known, level),
+        )
+}
+
 pub(crate) fn connections() -> String {
-    ["prime", "claude", "codex", "antigravity"]
+    ["prime", "claude", "codex", "antigravity", "cursor"]
         .iter()
         .map(|&name| {
             let available = match name {
                 "prime" => true,
                 "antigravity" => antigravity_bin().is_some(),
+                "cursor" => cursor_bin().is_some(),
                 other => command_available(Path::new(other)),
             };
             format!(
@@ -317,9 +379,15 @@ fn records(input: impl Read, mut visit: impl FnMut(Value) -> Result<()>) -> Resu
 }
 
 fn strip_user_request_tags(content: &str) -> &str {
-    if let Some(start) = content.find("<USER_REQUEST>") {
-        let after = &content[start + "<USER_REQUEST>".len()..];
-        if let Some(end) = after.find("</USER_REQUEST>") {
+    strip_tags(content, "USER_REQUEST")
+}
+
+/// The text inside the first `<tag>...</tag>`, or all of `content` when it has none.
+fn strip_tags<'a>(content: &'a str, tag: &str) -> &'a str {
+    let (open, close) = (format!("<{tag}>"), format!("</{tag}>"));
+    if let Some(start) = content.find(&open) {
+        let after = &content[start + open.len()..];
+        if let Some(end) = after.find(&close) {
             return after[..end].trim();
         }
     }
@@ -337,13 +405,6 @@ fn antigravity_id_from_path(path: &Path) -> Option<String> {
     None
 }
 
-/// The live process that hosts `session` (a pa chat's daemon), or None when no runtime holds it.
-fn session_holder(session: &Path) -> Option<u32> {
-    let home = std::env::var_os("PA_CAPTAIN_NATIVE_HOME")
-        .map_or_else(crate::config::get_agent_dir, PathBuf::from);
-    pa_daemon::lease::live_lease_owner(&home, session).map(|owner| owner.pid)
-}
-
 /// The session directory of the native home a Prime thread turn runs in.
 fn prime_session_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("PRIME_AGENT_SESSION_DIR") {
@@ -352,6 +413,49 @@ fn prime_session_dir() -> PathBuf {
     std::env::var_os("PA_CAPTAIN_NATIVE_HOME")
         .map_or_else(crate::config::get_agent_dir, PathBuf::from)
         .join("sessions")
+}
+
+/// The session file a Prime turn runs in: the thread's file, the file of a bare session ID, or
+/// a new file when the thread has no session yet. None when a session ID has no file here.
+fn prime_session_file(native_id: Option<&str>, cwd: &Path) -> Result<Option<PathBuf>> {
+    let Some(id) = native_id else {
+        return new_prime_session(cwd).map(Some);
+    };
+    let path = Path::new(id);
+    if path.is_absolute() {
+        return Ok(path.is_file().then(|| path.to_path_buf()));
+    }
+    let Ok(id) = uuid::Uuid::parse_str(id) else {
+        return Ok(None);
+    };
+    let id = id.to_string();
+    let found = walk_jsonl(&prime_session_dir())
+        .into_iter()
+        .filter(|file| file.to_string_lossy().contains(&id))
+        .find(|file| {
+            std::fs::File::open(file)
+                .ok()
+                .and_then(|f| BufReader::new(f).lines().next()?.ok())
+                .and_then(|line| serde_json::from_str::<Value>(&line).ok())
+                .is_some_and(|header| header["type"] == "session" && header["id"] == id)
+        });
+    Ok(found)
+}
+
+fn walk_jsonl(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(walk_jsonl(&path));
+        } else if path.extension().is_some_and(|ext| ext == "jsonl") {
+            out.push(path);
+        }
+    }
+    out
 }
 
 /// Create an empty native session for a new Prime thread, so the thread has one session file
@@ -404,16 +508,64 @@ fn prime_reply_after(session: &Path, offset: u64, prompt: &str) -> Result<Option
     Ok(reply)
 }
 
-/// Run one Prime turn through the shared daemon (`--mode acp`). The daemon hosts one runtime per
-/// session file, so a pa chat open on the same session shows this turn live, and a prompt sent
-/// from either side queues behind the running turn instead of starting a second one.
+/// Set by SIGTERM or SIGINT while a daemon turn runs: a Captain stop signals the job's process
+/// group, and the turn must end in the daemon too, not only in this client.
+static TURN_STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Watch SIGTERM and SIGINT for the rest of this process, which runs one turn.
+fn install_turn_stop_handler() -> Result<()> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()?;
+    let (mut term, mut int) = runtime.block_on(async {
+        Ok::<_, std::io::Error>((
+            signal(SignalKind::terminate())?,
+            signal(SignalKind::interrupt())?,
+        ))
+    })?;
+    std::thread::spawn(move || {
+        runtime.block_on(async {
+            tokio::select! {
+                _ = term.recv() => {}
+                _ = int.recv() => {}
+            }
+        });
+        TURN_STOP.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    Ok(())
+}
+
+/// A daemon turn that ended without a reply: the daemon answered, so no turn still runs and
+/// the thread may take its next message.
+#[derive(Debug)]
+pub(crate) struct TurnSettled(pub String);
+
+impl std::fmt::Display for TurnSettled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TurnSettled {}
+
+/// Run one Prime turn as a session of the shared daemon (`--mode acp`). The daemon hosts one
+/// runtime per session file and this client never holds the file's lease, so a pa chat can open
+/// the session while the turn runs and shows it live, and a prompt sent from either side queues
+/// behind the running turn instead of starting a second one. A stop signal sends
+/// `session/cancel`, which aborts the turn and its subagents in the daemon.
 fn prime_daemon_turn(
     mut cmd: Command,
     cwd: &Path,
     session: &Path,
     prompt: &str,
+    images: &[PathBuf],
     hidden_context: Option<&str>,
 ) -> Result<String> {
+    use std::os::unix::process::CommandExt;
+    use std::sync::atomic::Ordering;
+    use std::sync::mpsc;
+    use std::time::Duration;
     // The faux seam reads a script file in daemon mode; a test may pass the script inline.
     let faux = match std::env::var("PRIME_AGENT_FAUX_SCRIPT") {
         Ok(script) if !Path::new(&script).is_file() => {
@@ -427,21 +579,50 @@ fn prime_daemon_turn(
     let offset = std::fs::metadata(session)
         .with_context(|| format!("Missing native session {}", session.display()))?
         .len();
+    install_turn_stop_handler()?;
+    // Its own process group: a stop signals this process's group, and the client must stay
+    // alive long enough to cancel the turn in the daemon.
     let mut child = cmd
         .current_dir(cwd)
+        .process_group(0)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
         .context("Could not start prime")?;
     let mut stdin = child.stdin.take().context("Missing prime input")?;
-    let mut lines = BufReader::new(child.stdout.take().context("Missing prime output")?).lines();
+    let stdout = child.stdout.take().context("Missing prime output")?;
+    let (lines_tx, lines) = mpsc::channel::<String>();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if lines_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut session_id: Option<String> = None;
+    let mut cancel_sent = false;
     let mut call = |id: u64, method: &str, params: Value| -> Result<Value> {
         let frame =
             serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         writeln!(stdin, "{frame}")?;
         stdin.flush()?;
         loop {
-            let line = lines.next().context("Prime stopped before it answered")??;
+            if TURN_STOP.load(Ordering::SeqCst) && !cancel_sent {
+                let Some(session_id) = &session_id else {
+                    bail!("Turn stopped");
+                };
+                let cancel = serde_json::json!({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": session_id}});
+                writeln!(stdin, "{cancel}")?;
+                stdin.flush()?;
+                cancel_sent = true;
+            }
+            let line = match lines.recv_timeout(Duration::from_millis(100)) {
+                Ok(line) => line,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    bail!("Prime stopped before it answered")
+                }
+            };
             let Ok(message) = serde_json::from_str::<Value>(&line) else {
                 continue;
             };
@@ -453,7 +634,10 @@ fn prime_daemon_turn(
                     .as_str()
                     .or_else(|| error["message"].as_str())
                     .unwrap_or("Prime turn failed");
-                bail!("{detail}");
+                return Err(TurnSettled(detail.to_owned()).into());
+            }
+            if method == "session/new" {
+                session_id = message["result"]["sessionId"].as_str().map(str::to_owned);
             }
             return Ok(message["result"].clone());
         }
@@ -473,34 +657,105 @@ fn prime_daemon_turn(
             .as_str()
             .context("Prime did not return a session")?
             .to_owned();
-        let mut request = serde_json::json!({"sessionId": session_id, "prompt": [{"type": "text", "text": prompt}]});
+        let mut blocks = vec![serde_json::json!({"type": "text", "text": prompt})];
+        blocks.extend(image_blocks(images)?);
+        let mut request = serde_json::json!({"sessionId": session_id, "prompt": blocks});
         if let Some(context) = hidden_context {
-            // The open chat's system prompt belongs to the chat, so the context rides the
+            // The session's system prompt belongs to the chat, so the context rides the
             // prompt as a hidden row the daemon writes before it.
             request["_meta"] =
                 serde_json::json!({"ai.primeintellect.prime-agent": {"hiddenContext": context}});
         }
         let done = call(3, "session/prompt", request)?;
-        ensure!(
-            done["stopReason"] == "end_turn",
-            "Prime turn ended with {}",
-            done["stopReason"]
-        );
+        if done["stopReason"] == "cancelled" {
+            return Err(TurnSettled("Turn stopped".into()).into());
+        }
+        if done["stopReason"] != "end_turn" {
+            return Err(
+                TurnSettled(format!("Prime turn ended with {}", done["stopReason"])).into(),
+            );
+        }
         Ok(())
     })();
+    drop(call);
     // ACP mode exits when its input closes.
     drop(stdin);
-    drop(lines);
-    if outcome.is_err() {
+    if outcome.is_err() && !cancel_sent {
         let _ = child.kill();
     }
+    // A cancelled client exits once its teardown has ended the turn in the daemon, which can
+    // wait out a tool cell; a client that never exits is killed.
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    while matches!(child.try_wait(), Ok(None)) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
     let _ = child.wait();
+    drop(lines);
+    let _ = reader.join();
     if let Some(file) = faux {
         let _ = std::fs::remove_file(file);
     }
     outcome?;
     prime_reply_after(session, offset, prompt)?
-        .context("Provider did not return an assistant reply")
+        .ok_or_else(|| TurnSettled("Provider did not return an assistant reply".into()).into())
+}
+
+/// Newline-separated image files attached to a Captain message, set by the job that runs
+/// the turn; nested turns never inherit it.
+const CAPTAIN_IMAGES_ENV: &str = "PA_CAPTAIN_IMAGES";
+/// The most images one turn reads, so a turn's context stays bounded.
+const MAX_TURN_IMAGES: usize = 4;
+
+fn captain_images() -> Vec<PathBuf> {
+    std::env::var(CAPTAIN_IMAGES_ENV)
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .take(MAX_TURN_IMAGES)
+        .collect()
+}
+
+fn list_image_paths(prompt: &str, images: &[PathBuf]) -> String {
+    if images.is_empty() {
+        return prompt.to_owned();
+    }
+    let paths: Vec<String> = images
+        .iter()
+        .map(|path| format!("- {}", path.display()))
+        .collect();
+    format!("{prompt}\n\nAttached images:\n{}", paths.join("\n"))
+}
+
+/// ACP image blocks (`{type, data, mimeType}`) for the attached files.
+fn image_blocks(images: &[PathBuf]) -> Result<Vec<Value>> {
+    use base64::Engine as _;
+    images
+        .iter()
+        .map(|path| {
+            let ext = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let mime = match ext.as_str() {
+                "jpg" | "jpeg" => "image/jpeg",
+                "gif" => "image/gif",
+                "webp" => "image/webp",
+                _ => "image/png",
+            };
+            let bytes = std::fs::read(path)
+                .with_context(|| format!("Could not read image {}", path.display()))?;
+            Ok(serde_json::json!({
+                "type": "image",
+                "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+                "mimeType": mime,
+            }))
+        })
+        .collect()
 }
 
 /// One turn's input: the text the transcript shows as the user message, and context the
@@ -529,11 +784,20 @@ pub(crate) fn turn(
             inline.as_str()
         }
     };
+    // A daemon-hosted Prime turn reads the images as prompt blocks; every other turn reads
+    // their paths after the text.
+    let images = captain_images();
+    let listed = list_image_paths(prompt, &images);
+    let daemon_prompt = prompt;
+    let prompt = listed.as_str();
     let mut cmd = match provider {
         "prime" => Command::new(std::env::current_exe()?),
         "codex" | "claude" => Command::new(provider),
         "antigravity" => {
             Command::new(antigravity_bin().context("Antigravity CLI (agy) is not installed")?)
+        }
+        "cursor" => {
+            Command::new(cursor_bin().context("Cursor CLI (cursor-agent) is not installed")?)
         }
         _ => bail!("Unknown provider {provider}"),
     };
@@ -572,49 +836,54 @@ pub(crate) fn turn(
         });
     cmd.env_remove("PA_THREAD_MODEL");
     cmd.env_remove("PA_THREAD_THINKING");
+    cmd.env_remove(CAPTAIN_IMAGES_ENV);
     let instructions="When the user asks to spin up a subthread, use prime_threads spawn_subthread immediately. Pass a task when work is assigned. Use read_subthread to inspect the result.";
-    let uses_stdin = provider != "antigravity";
+    let uses_stdin = !matches!(provider, "antigravity" | "cursor");
     match provider {
         "prime" => {
             // A Captain thread's durable manifest and native model credentials have distinct homes.
             if let Some(native_home) = std::env::var_os("PA_CAPTAIN_NATIVE_HOME") {
                 cmd.env("PRIME_AGENT_CODING_AGENT_DIR", native_home);
-                if let Some(socket) = std::env::var_os("PA_CAPTAIN_NATIVE_SOCKET") {
-                    cmd.env("PRIME_AGENT_DAEMON_SOCKET", socket);
-                }
+                // The Captain hub's own socket never hosts a native session: with no native
+                // socket named, the turn uses pa's default socket.
+                match std::env::var_os("PA_CAPTAIN_NATIVE_SOCKET") {
+                    Some(socket) => cmd.env("PRIME_AGENT_DAEMON_SOCKET", socket),
+                    None => cmd.env_remove("PRIME_AGENT_DAEMON_SOCKET"),
+                };
             }
             let prefix = serde_json::json!([executable, "thread", "tool-call", parent.to_string()]);
             let hint=format!("If asked to spin up a subthread, call the installed thread tool from python_repl. Use subprocess.run({prefix} + ['spawn_subthread', json.dumps(arguments)], env={{**os.environ, 'PRIME_AGENT_CODING_AGENT_DIR': {}}}, check=True, capture_output=True,text=True). Import os, json, subprocess first. arguments is a dict with optional provider and task. Read a child with read_subthread and its id.",serde_json::to_string(&config_dir)?);
-            if let Some(id) = native_id.filter(|id| Path::new(id).is_absolute()) {
-                if session_holder(Path::new(id)).is_some() {
-                    // An open pa chat hosts this session. Send the turn through its daemon so
-                    // the chat shows it live and the two sides never run turns at once.
-                    let mut daemon = Command::new(&executable);
-                    for (key, value) in cmd.get_envs() {
-                        match value {
-                            Some(value) => daemon.env(key, value),
-                            None => daemon.env_remove(key),
-                        };
-                    }
-                    daemon
-                        .args(["--mode", "acp", "--append-system-prompt", &hint, "--cwd"])
-                        .arg(cwd);
-                    if let Some(model) = &model {
-                        daemon.arg("--model").arg(model);
-                    }
-                    if let Some(level) = &thinking {
-                        daemon.arg("--thinking").arg(level);
-                    }
-                    daemon.arg("--resume").arg(id);
-                    let reply = prime_daemon_turn(
-                        daemon,
-                        cwd,
-                        Path::new(id),
-                        prompt,
-                        input.hidden_context,
-                    )?;
-                    return Ok((id.to_owned(), reply));
+            if let Some(session) = prime_session_file(native_id, cwd)? {
+                // The daemon hosts the session, never this process: pa can open the chat while
+                // the turn runs, and the two sides never run turns at once.
+                let id = session.to_string_lossy().into_owned();
+                let id = id.as_str();
+                let mut daemon = Command::new(&executable);
+                for (key, value) in cmd.get_envs() {
+                    match value {
+                        Some(value) => daemon.env(key, value),
+                        None => daemon.env_remove(key),
+                    };
                 }
+                daemon
+                    .args(["--mode", "acp", "--append-system-prompt", &hint, "--cwd"])
+                    .arg(cwd);
+                if let Some(model) = &model {
+                    daemon.arg("--model").arg(model);
+                }
+                if let Some(level) = &thinking {
+                    daemon.arg("--thinking").arg(level);
+                }
+                daemon.arg("--resume").arg(id);
+                let reply = prime_daemon_turn(
+                    daemon,
+                    cwd,
+                    Path::new(id),
+                    daemon_prompt,
+                    &images,
+                    input.hidden_context,
+                )?;
+                return Ok((id.to_owned(), reply));
             }
             // The faux seam takes an inline script in print mode; a daemon test passes a file.
             if let Ok(script) = std::env::var("PRIME_AGENT_FAUX_SCRIPT") {
@@ -728,6 +997,35 @@ pub(crate) fn turn(
             };
             cmd.arg(format!("-p={full_prompt}"));
         }
+        "cursor" => {
+            // `--force` and `--trust` let print mode run tools and the workspace unattended.
+            cmd.args([
+                "--print",
+                "--output-format",
+                "json",
+                "--force",
+                "--trust",
+                "--workspace",
+            ])
+            .arg(cwd);
+            if let Some(model) = &model {
+                cmd.arg("--model")
+                    .arg(cursor_wire_model(model, thinking.as_deref()));
+            }
+            if let Some(id) = native_id {
+                cmd.arg("--resume").arg(id);
+            }
+            let full_prompt = if native_id.is_none() {
+                format!(
+                    "[Thread tool note: if asked to spin up a subthread, run `{exe} thread tool-call {parent} spawn_subthread '<json>'` with `PRIME_AGENT_CODING_AGENT_DIR={dir}`; read a child with `read_subthread`.]\n\n{prompt}",
+                    exe = executable.display(),
+                    dir = config_dir.display(),
+                )
+            } else {
+                prompt.to_owned()
+            };
+            cmd.arg("--").arg(full_prompt);
+        }
         _ => unreachable!(),
     }
     let mut child = cmd
@@ -773,6 +1071,25 @@ pub(crate) fn turn(
                     if let Some((_, body)) = text(&event["message"]) {
                         result = Some(body);
                     }
+                }
+                ("cursor", _) => {
+                    let Some(body) = event["result"].as_str() else {
+                        return Ok(());
+                    };
+                    ensure!(
+                        event["is_error"] != true
+                            && event["subtype"].as_str().is_none_or(|s| s == "success"),
+                        "{}",
+                        Some(body)
+                            .filter(|s| !s.trim().is_empty())
+                            .unwrap_or("Cursor returned a failed turn")
+                    );
+                    id = event["session_id"]
+                        .as_str()
+                        .or_else(|| event["chat_id"].as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned);
+                    result = Some(body.trim_end_matches('\n').to_owned());
                 }
                 ("antigravity", _) => {
                     // stream-json: `step_update` events carry the reply as `agent_response`
@@ -850,7 +1167,10 @@ pub(crate) fn turn(
 
 pub(crate) fn import(provider: &str, path: &Path) -> Result<(String, Messages, PathBuf)> {
     ensure!(
-        matches!(provider, "prime" | "claude" | "codex" | "antigravity"),
+        matches!(
+            provider,
+            "prime" | "claude" | "codex" | "antigravity" | "cursor"
+        ),
         "Unknown provider {provider}"
     );
     ensure!(
@@ -863,7 +1183,7 @@ pub(crate) fn import(provider: &str, path: &Path) -> Result<(String, Messages, P
         meta.is_file() && meta.len() <= MAX_HISTORY,
         "Select a regular conversation file of at most 128 MiB"
     );
-    let mut id = if provider == "antigravity" {
+    let mut id = if matches!(provider, "antigravity" | "cursor") {
         antigravity_id_from_path(path)
     } else {
         None
@@ -913,7 +1233,7 @@ pub(crate) fn import(provider: &str, path: &Path) -> Result<(String, Messages, P
                 "Conversation contains multiple session IDs"
             );
             id = Some(uuid(candidate)?);
-        } else if provider == "antigravity" {
+        } else if matches!(provider, "antigravity" | "cursor") {
             if let Some(location) = event["cwd"].as_str() {
                 let location = PathBuf::from(location);
                 ensure!(
@@ -927,6 +1247,24 @@ pub(crate) fn import(provider: &str, path: &Path) -> Result<(String, Messages, P
             "codex" if kind == Some("response_item") && event["payload"]["type"] == "message" => {
                 if let Some(msg) = text(&event["payload"]) {
                     messages.push(msg);
+                }
+            }
+            "cursor" => {
+                let role = event["role"]
+                    .as_str()
+                    .or_else(|| event["message"]["role"].as_str())
+                    .or(kind);
+                let content = if event["message"].is_object() {
+                    &event["message"]["content"]
+                } else {
+                    &event["content"]
+                };
+                let message = serde_json::json!({"role": role, "content": content});
+                if let Some((role, body)) = text(&message) {
+                    let body = strip_tags(&body, "user_query");
+                    if !body.is_empty() {
+                        messages.push((role, body.to_owned()));
+                    }
                 }
             }
             "antigravity" => match kind {
@@ -1014,14 +1352,213 @@ pub(crate) fn import(provider: &str, path: &Path) -> Result<(String, Messages, P
     };
     let cwd = match (provider, cwd) {
         (_, Some(dir)) => dir,
-        ("antigravity", None) => std::env::current_dir()?,
+        ("antigravity" | "cursor", None) => std::env::current_dir()?,
         (_, None) => bail!("Missing native working directory"),
     };
     Ok((selector, messages, cwd))
 }
 
+/// Host a Captain factory run on the native daemon: open the run's session there (a live
+/// worker for the file is reused), start the host cell on that session's kernel, and wait for
+/// it to end. The run belongs to the daemon session, so the daemon's factory overview shows it
+/// and it outlives this process; the cell's control folder is the host cell's own directory.
+pub(crate) fn factory_host_on_daemon(
+    socket: &Path,
+    cell_path: &Path,
+    cell: String,
+    session: &Path,
+    options: &[&str],
+) -> Result<()> {
+    use pa_types::daemon::{DaemonCommand, DaemonSessionLifecycle};
+    use std::time::{Duration, Instant};
+    let control = cell_path
+        .parent()
+        .context("The factory host cell has no control folder")?
+        .canonicalize()?;
+    let session = session
+        .canonicalize()
+        .with_context(|| format!("Missing native session {}", session.display()))?;
+    // A host starts its run once, as the host cell itself checks.
+    ensure!(
+        !control.join("claimed").exists() && !control.join("abandoned").exists(),
+        "This run was already started or abandoned."
+    );
+    let cwd = std::env::current_dir()?;
+    let mut config = serde_json::json!({
+        "cwd": cwd.display().to_string(),
+        "sessionDir": session.parent().context("Missing session folder")?.display().to_string(),
+        "executionMode": "print",
+    });
+    let mut rest = options.iter();
+    while let Some(flag) = rest.next() {
+        let value = rest.next().context("Missing factory host option value")?;
+        match *flag {
+            "--model" => config["model"] = Value::from(*value),
+            "--thinking" => config["thinking"] = Value::from(*value),
+            _ => bail!("Unknown factory host option {flag}"),
+        }
+    }
+    // The faux seam: a script file or an inline script. The host session runs the agent
+    // engine, the only engine with a kernel.
+    if let Some(script) = std::env::var_os("PRIME_AGENT_FAUX_SCRIPT") {
+        let text = if Path::new(&script).is_file() {
+            std::fs::read_to_string(&script)?
+        } else {
+            script.to_string_lossy().into_owned()
+        };
+        let mut script: Value = serde_json::from_str(&text).context("Invalid faux script")?;
+        if script.get("engine").is_none() {
+            script["engine"] = Value::from("faux");
+        }
+        let file = control.join("faux-script.json");
+        std::fs::write(&file, serde_json::to_vec(&script)?)?;
+        config["script"] = Value::from(file.display().to_string());
+    }
+    if let Some(script) = std::env::var_os("PRIME_AGENT_FAUX_CHILD_SCRIPT") {
+        config["childScript"] = Value::from(script.to_string_lossy().into_owned());
+    }
+    // A session's tools derive their actor from RLM_SESSION_ID, never from a Captain identity
+    // riding the launch env of whichever client started the worker.
+    let mut launch_env = pa_types::daemon::launch_env::collect_process_launch_env();
+    launch_env.retain(|key, _| {
+        !matches!(
+            key.as_str(),
+            "PA_CAPTAIN_ACTOR" | "PA_CAPTAIN_SESSION" | "PA_CAPTAIN_SELECTION"
+        )
+    });
+    // A daemon that answers is the user's; only a missing one is started.
+    let mut client = match crate::daemon_client::DaemonClient::connect_probe(socket) {
+        Ok(client) => client,
+        Err(_) => {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(crate::interactive_mode::ensure_daemon_running(socket, &cwd))?;
+            crate::daemon_client::DaemonClient::connect(socket)?
+        }
+    };
+    let created = client.request_with_timeout(
+        DaemonCommand::Create {
+            id: None,
+            session_path: Some(session.display().to_string()),
+            continue_recent: None,
+            no_session: None,
+            name: None,
+            config: Some(config),
+            telemetry_disabled: None,
+            runtime_metadata: None,
+            lifecycle: Some(DaemonSessionLifecycle::Resident),
+            env: None,
+            launch_env: (!launch_env.is_empty()).then_some(launch_env),
+            rest: serde_json::Map::default(),
+        },
+        120_000,
+    )?;
+    ensure!(
+        created.success,
+        "The daemon could not open the factory host session: {}",
+        created.error.unwrap_or_default()
+    );
+    let active_session_id = created
+        .data
+        .as_ref()
+        .and_then(|data| data.get("activeSessionId"))
+        .and_then(Value::as_str)
+        .context("The daemon did not name the factory host session")?
+        .to_owned();
+    let outcome = control.join("host-outcome.json");
+    let _ = std::fs::remove_file(&outcome);
+    let mut rest = serde_json::Map::new();
+    rest.insert("cell".into(), Value::from(cell));
+    rest.insert("outcome".into(), Value::from(outcome.display().to_string()));
+    let hosted = client.request_with_timeout(
+        DaemonCommand::FactoryActivity {
+            id: None,
+            active_session_id,
+            action: "host".into(),
+            run_id: None,
+            spec_id: None,
+            timeout_ms: None,
+            rest,
+        },
+        120_000,
+    )?;
+    if !hosted.success {
+        // The same shape as a failed print-mode cell, which the job worker reads back.
+        eprintln!(
+            "KernelError {{ ename: \"FactoryHostError\", evalue: {:?} }}",
+            hosted.error.unwrap_or_default()
+        );
+        bail!("The daemon refused the factory host");
+    }
+    drop(client);
+    // The job worker reopens a daemon-hosted run's session when its worker ends.
+    std::fs::write(
+        control.join("daemon-host.json"),
+        serde_json::to_vec(&serde_json::json!({ "socket": socket, "session": session }))?,
+    )?;
+    // The cell holds host.lock while it runs. A free lock after the claim without an outcome
+    // means the daemon kernel ended first; the job worker settles the run from the daemon.
+    let claim_deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        if let Ok(text) = std::fs::read_to_string(&outcome) {
+            let record: Value = serde_json::from_str(&text)?;
+            print!("{}", record["stdout"].as_str().unwrap_or_default());
+            eprint!("{}", record["stderr"].as_str().unwrap_or_default());
+            if record["status"] == "ok" {
+                return Ok(());
+            }
+            let error = &record["error"];
+            eprintln!(
+                "KernelError {{ ename: {:?}, evalue: {:?} }}",
+                error["ename"].as_str().unwrap_or("Error"),
+                error["evalue"].as_str().unwrap_or_default()
+            );
+            bail!("The factory host cell failed");
+        }
+        if control.join("claimed").exists() {
+            let lock = File::options()
+                .create(true)
+                .append(true)
+                .open(control.join("host.lock"))?;
+            let free = lock.try_lock().is_ok();
+            drop(lock);
+            if free {
+                // A cell that just ended releases the lock moments before its outcome lands.
+                let settle = Instant::now() + Duration::from_secs(3);
+                while !outcome.exists() && Instant::now() < settle {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                if !outcome.exists() {
+                    return Ok(());
+                }
+                continue;
+            }
+        } else if Instant::now() > claim_deadline {
+            bail!("The factory host cell did not start on the daemon");
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn attached_images_become_acp_blocks_or_listed_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let photo = dir.path().join("a.JPG");
+        std::fs::write(&photo, b"img").unwrap();
+        let blocks = super::image_blocks(std::slice::from_ref(&photo)).unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "image");
+        assert_eq!(blocks[0]["mimeType"], "image/jpeg");
+        assert_eq!(blocks[0]["data"], "aW1n");
+        assert_eq!(super::list_image_paths("hi", &[]), "hi");
+        assert_eq!(
+            super::list_image_paths("hi", &[photo.clone()]),
+            format!("hi\n\nAttached images:\n- {}", photo.display())
+        );
+    }
     use super::*;
     #[test]
     fn skips_abandoned_branches_and_tool_payloads() {
