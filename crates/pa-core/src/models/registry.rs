@@ -111,6 +111,21 @@ struct LocalCliProviders {
 /// Under a stored xAI subscription the provider's models switch onto the
 /// openai-responses API with the subscription thinking maps and
 /// `supportsLongCacheRetention: false` compat.
+/// A non-empty Anthropic key that is not a Claude subscription OAuth token.
+fn is_real_anthropic_api_key(key: &str) -> bool {
+    !key.trim().is_empty() && !key.contains("sk-ant-oat")
+}
+
+/// Whether the ambient `ANTHROPIC_API_KEY` selects the Messages API: only when
+/// `PA_ANTHROPIC_USE_API_KEY` is `1` or `true`.
+fn ambient_anthropic_api_key_opted_in(opt_in: Option<&str>, key: Option<&str>) -> bool {
+    let opted_in = opt_in.is_some_and(|raw| {
+        let raw = raw.trim();
+        raw == "1" || raw.eq_ignore_ascii_case("true")
+    });
+    opted_in && key.is_some_and(is_real_anthropic_api_key)
+}
+
 fn xai_subscription_model(model: &Model) -> Model {
     let mut adapted = model.clone();
     adapted.api = "openai-responses".to_string();
@@ -260,18 +275,23 @@ impl ModelRegistry {
             .collect()
     }
 
+    /// Whether Anthropic requests use the Messages API instead of the `claude` CLI.
+    /// Only an explicit choice counts: a key saved with `/login`, a `models.json`
+    /// override, or `ANTHROPIC_API_KEY` with `PA_ANTHROPIC_USE_API_KEY=1`. A shell
+    /// that merely exports `ANTHROPIC_API_KEY` keeps the signed-in claude.ai account.
     fn has_real_anthropic_api_key(&self) -> bool {
         if let Some(AuthCredential::ApiKey { key, .. }) =
             self.auth.get_all().credential("anthropic")
         {
-            if !key.trim().is_empty() && !key.contains("sk-ant-oat") {
+            if is_real_anthropic_api_key(&key) {
                 return true;
             }
         }
-        if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
-            if !key.trim().is_empty() && !key.contains("sk-ant-oat") {
-                return true;
-            }
+        if ambient_anthropic_api_key_opted_in(
+            std::env::var("PA_ANTHROPIC_USE_API_KEY").ok().as_deref(),
+            std::env::var("ANTHROPIC_API_KEY").ok().as_deref(),
+        ) {
+            return true;
         }
         if let Some(config) = self.provider_request_configs.get("anthropic") {
             if config.headers.is_some() || config.auth_header.is_some() {
@@ -279,7 +299,7 @@ impl ModelRegistry {
             }
             if config.api_key.as_deref().is_some_and(|key| {
                 crate::auth::resolve_config_value::resolve_config_value(key)
-                    .is_some_and(|resolved| !resolved.contains("sk-ant-oat"))
+                    .is_some_and(|resolved| is_real_anthropic_api_key(&resolved))
             }) {
                 return true;
             }

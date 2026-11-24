@@ -64,6 +64,13 @@ const BUILT_IN_PROVIDER_DISPLAY_NAMES: &[(&str, &str)] = &[
 
 const PRIME_INFERENCE_PROVIDER_ID: &str = "prime-inference";
 
+/// The Claude account row: signs in through the official `claude` CLI, which then
+/// serves Anthropic models. The `Anthropic` API-key row stays separate.
+const CLAUDE_ACCOUNT_ROW: (&str, &str) = (
+    pa_ai::claude_cli::ANTHROPIC_PROVIDER,
+    "Anthropic (Claude Account)",
+);
+
 /// The display name of a provider id (else the id itself).
 fn display_name(provider_id: &str) -> String {
     BUILT_IN_PROVIDER_DISPLAY_NAMES
@@ -155,6 +162,62 @@ fn status_indicator(
     }
     // An unconfigured api-key row hides its meta (TS inline rule).
     None
+}
+
+/// The Claude account row's status from the `claude` CLI: install hint, signed-in
+/// account label, or unconfigured. The second value is the row's `configured` flag.
+fn claude_account_status(
+    cli_installed: bool,
+    status: Option<&pa_ai::claude_cli::ClaudeCliAuthStatus>,
+) -> (AuthStatusIndicator, bool) {
+    if !cli_installed {
+        return (
+            AuthStatusIndicator {
+                style: AuthStatusStyle::Muted,
+                label: "install claude CLI".to_string(),
+            },
+            false,
+        );
+    }
+    match status {
+        Some(status) if status.logged_in => {
+            let method = status.auth_method.as_deref().unwrap_or("signed in");
+            let label = match status.subscription_type.as_deref() {
+                Some(plan) => format!("{method} ({plan})"),
+                None => method.to_string(),
+            };
+            (
+                AuthStatusIndicator {
+                    style: AuthStatusStyle::Success,
+                    label,
+                },
+                true,
+            )
+        }
+        _ => (
+            AuthStatusIndicator {
+                style: AuthStatusStyle::Muted,
+                label: "unconfigured".to_string(),
+            },
+            false,
+        ),
+    }
+}
+
+fn claude_account_row() -> ProviderRow {
+    let (id, name) = CLAUDE_ACCOUNT_ROW;
+    let installed = pa_ai::claude_cli::is_available();
+    let auth_status = installed.then(pa_ai::claude_cli::auth_status).flatten();
+    let (status, configured) = claude_account_status(installed, auth_status.as_ref());
+    ProviderRow {
+        id: id.to_string(),
+        name: name.to_string(),
+        auth_type: AuthType::Oauth,
+        status: Some(status),
+        flow: AuthFlow::TerminalFlow,
+        configured,
+        available: true,
+    }
 }
 
 fn api_key_source_label(source: AuthSource, label: Option<&str>) -> String {
@@ -332,6 +395,8 @@ impl ProviderAuth {
                     available: true,
                 });
             }
+
+            rows.push(claude_account_row());
 
             // The API-key model providers.
             let registry = ModelRegistry::create(
@@ -561,30 +626,11 @@ fn login_blocking_on_panel(
                 },
             );
     }
-    // The Anthropic (Claude Pro/Max) login.
-    if provider_row.id == pa_core::auth::ANTHROPIC_PROVIDER_ID {
-        return tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_or_else(
-                |error: std::io::Error| {
-                    ProviderAuthOutcome::Error(format!(
-                        "Failed to login to {}: {error}",
-                        provider_row.name
-                    ))
-                },
-                |runtime| {
-                    runtime.block_on(crate::subscription_login::run_anthropic_login(
-                        &agent_dir,
-                        &provider_row.name,
-                        &pa_ai::oauth::ReqwestProviderHttp::new(),
-                        &crate::subscription_login::PanelSubscriptionLoginUi::new(
-                            panel,
-                            &provider_row.id,
-                        ),
-                    ))
-                },
-            );
+    // The Claude account login runs the official `claude` CLI.
+    if provider_row.id == pa_core::auth::ANTHROPIC_PROVIDER_ID
+        && provider_row.auth_type == AuthType::Oauth
+    {
+        return claude_account_login(&agent_dir, &panel);
     }
     // The GitHub Copilot login.
     if provider_row.id == pa_core::auth::GITHUB_COPILOT_PROVIDER_ID {
@@ -638,6 +684,142 @@ fn login_blocking_on_panel(
     }
     // Any other row answers the silent cancel.
     ProviderAuthOutcome::Cancelled
+}
+
+const CLAUDE_SIGNED_IN: &str =
+    "Signed in to Claude Code (claude.ai). Anthropic models route through the official claude CLI.";
+
+/// Signs in with `claude auth login`. The CLI owns the account session; pa stores
+/// nothing and only removes a legacy Anthropic OAuth token so `/login` shows one
+/// source of truth.
+fn claude_account_login(
+    agent_dir: &Path,
+    panel: &pa_tui::auth_panel::AuthPanelHandle,
+) -> ProviderAuthOutcome {
+    let Some(bin) = pa_ai::claude_cli::claude_bin() else {
+        return ProviderAuthOutcome::Error(
+            "Claude Code CLI (claude) is not installed. Install it from https://claude.ai/code and try again."
+                .into(),
+        );
+    };
+    if pa_ai::claude_cli::auth_status().is_some_and(|status| status.logged_in) {
+        return finish_claude_account_login(agent_dir);
+    }
+
+    let mut cmd = std::process::Command::new(&bin);
+    pa_ai::claude_cli::remove_api_key_env(&mut cmd)
+        .args(["auth", "login"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            return ProviderAuthOutcome::Error(format!(
+                "Failed to start {} auth login: {error}",
+                bin.display()
+            ));
+        }
+    };
+    panel.progress_line("Running claude auth login. Finish the sign-in in your browser.");
+
+    let (lines_tx, lines_rx) = std::sync::mpsc::channel::<String>();
+    let readers: Vec<_> = [
+        child
+            .stdout
+            .take()
+            .map(|out| Box::new(out) as Box<dyn std::io::Read + Send>),
+        child
+            .stderr
+            .take()
+            .map(|err| Box::new(err) as Box<dyn std::io::Read + Send>),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|stream| {
+        let lines_tx = lines_tx.clone();
+        std::thread::spawn(move || {
+            use std::io::BufRead as _;
+            for line in std::io::BufReader::new(stream).lines() {
+                let Ok(line) = line else { break };
+                if lines_tx.send(line).is_err() {
+                    break;
+                }
+            }
+        })
+    })
+    .collect();
+    drop(lines_tx);
+
+    let forward = |line: String| {
+        let line = line.trim();
+        if line.is_empty() {
+            return;
+        }
+        match login_url(line) {
+            Some(url) => panel.auth_url(url, Some(line)),
+            None => panel.progress_line(line),
+        }
+    };
+    let exit = loop {
+        while let Ok(line) = lines_rx.try_recv() {
+            forward(line);
+        }
+        if panel.cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return ProviderAuthOutcome::Cancelled;
+        }
+        match child.try_wait() {
+            Ok(Some(exit)) => break exit,
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
+            Err(error) => {
+                let _ = child.kill();
+                return ProviderAuthOutcome::Error(format!(
+                    "Failed waiting for claude auth login: {error}"
+                ));
+            }
+        }
+    };
+    for reader in readers {
+        let _ = reader.join();
+    }
+    for line in lines_rx.try_iter() {
+        forward(line);
+    }
+
+    if pa_ai::claude_cli::auth_status().is_some_and(|status| status.logged_in) {
+        return finish_claude_account_login(agent_dir);
+    }
+    ProviderAuthOutcome::Error(if exit.success() {
+        "claude auth login finished, but claude auth status does not report a signed-in account."
+            .to_string()
+    } else {
+        format!("claude auth login failed ({exit}).")
+    })
+}
+
+/// The first `http(s)://` URL in a CLI output line.
+fn login_url(line: &str) -> Option<&str> {
+    let start = line.find("https://").or_else(|| line.find("http://"))?;
+    line[start..].split_whitespace().next()
+}
+
+fn finish_claude_account_login(agent_dir: &Path) -> ProviderAuthOutcome {
+    let mut auth = pa_core::auth::AuthStorage::create(agent_dir);
+    if matches!(
+        auth.get_all()
+            .credential(pa_core::auth::ANTHROPIC_PROVIDER_ID),
+        Some(AuthCredential::Oauth { .. })
+    ) {
+        auth.remove(pa_core::auth::ANTHROPIC_PROVIDER_ID);
+        if let Some(error) = auth.drain_errors().pop() {
+            return ProviderAuthOutcome::Error(format!(
+                "Signed in to Claude Code, but could not remove the old Anthropic OAuth token: {error}"
+            ));
+        }
+    }
+    ProviderAuthOutcome::Status(CLAUDE_SIGNED_IN.to_string())
 }
 
 fn logout_blocking(provider_row: &ProviderRow, agent_dir: &Path) -> ProviderAuthOutcome {

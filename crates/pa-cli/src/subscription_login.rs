@@ -106,6 +106,7 @@ impl OAuthLoginUi for PanelSubscriptionLoginUi {
 
 /// Run the Anthropic flow, store the credential, and report the status. A
 /// cancelled surface stays silent; a failed flow reports the error row.
+#[allow(dead_code)]
 pub(crate) async fn run_anthropic_login(
     agent_dir: &Path,
     provider_name: &str,

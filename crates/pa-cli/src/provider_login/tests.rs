@@ -157,6 +157,130 @@ async fn login_options_list_providers_only() {
     );
 }
 
+#[tokio::test]
+async fn login_options_list_the_claude_account_and_api_key_rows() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let agent = dir.path().join("agent");
+    std::fs::create_dir_all(&agent).expect("agent dir");
+    let auth = ProviderAuth::new(dir.path(), agent.clone());
+    let rows = auth.login_options().await;
+    let account = rows
+        .iter()
+        .find(|row| row.id == "anthropic" && row.auth_type == AuthType::Oauth)
+        .expect("the Claude account row renders");
+    assert_eq!(account.name, "Anthropic (Claude Account)");
+    assert_eq!(account.flow, AuthFlow::TerminalFlow);
+    assert!(account.status.is_some());
+    let api_key = rows
+        .iter()
+        .find(|row| row.id == "anthropic" && row.auth_type == AuthType::ApiKey)
+        .expect("the Anthropic API-key row renders");
+    assert_eq!(api_key.name, "Anthropic");
+    assert_eq!(api_key.flow, AuthFlow::ApiKeyPrompt);
+}
+
+#[test]
+fn the_claude_account_status_follows_the_claude_cli() {
+    use pa_ai::claude_cli::ClaudeCliAuthStatus;
+
+    let (status, configured) = claude_account_status(false, None);
+    assert_eq!(status.style, AuthStatusStyle::Muted);
+    assert_eq!(status.label, "install claude CLI");
+    assert!(!configured);
+
+    let (status, configured) = claude_account_status(true, None);
+    assert_eq!(status.style, AuthStatusStyle::Muted);
+    assert_eq!(status.label, "unconfigured");
+    assert!(!configured);
+
+    let signed_out = ClaudeCliAuthStatus {
+        logged_in: false,
+        auth_method: None,
+        subscription_type: None,
+    };
+    let (status, configured) = claude_account_status(true, Some(&signed_out));
+    assert_eq!(status.label, "unconfigured");
+    assert!(!configured);
+
+    let team = ClaudeCliAuthStatus {
+        logged_in: true,
+        auth_method: Some("claude.ai".to_string()),
+        subscription_type: Some("team".to_string()),
+    };
+    let (status, configured) = claude_account_status(true, Some(&team));
+    assert_eq!(status.style, AuthStatusStyle::Success);
+    assert_eq!(status.label, "claude.ai (team)");
+    assert!(configured);
+
+    let no_plan = ClaudeCliAuthStatus {
+        subscription_type: None,
+        ..team
+    };
+    assert_eq!(
+        claude_account_status(true, Some(&no_plan)).0.label,
+        "claude.ai"
+    );
+}
+
+#[test]
+fn the_claude_login_url_is_taken_from_cli_output() {
+    assert_eq!(
+        login_url("Open this URL: https://claude.ai/oauth/authorize?code=1 to continue"),
+        Some("https://claude.ai/oauth/authorize?code=1")
+    );
+    assert_eq!(login_url("Opening browser to sign in"), None);
+}
+
+#[test]
+fn a_finished_claude_login_removes_the_legacy_anthropic_oauth_token() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut storage = pa_core::auth::AuthStorage::create(dir.path());
+    storage.set(
+        "anthropic",
+        AuthCredential::Oauth {
+            access: "legacy".to_string(),
+            refresh: None,
+            expires: i64::MAX,
+            endpoint: None,
+            token_endpoint: None,
+            client_id: None,
+            resource: None,
+            issuer: None,
+            audience_mode: None,
+            account_id: None,
+            enterprise_url: None,
+        },
+    );
+    storage.set(
+        "openai",
+        AuthCredential::ApiKey {
+            key: "sk-openai".to_string(),
+            prime_team: None,
+        },
+    );
+    assert!(matches!(
+        finish_claude_account_login(dir.path()),
+        ProviderAuthOutcome::Status(message) if message == CLAUDE_SIGNED_IN
+    ));
+    let after = pa_core::auth::AuthStorage::create(dir.path()).get_all();
+    assert!(after.credential("anthropic").is_none());
+    assert!(after.credential("openai").is_some());
+
+    // A saved Anthropic API key is the user's explicit choice and stays.
+    storage.set(
+        "anthropic",
+        AuthCredential::ApiKey {
+            key: "sk-ant-api03-saved".to_string(),
+            prime_team: None,
+        },
+    );
+    finish_claude_account_login(dir.path());
+    assert!(pa_core::auth::AuthStorage::create(dir.path())
+        .get_all()
+        .credential("anthropic")
+        .is_some());
+}
+
 /// The TS #2645 ban-risk warning no longer applies: an Anthropic
 /// subscription (a stored OAuth login or an `sk-ant-oat` key) is served by
 /// the official `claude` CLI, so pa never identifies as Claude Code itself

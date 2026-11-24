@@ -13,19 +13,19 @@ use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use pa_types::JsNumber;
 use serde_json::{Map, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 
+use crate::cli_pricing::{apply_estimated_cost, list_price_for_model, reported_cost_usd};
 use crate::event_stream::{
     create_assistant_message_event_stream, AssistantMessageEventStream, AssistantMessageEventWriter,
 };
 use crate::providers::antigravity::tool_progress_line;
 use crate::registry::Provider;
 use crate::types::{
-    AssistantContent, AssistantMessage, AssistantMessageEvent, Context, DoneStopReason,
-    ErrorStopReason, Message, Model, ModelCost, ModelInput, ModelThinkingLevel,
+    zero_model_cost, AssistantContent, AssistantMessage, AssistantMessageEvent, Context,
+    DoneStopReason, ErrorStopReason, Message, Model, ModelInput, ModelThinkingLevel,
     SimpleStreamOptions, StopReason, StreamOptions, TextContent, ThinkingContent, ThinkingLevelMap,
     ToolResultMessage, Usage, UsageCost, UserMessageContent,
 };
@@ -241,12 +241,7 @@ fn make_model(id: &str, name: &str, wires: &[(ModelThinkingLevel, &str)]) -> Mod
         reasoning: !wires.is_empty(),
         thinking_level_map,
         input: vec![ModelInput::Text, ModelInput::Image],
-        cost: ModelCost {
-            input: JsNumber::from(0.0),
-            output: JsNumber::from(0.0),
-            cache_read: JsNumber::from(0.0),
-            cache_write: JsNumber::from(0.0),
-        },
+        cost: list_price_for_model(id).unwrap_or_else(zero_model_cost),
         context_window,
         max_tokens: 64_000,
         max_tokens_explicit: false,
@@ -668,7 +663,7 @@ fn usage_field(value: &Value, camel: &str, snake: &str) -> Option<u64> {
     value[camel].as_u64().or_else(|| value[snake].as_u64())
 }
 
-fn apply_usage(usage: &mut Usage, value: &Value) {
+fn apply_usage(model: &Model, response_model: Option<&str>, usage: &mut Usage, value: &Value) {
     let input = usage_field(value, "inputTokens", "input_tokens").unwrap_or(usage.input);
     let output = usage_field(value, "outputTokens", "output_tokens").unwrap_or(usage.output);
     let cache_read =
@@ -683,6 +678,7 @@ fn apply_usage(usage: &mut Usage, value: &Value) {
         total_tokens: input + output + cache_read + cache_write,
         cost: UsageCost::default(),
     };
+    apply_estimated_cost(model, response_model, usage, reported_cost_usd(value));
 }
 
 fn push_error(
@@ -1072,7 +1068,20 @@ async fn run_stream_with_bin(
             Some("result") => {
                 record_chat_id(&event, &mut chat_id, &mut partial);
                 if event["usage"].is_object() {
-                    apply_usage(&mut partial.usage, &event["usage"]);
+                    apply_usage(
+                        &model,
+                        partial.response_model.as_deref(),
+                        &mut partial.usage,
+                        &event["usage"],
+                    );
+                }
+                if let Some(reported) = reported_cost_usd(&event) {
+                    apply_estimated_cost(
+                        &model,
+                        partial.response_model.as_deref(),
+                        &mut partial.usage,
+                        Some(reported),
+                    );
                 }
                 if event["is_error"].as_bool() == Some(true) {
                     result_error = Some(
@@ -1525,6 +1534,8 @@ claude-4.6-opus-max-thinking - Claude Opus 4.6 1M Max Thinking\n";
         assert_eq!(message.usage.cache_read, 4);
         assert_eq!(message.usage.cache_write, 2);
         assert_eq!(message.usage.total_tokens, 42);
+        // Opus list price: $5 in, $25 out, $0.50 read, $6.25 write per million tokens.
+        assert!((message.usage.cost.total.as_f64() - 314.5e-6).abs() < 1e-12);
 
         let mut second_context = first_context;
         second_context
@@ -1555,5 +1566,52 @@ claude-4.6-opus-max-thinking - Claude Opus 4.6 1M Max Thinking\n";
         assert_eq!(second.last(), Some(&"again"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn builtin_models_carry_list_prices_and_usage_is_priced() {
+        let catalog = builtin_models();
+        let model = |id: &str| catalog.iter().find(|m| m.id == id).expect(id).clone();
+        let composer = model("composer-2.5");
+        assert_eq!(composer.cost.input.as_f64(), 1.25);
+        assert_eq!(composer.cost.output.as_f64(), 6.0);
+        assert_eq!(model("gemini-4-neon").cost.output.as_f64(), 15.0);
+        assert_eq!(model("auto").cost, zero_model_cost());
+
+        let mut usage = Usage::default();
+        apply_usage(
+            &composer,
+            None,
+            &mut usage,
+            &serde_json::json!({"inputTokens": 1_000_000, "outputTokens": 0}),
+        );
+        assert!((usage.cost.total.as_f64() - 1.25).abs() < 1e-12);
+
+        // `auto` has no list price of its own; the routed response model prices it.
+        let auto = model("auto");
+        apply_usage(
+            &auto,
+            Some("composer-2.5"),
+            &mut usage,
+            &serde_json::json!({"inputTokens": 1_000_000, "outputTokens": 0}),
+        );
+        assert!((usage.cost.total.as_f64() - 1.25).abs() < 1e-12);
+
+        apply_usage(
+            &composer,
+            None,
+            &mut usage,
+            &serde_json::json!({"inputTokens": 10, "outputTokens": 1, "total_cost_usd": 0.5}),
+        );
+        assert_eq!(usage.cost.total.as_f64(), 0.5);
+
+        let mut empty = Usage::default();
+        apply_usage(
+            &composer,
+            None,
+            &mut empty,
+            &serde_json::json!({"inputTokens": 0, "outputTokens": 0}),
+        );
+        assert_eq!(empty.cost.total.as_f64(), 0.0);
     }
 }

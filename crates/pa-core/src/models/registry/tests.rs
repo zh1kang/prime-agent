@@ -780,9 +780,11 @@ fn cursor_models_surface_when_cli_is_available() {
 
 #[test]
 fn anthropic_routes_through_claude_cli_without_real_api_key() {
-    if std::env::var("ANTHROPIC_API_KEY")
-        .is_ok_and(|k| !k.trim().is_empty() && !k.contains("sk-ant-oat"))
-    {
+    // An explicit opt-in lets the ambient key select the Messages API.
+    if ambient_anthropic_api_key_opted_in(
+        std::env::var("PA_ANTHROPIC_USE_API_KEY").ok().as_deref(),
+        std::env::var("ANTHROPIC_API_KEY").ok().as_deref(),
+    ) {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -816,6 +818,65 @@ fn anthropic_routes_through_claude_cli_without_real_api_key() {
         .find(|m| m.provider == "anthropic")
         .expect("anthropic model available via API key");
     assert_eq!(api_claude.api, "anthropic-messages");
+}
+
+#[test]
+fn ambient_anthropic_api_key_needs_explicit_opt_in() {
+    let key = Some("sk-ant-api03-stale");
+    assert!(!ambient_anthropic_api_key_opted_in(None, key));
+    assert!(!ambient_anthropic_api_key_opted_in(Some(""), key));
+    assert!(!ambient_anthropic_api_key_opted_in(Some("0"), key));
+    assert!(ambient_anthropic_api_key_opted_in(Some("1"), key));
+    assert!(ambient_anthropic_api_key_opted_in(Some(" TRUE "), key));
+    assert!(!ambient_anthropic_api_key_opted_in(Some("1"), None));
+    assert!(!ambient_anthropic_api_key_opted_in(Some("1"), Some("  ")));
+    assert!(!ambient_anthropic_api_key_opted_in(
+        Some("1"),
+        Some("sk-ant-oat01-subscription")
+    ));
+}
+
+#[test]
+fn only_explicit_anthropic_api_keys_leave_claude_cli() {
+    let dir = tempfile::tempdir().unwrap();
+    let models_path = dir.path().join("models.json");
+    let anthropic_api = |registry: &ModelRegistry| {
+        registry
+            .get_all()
+            .iter()
+            .find(|m| m.provider == "anthropic")
+            .expect("anthropic model in catalog")
+            .api
+            .clone()
+    };
+
+    // A stored subscription OAuth token is not an API key: the CLI keeps serving.
+    let oauth_token = auth_with_local_clis(
+        &serde_json::json!({
+            "anthropic": { "type": "api_key", "key": "sk-ant-oat01-subscription" }
+        }),
+        &["anthropic"],
+    );
+    let registry = ModelRegistry::create(oauth_token, &models_path);
+    if !ambient_anthropic_api_key_opted_in(
+        std::env::var("PA_ANTHROPIC_USE_API_KEY").ok().as_deref(),
+        std::env::var("ANTHROPIC_API_KEY").ok().as_deref(),
+    ) {
+        assert_eq!(anthropic_api(&registry), pa_ai::claude_cli::CLAUDE_CLI_API);
+    }
+
+    // A models.json API key is explicit and selects the Messages API.
+    std::fs::write(
+        &models_path,
+        r#"{"providers":{"anthropic":{
+            "baseUrl":"https://api.anthropic.com","apiKey":"sk-ant-api03-from-models-json"
+        }}}"#,
+    )
+    .unwrap();
+    let configured = auth_with_local_clis(&serde_json::json!({}), &["anthropic"]);
+    let registry = ModelRegistry::create(configured, &models_path);
+    assert_eq!(registry.get_error(), None);
+    assert_eq!(anthropic_api(&registry), "anthropic-messages");
 }
 
 #[test]

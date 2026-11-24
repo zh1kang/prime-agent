@@ -13,6 +13,7 @@ use serde_json::{Map, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
+use crate::cli_pricing::{apply_estimated_cost, reported_cost_usd};
 use crate::event_stream::{
     create_assistant_message_event_stream, AssistantMessageEventStream, AssistantMessageEventWriter,
 };
@@ -101,6 +102,67 @@ pub fn claude_bin() -> Option<PathBuf> {
 #[must_use]
 pub fn is_available() -> bool {
     claude_bin().is_some()
+}
+
+/// Environment variables that make `claude` use an API key instead of the signed-in
+/// claude.ai account.
+const API_KEY_ENV_VARS: [&str; 2] = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"];
+
+/// Removes inherited API-key variables so a `claude` child process always uses the
+/// signed-in claude.ai account, even when the parent shell exports a stale key.
+pub fn remove_api_key_env(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    for key in API_KEY_ENV_VARS {
+        cmd.env_remove(key);
+    }
+    cmd
+}
+
+/// Sign-in state reported by `claude auth status`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaudeCliAuthStatus {
+    pub logged_in: bool,
+    pub auth_method: Option<String>,
+    pub subscription_type: Option<String>,
+}
+
+/// Parses `claude auth status` JSON. Text around the outermost object is ignored
+/// because the CLI can emit a stray byte after the closing brace.
+#[must_use]
+pub fn parse_auth_status(raw: &str) -> Option<ClaudeCliAuthStatus> {
+    let start = raw.find('{')?;
+    let end = raw.rfind('}')?;
+    if end < start {
+        return None;
+    }
+    let value: Value = serde_json::from_str(&raw[start..=end]).ok()?;
+    let object = value.as_object()?;
+    let text = |key: &str| {
+        object
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    };
+    Some(ClaudeCliAuthStatus {
+        logged_in: object.get("loggedIn").and_then(Value::as_bool)?,
+        auth_method: text("authMethod"),
+        subscription_type: text("subscriptionType"),
+    })
+}
+
+/// Runs `claude auth status` without API-key overrides. Returns `None` when the CLI is
+/// missing, fails to run, or prints output that is not a status object.
+#[must_use]
+pub fn auth_status() -> Option<ClaudeCliAuthStatus> {
+    let bin = claude_bin()?;
+    let mut cmd = std::process::Command::new(bin);
+    remove_api_key_env(&mut cmd)
+        .args(["auth", "status"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
+    let output = cmd.output().ok()?;
+    parse_auth_status(&String::from_utf8_lossy(&output.stdout))
 }
 
 fn effort_for_level(model: &Model, level: Option<ModelThinkingLevel>) -> Option<&'static str> {
@@ -320,7 +382,7 @@ fn empty_assistant_message(model: &Model) -> AssistantMessage {
     }
 }
 
-fn apply_usage(usage: &mut Usage, value: &Value) {
+fn apply_usage(model: &Model, response_model: Option<&str>, usage: &mut Usage, value: &Value) {
     let input = value["input_tokens"].as_u64().unwrap_or(usage.input);
     let output = value["output_tokens"].as_u64().unwrap_or(usage.output);
     let cache_read = value["cache_read_input_tokens"]
@@ -338,6 +400,7 @@ fn apply_usage(usage: &mut Usage, value: &Value) {
         total_tokens: total,
         cost: UsageCost::default(),
     };
+    apply_estimated_cost(model, response_model, usage, None);
 }
 
 fn push_error(
@@ -460,6 +523,7 @@ async fn run_stream_with_bin(
     if let Some(cid) = &resume_id {
         cmd.args(["--resume", cid]);
     }
+    remove_api_key_env(cmd.as_std_mut());
     cmd.current_dir(&cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -603,7 +667,12 @@ async fn run_stream_with_bin(
                             partial.response_model = Some(rm.to_string());
                         }
                         if msg["usage"].is_object() {
-                            apply_usage(&mut partial.usage, &msg["usage"]);
+                            apply_usage(
+                                &model,
+                                partial.response_model.as_deref(),
+                                &mut partial.usage,
+                                &msg["usage"],
+                            );
                         }
                     }
                     Some("content_block_delta") => {
@@ -700,7 +769,12 @@ async fn run_stream_with_bin(
                     }
                     Some("message_delta") => {
                         if inner["usage"].is_object() {
-                            apply_usage(&mut partial.usage, &inner["usage"]);
+                            apply_usage(
+                                &model,
+                                partial.response_model.as_deref(),
+                                &mut partial.usage,
+                                &inner["usage"],
+                            );
                         }
                     }
                     _ => {}
@@ -712,7 +786,12 @@ async fn run_stream_with_bin(
                     partial.response_model = Some(rm.to_string());
                 }
                 if msg["usage"].is_object() {
-                    apply_usage(&mut partial.usage, &msg["usage"]);
+                    apply_usage(
+                        &model,
+                        partial.response_model.as_deref(),
+                        &mut partial.usage,
+                        &msg["usage"],
+                    );
                 }
                 if let Some(blocks) = msg["content"].as_array() {
                     for block in blocks {
@@ -752,8 +831,19 @@ async fn run_stream_with_bin(
                     partial.response_id = Some(sid.to_string());
                 }
                 if event["usage"].is_object() {
-                    apply_usage(&mut partial.usage, &event["usage"]);
+                    apply_usage(
+                        &model,
+                        partial.response_model.as_deref(),
+                        &mut partial.usage,
+                        &event["usage"],
+                    );
                 }
+                apply_estimated_cost(
+                    &model,
+                    partial.response_model.as_deref(),
+                    &mut partial.usage,
+                    reported_cost_usd(&event),
+                );
                 if event["is_error"].as_bool() == Some(true) {
                     result_error = Some(
                         event["result"]
@@ -1003,6 +1093,48 @@ mod tests {
     }
 
     #[test]
+    fn parses_auth_status_with_trailing_noise() {
+        let raw = "{\n  \"loggedIn\": true,\n  \"authMethod\": \"claude.ai\",\n  \"apiProvider\": \"firstParty\",\n  \"subscriptionType\": \"team\"\n}\u{1b}";
+        assert_eq!(
+            parse_auth_status(raw),
+            Some(ClaudeCliAuthStatus {
+                logged_in: true,
+                auth_method: Some("claude.ai".to_string()),
+                subscription_type: Some("team".to_string()),
+            })
+        );
+        assert_eq!(
+            parse_auth_status("{\"loggedIn\": false}\n%"),
+            Some(ClaudeCliAuthStatus {
+                logged_in: false,
+                auth_method: None,
+                subscription_type: None,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_auth_status_without_status_object() {
+        assert_eq!(parse_auth_status(""), None);
+        assert_eq!(parse_auth_status("Not logged in"), None);
+        assert_eq!(parse_auth_status("{\"authMethod\": \"claude.ai\"}"), None);
+        assert_eq!(parse_auth_status("} {"), None);
+    }
+
+    #[test]
+    fn removes_api_key_env_from_claude_commands() {
+        let mut cmd = std::process::Command::new("claude");
+        cmd.env("ANTHROPIC_API_KEY", "sk-ant-stale");
+        remove_api_key_env(&mut cmd);
+        let removed: Vec<_> = cmd
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(removed, vec!["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]);
+    }
+
+    #[test]
     fn builtin_registry_registers_claude_cli_provider() {
         crate::registry::ensure_builtins();
         let provider = crate::registry::get_api_provider(CLAUDE_CLI_API);
@@ -1091,12 +1223,67 @@ mod tests {
         assert_eq!(message.usage.cache_read, 10);
         assert_eq!(message.usage.cache_write, 3);
         assert_eq!(message.usage.total_tokens, 38);
+        // No reported total: Opus list price ($5 in, $25 out, $0.50 read, $6.25 write per 1M).
+        assert!((message.usage.cost.total.as_f64() - 248.75e-6).abs() < 1e-12);
 
         let recorded_args = std::fs::read_to_string(&args_log).unwrap();
         let args: Vec<&str> = recorded_args.lines().collect();
         assert!(args.windows(2).any(|w| w == ["--model", "claude-opus-5-5"]));
         assert!(args.windows(2).any(|w| w == ["--effort", "high"]));
         assert_eq!(std::fs::read_to_string(&stdin_log).unwrap(), "Say hi");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn result_total_cost_usd_overrides_estimate_and_keeps_tokens() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "pa-claude-cli-cost-test-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script_path = dir.join("fake-claude");
+        let script = "#!/bin/sh\ncat > /dev/null\n\
+             printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"cc-sess-2\",\"model\":\"claude-opus-5-5\"}'\n\
+             printf '%s\\n' '{\"type\":\"assistant\",\"message\":{\"model\":\"claude-opus-5-5\",\"content\":[{\"type\":\"text\",\"text\":\"Hi\"}],\"usage\":{\"input_tokens\":1000,\"output_tokens\":100}}}'\n\
+             printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"cc-sess-2\",\"result\":\"Hi\",\"total_cost_usd\":0.0123}'\n";
+        std::fs::write(&script_path, script).unwrap();
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).unwrap();
+
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(UserMessage {
+                content: UserMessageContent::Text("Say hi".to_string()),
+                timestamp: now_ms(),
+                rest: Map::default(),
+            })],
+            tools: None,
+        };
+        let (writer, mut stream) = create_assistant_message_event_stream();
+        let handle = tokio::spawn(run_stream_with_bin(
+            writer,
+            opus_model(),
+            context,
+            StreamOptions::default(),
+            None,
+            Some(script_path),
+        ));
+        while stream.next_event().await.is_some() {}
+        let message = stream.result().await;
+        handle.await.unwrap();
+
+        assert_eq!(message.stop_reason, StopReason::Stop);
+        assert_eq!(message.usage.input, 1000);
+        assert_eq!(message.usage.output, 100);
+        assert!((message.usage.cost.input.as_f64() - 5e-3).abs() < 1e-12);
+        assert!((message.usage.cost.output.as_f64() - 2.5e-3).abs() < 1e-12);
+        assert_eq!(message.usage.cost.total.as_f64(), 0.0123);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

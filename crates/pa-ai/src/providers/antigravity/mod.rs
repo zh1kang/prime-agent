@@ -11,25 +11,87 @@ use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use pa_types::JsNumber;
 use serde_json::{Map, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{ChildStdin, ChildStdout, Command};
 use tokio_util::sync::CancellationToken;
 
+use crate::cli_pricing::{apply_estimated_cost, list_price_for_model, reported_cost_usd};
 use crate::event_stream::{
     create_assistant_message_event_stream, AssistantMessageEventStream, AssistantMessageEventWriter,
 };
 use crate::registry::Provider;
 use crate::types::{
-    AssistantContent, AssistantMessage, AssistantMessageEvent, Context, DoneStopReason,
-    ErrorStopReason, Message, Model, ModelCost, ModelInput, ModelThinkingLevel,
+    zero_model_cost, AssistantContent, AssistantMessage, AssistantMessageEvent, Context,
+    DoneStopReason, ErrorStopReason, Message, Model, ModelInput, ModelThinkingLevel,
     SimpleStreamOptions, StopReason, StreamOptions, TextContent, ThinkingContent, ThinkingLevelMap,
     ToolResultMessage, Usage, UsageCost, UserMessageContent,
 };
 use crate::utils_inner::diagnostics::now_ms;
 
 const ACP_INIT_TIMEOUT: Duration = Duration::from_secs(20);
+const ACP_POOL_TTL: Duration = Duration::from_secs(600);
+const ACP_POOL_MAX: usize = 8;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AcpPoolKey {
+    bin: PathBuf,
+    cwd: PathBuf,
+    acp_session: String,
+}
+
+struct WarmAcp {
+    child: tokio::process::Child,
+    io: AcpIo,
+    model_id: String,
+    effort: Option<&'static str>,
+    last_used: Instant,
+}
+
+fn acp_pool() -> &'static tokio::sync::Mutex<HashMap<AcpPoolKey, WarmAcp>> {
+    static POOL: OnceLock<tokio::sync::Mutex<HashMap<AcpPoolKey, WarmAcp>>> = OnceLock::new();
+    POOL.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+}
+
+async fn take_warm_acp(bin: &Path, cwd: &Path, acp_session: &str) -> Option<WarmAcp> {
+    let key = AcpPoolKey {
+        bin: bin.to_path_buf(),
+        cwd: cwd.to_path_buf(),
+        acp_session: acp_session.to_string(),
+    };
+    let mut pool = acp_pool().lock().await;
+    pool.retain(|_, worker| worker.last_used.elapsed() <= ACP_POOL_TTL);
+    let mut worker = pool.remove(&key)?;
+    if worker.child.try_wait().ok().flatten().is_some() {
+        return None;
+    }
+    Some(worker)
+}
+
+async fn put_warm_acp(key: AcpPoolKey, mut worker: WarmAcp) {
+    if worker.child.try_wait().ok().flatten().is_some() {
+        return;
+    }
+    worker.last_used = Instant::now();
+    let mut pool = acp_pool().lock().await;
+    pool.retain(|_, existing| existing.last_used.elapsed() <= ACP_POOL_TTL);
+    while pool.len() >= ACP_POOL_MAX {
+        let Some(oldest) = pool
+            .iter()
+            .min_by_key(|(_, existing)| existing.last_used)
+            .map(|(k, _)| k.clone())
+        else {
+            break;
+        };
+        pool.remove(&oldest);
+    }
+    pool.insert(key, worker);
+}
+
+#[cfg(test)]
+async fn clear_warm_acp_pool() {
+    acp_pool().lock().await.clear();
+}
 
 const TOOL_ARG_KEYS: &[&str] = &[
     "CommandLine",
@@ -401,12 +463,7 @@ fn make_model(id: &str, name: &str, efforts: &[&str], featured: bool) -> Model {
         reasoning: !efforts.is_empty(),
         thinking_level_map: build_thinking_map(efforts),
         input: vec![ModelInput::Text, ModelInput::Image],
-        cost: ModelCost {
-            input: JsNumber::from(0.0),
-            output: JsNumber::from(0.0),
-            cache_read: JsNumber::from(0.0),
-            cache_write: JsNumber::from(0.0),
-        },
+        cost: list_price_for_model(id).unwrap_or_else(zero_model_cost),
         context_window,
         max_tokens,
         max_tokens_explicit: false,
@@ -828,7 +885,7 @@ fn empty_assistant_message(model: &Model) -> AssistantMessage {
     }
 }
 
-fn apply_usage(usage: &mut Usage, value: &Value) {
+fn apply_usage(model: &Model, response_model: Option<&str>, usage: &mut Usage, value: &Value) {
     let input = value["input_tokens"].as_u64().unwrap_or(0);
     let output = value["output_tokens"].as_u64().unwrap_or(0);
     let cache_read = value["cache_read_tokens"].as_u64().unwrap_or(0);
@@ -843,6 +900,7 @@ fn apply_usage(usage: &mut Usage, value: &Value) {
         total_tokens: total,
         cost: UsageCost::default(),
     };
+    apply_estimated_cost(model, response_model, usage, reported_cost_usd(value));
 }
 
 fn push_error(
@@ -1065,7 +1123,12 @@ async fn run_stream_with_bin(
                             blocks.push_text(delta, &mut partial, &writer);
                         }
                         if update["usage"].is_object() {
-                            apply_usage(&mut partial.usage, &update["usage"]);
+                            apply_usage(
+                                &model,
+                                partial.response_model.as_deref(),
+                                &mut partial.usage,
+                                &update["usage"],
+                            );
                         }
                     }
                     Some("tool") => {
@@ -1089,7 +1152,20 @@ async fn run_stream_with_bin(
                     partial.response_id = Some(cid.to_string());
                 }
                 if res["usage"].is_object() {
-                    apply_usage(&mut partial.usage, &res["usage"]);
+                    apply_usage(
+                        &model,
+                        partial.response_model.as_deref(),
+                        &mut partial.usage,
+                        &res["usage"],
+                    );
+                }
+                if let Some(reported) = reported_cost_usd(res) {
+                    apply_estimated_cost(
+                        &model,
+                        partial.response_model.as_deref(),
+                        &mut partial.usage,
+                        Some(reported),
+                    );
                 }
                 if let Some(status) = res["status"].as_str() {
                     if !status.eq_ignore_ascii_case("SUCCESS") {
@@ -1114,7 +1190,20 @@ async fn run_stream_with_bin(
                         partial.response_id = Some(cid.to_string());
                     }
                     if event["usage"].is_object() {
-                        apply_usage(&mut partial.usage, &event["usage"]);
+                        apply_usage(
+                            &model,
+                            partial.response_model.as_deref(),
+                            &mut partial.usage,
+                            &event["usage"],
+                        );
+                    }
+                    if let Some(reported) = reported_cost_usd(&event) {
+                        apply_estimated_cost(
+                            &model,
+                            partial.response_model.as_deref(),
+                            &mut partial.usage,
+                            Some(reported),
+                        );
                     }
                     if !status.eq_ignore_ascii_case("SUCCESS") {
                         result_error = Some(
@@ -1176,6 +1265,11 @@ async fn run_stream_with_bin(
         }
     }
 
+    if let Some(banner) = detect_quota_or_auth_banner(&assistant_text(&partial)) {
+        push_error(&writer, partial, ErrorStopReason::Error, banner);
+        return;
+    }
+
     finish_stream(
         &writer,
         partial,
@@ -1184,6 +1278,43 @@ async fn run_stream_with_bin(
         session_id,
         conversation_id,
     );
+}
+
+fn assistant_text(partial: &AssistantMessage) -> String {
+    partial
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            AssistantContent::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Upper bound on a reply that can still be a provider banner; longer replies are
+/// real answers that merely mention quota or key wording.
+const BANNER_MAX_LEN: usize = 500;
+
+/// Antigravity reports quota and credential failures as plain assistant text with a
+/// normal `end_turn`. Returns the banner when the whole reply is such a notice.
+fn detect_quota_or_auth_banner(text: &str) -> Option<String> {
+    const MARKERS: [&str; 6] = [
+        "individual quota reached",
+        "quota exceeded",
+        "rate limit reached",
+        "please upgrade your subscription to increase your limits",
+        "invalid api key",
+        "fix external api key",
+    ];
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.len() > BANNER_MAX_LEN {
+        return None;
+    }
+    let lower = trimmed.to_lowercase();
+    MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+        .then(|| trimmed.to_string())
 }
 
 fn finish_stream(
@@ -1411,11 +1542,20 @@ fn acp_tool_line(update: &Value) -> String {
 
 fn apply_acp_update(
     update: &Value,
+    model: &Model,
     partial: &mut AssistantMessage,
     blocks: &mut BlockState,
     seen_tools: &mut HashSet<String>,
     writer: &AssistantMessageEventWriter,
 ) {
+    if update["usage"].is_object() {
+        apply_acp_usage(
+            model,
+            partial.response_model.as_deref(),
+            &mut partial.usage,
+            &update["usage"],
+        );
+    }
     match update["sessionUpdate"].as_str() {
         Some("agent_thought_chunk") => {
             if let Some(chunk) = acp_text(update) {
@@ -1444,7 +1584,7 @@ fn apply_acp_update(
     }
 }
 
-fn apply_acp_usage(usage: &mut Usage, value: &Value) {
+fn apply_acp_usage(model: &Model, response_model: Option<&str>, usage: &mut Usage, value: &Value) {
     let input = value["inputTokens"].as_u64().unwrap_or(0);
     let output = value["outputTokens"].as_u64().unwrap_or(0);
     let cache_read = value["cachedReadTokens"].as_u64().unwrap_or(0);
@@ -1459,11 +1599,75 @@ fn apply_acp_usage(usage: &mut Usage, value: &Value) {
             .unwrap_or(input + output + cache_read + cache_write),
         cost: UsageCost::default(),
     };
+    apply_estimated_cost(model, response_model, usage, reported_cost_usd(value));
 }
 
-/// Runs one turn through `agy acp`. Returns `false` (having pushed no events) when the
-/// ACP server never answers `initialize`, so the caller can fall back to `stream-json`.
+/// Runs one turn through `agy acp`, reusing a warm persistent ACP process for the same
+/// `(bin, cwd, session)` when available so multi-turn chats skip the ~1.4s spawn + load tax.
+/// Returns `false` (having pushed no events) when a fresh ACP server never answers `initialize`,
+/// so the caller can fall back to `stream-json`.
 async fn run_acp(writer: &AssistantMessageEventWriter, request: AcpRequest<'_>) -> bool {
+    if let Some(resume) = request.resume_id.as_deref() {
+        if let Some(mut warm) = take_warm_acp(request.bin, request.cwd, resume).await {
+            let mut partial = empty_assistant_message(request.model);
+            partial.response_id = Some(resume.to_string());
+            let mut blocks = BlockState::default();
+            let mut started = false;
+            let turn = acp_prompt_warm(
+                &mut warm,
+                resume,
+                &request,
+                &mut partial,
+                &mut blocks,
+                &mut started,
+                writer,
+            )
+            .await;
+            match turn {
+                Ok(acp_session) => {
+                    blocks.close_all(&mut partial, writer);
+                    if let Some(banner) = detect_quota_or_auth_banner(&assistant_text(&partial)) {
+                        let _ = warm.child.kill().await;
+                        push_error(writer, partial, ErrorStopReason::Error, banner);
+                        return true;
+                    }
+                    put_warm_acp(
+                        AcpPoolKey {
+                            bin: request.bin.to_path_buf(),
+                            cwd: request.cwd.to_path_buf(),
+                            acp_session: acp_session.clone(),
+                        },
+                        warm,
+                    )
+                    .await;
+                    finish_stream(
+                        writer,
+                        partial,
+                        request.model,
+                        request.context,
+                        request.session_id,
+                        Some(acp_session),
+                    );
+                    return true;
+                }
+                Err(AcpError::Closed(_)) if !started => {
+                    // Pooled process died while idle before streaming anything: retry cold below.
+                    let _ = warm.child.kill().await;
+                }
+                Err(error) => {
+                    let _ = warm.child.kill().await;
+                    let reason = if matches!(error, AcpError::Aborted) {
+                        ErrorStopReason::Aborted
+                    } else {
+                        ErrorStopReason::Error
+                    };
+                    push_error(writer, partial, reason, error.message());
+                    return true;
+                }
+            }
+        }
+    }
+
     let mut cmd = Command::new(request.bin);
     cmd.args(["acp", "--dangerously-skip-permissions"])
         .current_dir(request.cwd)
@@ -1524,12 +1728,31 @@ async fn run_acp(writer: &AssistantMessageEventWriter, request: AcpRequest<'_>) 
     });
     let mut blocks = BlockState::default();
     let turn = acp_turn(&mut io, &request, &mut partial, &mut blocks, writer).await;
-    drop(io);
-    let _ = child.kill().await;
 
     match turn {
         Ok(acp_session) => {
             blocks.close_all(&mut partial, writer);
+            if let Some(banner) = detect_quota_or_auth_banner(&assistant_text(&partial)) {
+                drop(io);
+                let _ = child.kill().await;
+                push_error(writer, partial, ErrorStopReason::Error, banner);
+                return true;
+            }
+            put_warm_acp(
+                AcpPoolKey {
+                    bin: request.bin.to_path_buf(),
+                    cwd: request.cwd.to_path_buf(),
+                    acp_session: acp_session.clone(),
+                },
+                WarmAcp {
+                    child,
+                    io,
+                    model_id: request.model.id.clone(),
+                    effort: request.effort,
+                    last_used: Instant::now(),
+                },
+            )
+            .await;
             finish_stream(
                 writer,
                 partial,
@@ -1540,6 +1763,8 @@ async fn run_acp(writer: &AssistantMessageEventWriter, request: AcpRequest<'_>) 
             );
         }
         Err(error) => {
+            drop(io);
+            let _ = child.kill().await;
             let reason = if matches!(error, AcpError::Aborted) {
                 ErrorStopReason::Aborted
             } else {
@@ -1549,6 +1774,112 @@ async fn run_acp(writer: &AssistantMessageEventWriter, request: AcpRequest<'_>) 
         }
     }
     true
+}
+
+async fn acp_prompt_warm(
+    warm: &mut WarmAcp,
+    acp_session: &str,
+    request: &AcpRequest<'_>,
+    partial: &mut AssistantMessage,
+    blocks: &mut BlockState,
+    started: &mut bool,
+    writer: &AssistantMessageEventWriter,
+) -> Result<String, AcpError> {
+    let signal = request.signal;
+    if warm.model_id != request.model.id {
+        warm.io
+            .call(
+                "session/set_config_option",
+                serde_json::json!({"sessionId": acp_session, "configId": "model", "value": request.model.id}),
+                signal,
+                &mut |_| {},
+            )
+            .await?;
+        warm.model_id.clone_from(&request.model.id);
+    }
+    if warm.effort != request.effort {
+        if let Some(effort) = request.effort {
+            let set = warm
+                .io
+                .call(
+                    "session/set_config_option",
+                    serde_json::json!({"sessionId": acp_session, "configId": "thought_level", "value": effort}),
+                    signal,
+                    &mut |_| {},
+                )
+                .await;
+            if let Err(AcpError::Aborted) = set {
+                return Err(AcpError::Aborted);
+            }
+        }
+        warm.effort = request.effort;
+    }
+
+    let mut seen_tools = HashSet::new();
+    let result = warm
+        .io
+        .call(
+            "session/prompt",
+            serde_json::json!({
+                "sessionId": acp_session,
+                "prompt": [{"type": "text", "text": request.prompt}],
+            }),
+            signal,
+            &mut |update| {
+                if !*started {
+                    *started = true;
+                    writer.push(AssistantMessageEvent::Start {
+                        partial: partial.clone(),
+                    });
+                }
+                apply_acp_update(
+                    update,
+                    request.model,
+                    partial,
+                    blocks,
+                    &mut seen_tools,
+                    writer,
+                );
+            },
+        )
+        .await;
+    if let Err(AcpError::Aborted) = &result {
+        let _ = warm
+            .io
+            .send(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "session/cancel",
+                "params": {"sessionId": acp_session},
+            }))
+            .await;
+    }
+    let result = result?;
+    if !*started {
+        *started = true;
+        writer.push(AssistantMessageEvent::Start {
+            partial: partial.clone(),
+        });
+    }
+    if result["usage"].is_object() {
+        apply_acp_usage(
+            request.model,
+            partial.response_model.as_deref(),
+            &mut partial.usage,
+            &result["usage"],
+        );
+    }
+    match result["stopReason"].as_str() {
+        Some("cancelled") => Err(AcpError::Aborted),
+        Some("refusal") => Err(AcpError::Rpc(
+            "Antigravity refused to answer this request".to_string(),
+        )),
+        Some(raw @ ("max_tokens" | "max_turn_requests")) => {
+            partial.stop_reason = StopReason::Length;
+            partial.stop_reason_raw = Some(raw.to_string());
+            Ok(acp_session.to_string())
+        }
+        _ => Ok(acp_session.to_string()),
+    }
 }
 
 async fn acp_turn(
@@ -1632,7 +1963,16 @@ async fn acp_turn(
                 "prompt": [{"type": "text", "text": prompt}],
             }),
             signal,
-            &mut |update| apply_acp_update(update, partial, blocks, &mut seen_tools, writer),
+            &mut |update| {
+                apply_acp_update(
+                    update,
+                    request.model,
+                    partial,
+                    blocks,
+                    &mut seen_tools,
+                    writer,
+                )
+            },
         )
         .await;
     if let Err(AcpError::Aborted) = &result {
@@ -1646,7 +1986,12 @@ async fn acp_turn(
     }
     let result = result?;
     if result["usage"].is_object() {
-        apply_acp_usage(&mut partial.usage, &result["usage"]);
+        apply_acp_usage(
+            request.model,
+            partial.response_model.as_deref(),
+            &mut partial.usage,
+            &result["usage"],
+        );
     }
     match result["stopReason"].as_str() {
         Some("cancelled") => Err(AcpError::Aborted),
@@ -1812,6 +2157,8 @@ gemini-pro-orchestrator-neon    Orchestrator (Neon)\n";
             .expect("gemini-4-neon in builtin catalog");
         assert_eq!(neon.provider, "antigravity");
         assert_eq!(neon.api, "antigravity-cli");
+        assert_eq!(neon.cost.input.as_f64(), 2.5);
+        assert_eq!(neon.cost.output.as_f64(), 15.0);
         assert_eq!(
             effort_for_level(neon, Some(ModelThinkingLevel::Xhigh)),
             Some("xhigh")
@@ -1926,12 +2273,77 @@ gemini-pro-orchestrator-neon    Orchestrator (Neon)\n";
         assert_eq!(message.usage.output, 4);
         assert_eq!(message.usage.cache_read, 2);
         assert_eq!(message.usage.total_tokens, 18);
+        assert!((message.usage.cost.input.as_f64() - 30e-6).abs() < 1e-12);
+        assert!((message.usage.cost.output.as_f64() - 60e-6).abs() < 1e-12);
+        assert!((message.usage.cost.total.as_f64() - 90.5e-6).abs() < 1e-12);
 
         let recorded_args = std::fs::read_to_string(&args_log).unwrap();
         let args: Vec<&str> = recorded_args.lines().collect();
         assert!(args.windows(2).any(|w| w == ["--model", "gemini-4-neon"]));
         assert!(args.windows(2).any(|w| w == ["--effort", "xhigh"]));
         assert!(args.contains(&"-p=Say hi"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn quota_banner_reply_ends_the_stream_with_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "pa-antigravity-quota-test-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script_path = dir.join("fake-agy");
+        let script = "#!/bin/sh\n\
+             printf '%s\\n' '{\"event\":\"init\",\"conversation_id\":\"conv-q\"}'\n\
+             printf '%s\\n' '{\"event\":\"result\",\"result\":{\"conversation_id\":\"conv-q\",\"status\":\"SUCCESS\",\"response\":\"\\n⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 4h52m9s.\"}}'\n";
+        std::fs::write(&script_path, script).unwrap();
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).unwrap();
+
+        let model = builtin_models().into_iter().next().unwrap();
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(pa_types::ai::UserMessage {
+                content: UserMessageContent::Text("Say hi".to_string()),
+                timestamp: now_ms(),
+                rest: Map::default(),
+            })],
+            tools: None,
+        };
+        let (writer, mut stream) = create_assistant_message_event_stream();
+        let handle = tokio::spawn(run_stream_with_bin(
+            writer,
+            model,
+            context,
+            StreamOptions::default(),
+            None,
+            Some(script_path),
+        ));
+        let mut saw_error = false;
+        let mut saw_done = false;
+        while let Some(event) = stream.next_event().await {
+            match event {
+                AssistantMessageEvent::Error { .. } => saw_error = true,
+                AssistantMessageEvent::Done { .. } => saw_done = true,
+                _ => {}
+            }
+        }
+        let message = stream.result().await;
+        handle.await.unwrap();
+
+        assert!(saw_error);
+        assert!(!saw_done);
+        assert_eq!(message.stop_reason, StopReason::Error);
+        assert_eq!(
+            message.error_message.as_deref(),
+            Some("⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 4h52m9s.")
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1957,6 +2369,7 @@ while IFS= read -r line; do
       printf '%s\n' "$reply" >> "$dir/acp-requests.txt"
       printf '%s%s}}\n' "$u" '{"sessionUpdate":"tool_call","toolCallId":"t1","name":"view_file","args":{"AbsolutePath":"/tmp/a.rs"},"status":"in_progress"}'
       printf '%s%s}}\n' "$u" '{"sessionUpdate":"tool_call_update","toolCallId":"t1","name":"view_file","status":"completed"}'
+      printf '%s%s}}\n' "$u" '{"sessionUpdate":"usage_update","usage":{"inputTokens":9,"outputTokens":1,"totalTokens":10}}'
       printf '%s%s}}\n' "$u" '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Hello "}}'
       printf '%s%s}}\n' "$u" '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"ACP!"}}'
       printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn","usage":{"inputTokens":9,"outputTokens":3,"cachedReadTokens":1,"totalTokens":13}}}\n' "$id" ;;
@@ -2015,6 +2428,7 @@ done
         };
         let (mut stream, handle) = run(first_context.clone());
         let mut order = Vec::new();
+        let mut first_text_cost = None;
         while let Some(event) = stream.next_event().await {
             match event {
                 AssistantMessageEvent::ThinkingStart { .. } => order.push("thinking_start".into()),
@@ -2022,7 +2436,8 @@ done
                     order.push(format!("thinking:{delta}"));
                 }
                 AssistantMessageEvent::ThinkingEnd { .. } => order.push("thinking_end".into()),
-                AssistantMessageEvent::TextDelta { delta, .. } => {
+                AssistantMessageEvent::TextDelta { delta, partial, .. } => {
+                    first_text_cost.get_or_insert(partial.usage.cost.total.as_f64());
                     order.push(format!("text:{delta}"))
                 }
                 AssistantMessageEvent::TextEnd { content, .. } => {
@@ -2052,6 +2467,13 @@ done
         assert_eq!(message.usage.output, 3);
         assert_eq!(message.usage.cache_read, 1);
         assert_eq!(message.usage.total_tokens, 13);
+        // Gemini 4 Neon list price: $2.50 in, $15 out, $0.25 cache read per million tokens.
+        let streamed = first_text_cost.expect("text streamed");
+        assert!(
+            (streamed - 37.5e-6).abs() < 1e-12,
+            "streamed cost {streamed}"
+        );
+        assert!((message.usage.cost.total.as_f64() - 67.75e-6).abs() < 1e-12);
 
         let args = std::fs::read_to_string(dir.join("acp-args.txt")).unwrap();
         assert_eq!(
@@ -2093,7 +2515,7 @@ done
             .messages
             .push(Message::Assistant(message.clone()));
         second_context.messages.push(user("again"));
-        let (mut stream, handle) = run(second_context);
+        let (mut stream, handle) = run(second_context.clone());
         let mut texts = Vec::new();
         while let Some(event) = stream.next_event().await {
             if let AssistantMessageEvent::TextDelta { delta, .. } = event {
@@ -2110,11 +2532,21 @@ done
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        let load = requests
-            .iter()
-            .find(|r| r["method"] == "session/load")
-            .expect("second turn resumes via session/load");
-        assert_eq!(load["params"]["sessionId"], "acp-sess-1");
+        // Second turn reuses the warm persistent ACP process: no second initialize or session/load!
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r["method"] == "initialize")
+                .count(),
+            1
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r["method"] == "session/load")
+                .count(),
+            0
+        );
         assert_eq!(
             requests
                 .iter()
@@ -2129,7 +2561,70 @@ done
             .unwrap();
         assert_eq!(last_prompt["params"]["prompt"][0]["text"], "again");
 
+        // After pool eviction (e.g. idle timeout or restart), the third turn falls back cleanly to session/load.
+        clear_warm_acp_pool().await;
+        let mut third_context = second_context;
+        third_context.messages.push(Message::Assistant(second));
+        third_context.messages.push(user("third"));
+        let (mut stream, handle) = run(third_context);
+        while stream.next_event().await.is_some() {}
+        let third = stream.result().await;
+        handle.await.unwrap();
+        assert_eq!(third.stop_reason, StopReason::Stop);
+
+        let requests: Vec<Value> = std::fs::read_to_string(dir.join("acp-requests.txt"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let load = requests
+            .iter()
+            .find(|r| r["method"] == "session/load")
+            .expect("evicted turn resumes via session/load");
+        assert_eq!(load["params"]["sessionId"], "acp-sess-1");
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r["method"] == "session/new")
+                .count(),
+            1
+        );
+        let last_prompt = requests
+            .iter()
+            .rev()
+            .find(|r| r["method"] == "session/prompt")
+            .unwrap();
+        assert_eq!(last_prompt["params"]["prompt"][0]["text"], "third");
+
+        clear_warm_acp_pool().await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detects_quota_banner_as_error_text() {
+        let raw = "\n⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 4h52m9s.";
+        assert_eq!(
+            detect_quota_or_auth_banner(raw).as_deref(),
+            Some("⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 4h52m9s.")
+        );
+        assert!(detect_quota_or_auth_banner("Invalid API key · Fix external API key").is_some());
+    }
+
+    #[test]
+    fn ignores_long_answers_that_mention_quota_wording() {
+        assert_eq!(detect_quota_or_auth_banner(""), None);
+        assert_eq!(detect_quota_or_auth_banner("  \n "), None);
+        assert_eq!(
+            detect_quota_or_auth_banner("Here is the refactored function."),
+            None
+        );
+        let docs = format!(
+            "The client retries when the server answers `quota exceeded`.\n\n```rust\n{}\n```",
+            "if status == 429 { return Err(Error::QuotaExceeded(\"quota exceeded\".into())); }\n"
+                .repeat(8)
+        );
+        assert!(docs.len() > BANNER_MAX_LEN);
+        assert_eq!(detect_quota_or_auth_banner(&docs), None);
     }
 
     #[test]

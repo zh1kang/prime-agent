@@ -8,7 +8,7 @@ pub use pa_types::ai::thinking_levels::{
     SUPPORTED_THINKING_LEVELS,
 };
 
-use crate::types::{Model, Usage, UsageCost};
+use crate::types::{Model, ModelCost, Usage, UsageCost};
 
 #[derive(Debug, Clone, Default)]
 pub struct CostOverrides {
@@ -26,18 +26,27 @@ pub fn calculate_cost_values(
     usage: &Usage,
     overrides: Option<&CostOverrides>,
 ) -> UsageCost {
-    let cache_write_cost = overrides
-        .and_then(|overrides| overrides.cache_write)
-        .unwrap_or_else(|| model.cost.cache_write.as_f64());
+    let rates = ModelCost {
+        cache_write: overrides
+            .and_then(|overrides| overrides.cache_write)
+            .map_or(model.cost.cache_write, JsNumber::from),
+        ..model.cost
+    };
+    usage_cost_at_rates(&rates, usage)
+}
+
+/// Price `usage` at `rates` ($/million tokens).
+#[must_use]
+pub(crate) fn usage_cost_at_rates(rates: &ModelCost, usage: &Usage) -> UsageCost {
     // Token counts sit far below f64's 2^53 exact-integer range; the cost math is f64 by design.
     #[allow(clippy::cast_precision_loss)]
-    let input = (model.cost.input.as_f64() / 1_000_000.0) * usage.input as f64;
+    let input = (rates.input.as_f64() / 1_000_000.0) * usage.input as f64;
     #[allow(clippy::cast_precision_loss)]
-    let output = (model.cost.output.as_f64() / 1_000_000.0) * usage.output as f64;
+    let output = (rates.output.as_f64() / 1_000_000.0) * usage.output as f64;
     #[allow(clippy::cast_precision_loss)]
-    let cache_read = (model.cost.cache_read.as_f64() / 1_000_000.0) * usage.cache_read as f64;
+    let cache_read = (rates.cache_read.as_f64() / 1_000_000.0) * usage.cache_read as f64;
     #[allow(clippy::cast_precision_loss)]
-    let cache_write = (cache_write_cost / 1_000_000.0) * usage.cache_write as f64;
+    let cache_write = (rates.cache_write.as_f64() / 1_000_000.0) * usage.cache_write as f64;
     UsageCost {
         input: JsNumber::from(input),
         output: JsNumber::from(output),
