@@ -6,7 +6,7 @@ use crate::{Line, Span};
 use ratatui::style::{Modifier, Style};
 use serde_json::Value;
 
-use crate::theme::{Theme, ThemeBg, ThemeColor};
+use crate::theme::{Theme, ThemeColor};
 
 /// Truncate a plain string to a visible width (cut on grapheme
 /// boundaries, appending the ellipsis).
@@ -1479,10 +1479,11 @@ pub fn render_speed_footer(text: &str, theme: &Theme, width: usize) -> Line {
     vec![Span::styled(text, dim)]
 }
 
-/// The editor surface background: `userMessageBg` (TS `getEditorTheme`).
+/// Transparent editor surface background so terminal transparency (e.g. Ghostty)
+/// shows through the prompt box cleanly.
 #[must_use]
-pub fn editor_background(theme: &Theme) -> ratatui::style::Style {
-    theme.bg_style(ThemeBg::UserMessageBg)
+pub fn editor_background(_theme: &Theme) -> ratatui::style::Style {
+    ratatui::style::Style::default()
 }
 #[cfg(test)]
 mod tests;

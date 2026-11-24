@@ -279,6 +279,26 @@ fn autocomplete_panel_opens_with_the_top_border_rule() {
     );
 }
 
+#[test]
+fn prompt_editor_box_is_transparent_with_hairline_borders() {
+    let mut v = view();
+    v.editor.set_text("hello ghostty");
+    let frame = v.render_dock(60);
+    let prompt_idx = frame
+        .iter()
+        .position(|line| text_of(line).contains(">  hello ghostty"))
+        .expect("the prompt row renders");
+    let prompt_row = &frame[prompt_idx];
+    assert!(
+        prompt_row.iter().all(|span| span.style.bg.is_none()),
+        "prompt row carries no solid background fill: {prompt_row:?}"
+    );
+    assert_eq!(text_of(&frame[prompt_idx - 1]), "\u{2500}".repeat(60));
+    assert_eq!(text_of(&frame[prompt_idx + 1]), "\u{2500}".repeat(60));
+    assert!(frame[prompt_idx - 1].iter().all(|s| s.style.bg.is_none()));
+    assert!(frame[prompt_idx + 1].iter().all(|s| s.style.bg.is_none()));
+}
+
 /// The selected row's wash spans the panel's full width (operator directive 2026-09-26).
 #[test]
 fn autocomplete_selected_row_washes_the_full_panel_width() {
@@ -1512,9 +1532,10 @@ fn browse_header_pair_sits_below_the_editor_top_row() {
         .iter()
         .position(|row| row.contains("browse"))
         .expect("the queue browse header renders");
-    assert!(
-        joined[header_row - 1].trim().is_empty(),
-        "the editor top row stays above the header: {:?}",
+    assert_eq!(
+        joined[header_row - 1],
+        "\u{2500}".repeat(80),
+        "the editor hairline top border stays above the header: {:?}",
         joined[header_row - 1]
     );
     assert!(

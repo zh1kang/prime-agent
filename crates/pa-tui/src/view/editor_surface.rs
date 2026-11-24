@@ -63,7 +63,7 @@ pub(crate) fn render(
         let indicator = format!(" \u{2191} {scroll_offset} more");
         rows.push(indicator_row(&indicator, bg, border, width));
     } else {
-        rows.push(vec![Span::styled(" ".repeat(width), bg)]);
+        rows.push(vec![Span::styled("\u{2500}".repeat(width), border)]);
     }
     // The header block: the caller's line on the editor background plus its
     // empty companion row — the box grows by two rows while a header shows, and
@@ -178,7 +178,7 @@ pub(crate) fn render(
             width,
         ));
     } else {
-        rows.push(vec![Span::styled(" ".repeat(width), bg)]);
+        rows.push(vec![Span::styled("\u{2500}".repeat(width), border)]);
     }
     EditorBox {
         rows,
