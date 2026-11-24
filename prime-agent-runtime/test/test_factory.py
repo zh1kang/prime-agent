@@ -83,6 +83,7 @@ from rlm.factory import (
     MachineFile,
     MachineResolutionError,
     _child_name,
+    _detect_provider_auth_or_quota_error,
     _guard_passes,
     _parse_json_output,
     _resolve_machine_dir,
@@ -8392,6 +8393,41 @@ class FactoryEmitTest(_ExecutorTestCase):
         self.assertIn("repaired", kinds)
 
     @async_test
+    async def test_a_provider_quota_banner_pauses_the_run_instead_of_a_repair(self) -> None:
+        self.host.outcomes["design"] = {
+            "status": "done",
+            "answer": "\n⚠ Individual quota reached. Please upgrade your subscription to increase "
+            "your limits. Resets in 4h52m9s.",
+        }
+        status = await self.settle(await self.start())
+
+        self.assertEqual(status["state"], "paused")
+        self.assertEqual(
+            status["pause_reason"],
+            "Provider auth/quota error in state 'design': ⚠ Individual quota reached. Please upgrade "
+            "your subscription to increase your limits. Resets in 4h52m9s.",
+        )
+        self.assertEqual(self.host.calls_of("agent_message.send"), [])
+        self.assertEqual(len(self.host.spawn_calls("design")), 1, "no retry on a broken provider")
+        kinds = [event["kind"] for event in status["events"]]
+        self.assertNotIn("repair_requested", kinds)
+        self.assertNotIn("retry", kinds)
+        self.assertEqual(self.host.spawn_calls("build"), [])
+
+    @async_test
+    async def test_a_provider_auth_error_settle_pauses_without_a_retry(self) -> None:
+        self.host.outcomes["design"] = {"status": "error", "error": "Invalid API key · Fix external API key"}
+        status = await self.settle(await self.start())
+
+        self.assertEqual(status["state"], "paused")
+        self.assertEqual(
+            status["pause_reason"],
+            "Provider auth/quota error in state 'design': Invalid API key · Fix external API key",
+        )
+        self.assertEqual(len(self.host.spawn_calls("design")), 1)
+        self.assertNotIn("retry", [event["kind"] for event in status["events"]])
+
+    @async_test
     async def test_output_repair_waits_for_background_task_work(self) -> None:
         self.host.emitted["design"] = {"design": "the design"}
         self.host.factory_task_busy_until_collect["design"] = 2
@@ -8638,8 +8674,64 @@ class FactoryCliOutputsTest(_ExecutorTestCase):
             "claude-cli/opus",
         ):
             self.assertTrue(factory_module._is_cli_backed_model(model), model)
-        for model in (None, "", "anthropic/claude-opus", "openai/gpt-5", "cursorish/x"):
+        for model in (None, "", "openai/gpt-5", "cursorish/x"):
             self.assertFalse(factory_module._is_cli_backed_model(model), model)
+
+        with TemporaryDirectory() as agent_dir:
+            base_env = {
+                "PRIME_AGENT_CODING_AGENT_DIR": agent_dir,
+                "PA_CLAUDE_BIN": "/bin/true",
+                "PA_ANTHROPIC_USE_API_KEY": "",
+                "ANTHROPIC_API_KEY": "",
+            }
+            with unittest.mock.patch.dict(os.environ, base_env, clear=False):
+                self.assertTrue(factory_module._is_cli_backed_model("anthropic/claude-opus-5-5"))
+                # Ambient ANTHROPIC_API_KEY without explicit opt-in still routes via claude CLI.
+                with unittest.mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-api03-ambient"}):
+                    self.assertTrue(factory_module._is_cli_backed_model("anthropic/claude-opus-5-5"))
+                # Explicit env opt-in uses the Messages API (native REPL).
+                with unittest.mock.patch.dict(
+                    os.environ,
+                    {
+                        "PA_ANTHROPIC_USE_API_KEY": "1",
+                        "ANTHROPIC_API_KEY": "sk-ant-api03-explicit",
+                    },
+                ):
+                    self.assertFalse(factory_module._is_cli_backed_model("anthropic/claude-opus-5-5"))
+                # Disabling claude CLI falls back to native.
+                with unittest.mock.patch.dict(os.environ, {"PA_CLAUDE_BIN": "none"}):
+                    self.assertFalse(factory_module._is_cli_backed_model("anthropic/claude-opus-5-5"))
+                # Stored Anthropic API key in auth.json opts into Messages API.
+                (Path(agent_dir) / "auth.json").write_text(
+                    json.dumps({"anthropic": {"type": "api_key", "key": "sk-ant-api03-stored"}}),
+                    encoding="utf-8",
+                )
+                self.assertFalse(factory_module._is_cli_backed_model("anthropic/claude-opus-5-5"))
+
+    @async_test
+    async def test_anthropic_claude_cli_child_gets_cli_outputs_section_and_binds(self) -> None:
+        with TemporaryDirectory() as agent_dir:
+            (Path(agent_dir) / "settings.json").write_text(
+                json.dumps({"factory": {"enabled": True}}),
+                encoding="utf-8",
+            )
+            env = {
+                "PRIME_AGENT_CODING_AGENT_DIR": agent_dir,
+                "PA_CLAUDE_BIN": "/bin/true",
+                "PA_ANTHROPIC_USE_API_KEY": "",
+                "ANTHROPIC_API_KEY": "",
+            }
+            with unittest.mock.patch.dict(os.environ, env, clear=False):
+                self.store_cli_machine("anthropic/claude-opus-5-5", spec_id="anthropic-cli")
+                self.host.outcomes["review"] = {"status": "done", "answer": self.block(self.VALID)}
+                status = await self.finish("anthropic-cli")
+
+                self.assertEqual(status["state"], "done", status.get("last_error"))
+                [spawn] = self.host.spawn_calls("review")
+                self.assertIn("```factory-outputs", spawn["prompt"])
+                self.assertIn("ignore any instruction to call it", spawn["prompt"])
+                self.assertEqual(self.review_outputs(status), self.VALID)
+                self.assertEqual(self.host.calls_of("agent_message.send"), [])
 
     @async_test
     async def test_fenced_block_binds_typed_ports_without_repair(self) -> None:
@@ -8747,7 +8839,7 @@ class FactoryCliOutputsTest(_ExecutorTestCase):
 
     @async_test
     async def test_native_child_keeps_emit_instructions_and_ignores_plain_json(self) -> None:
-        self.store_cli_machine("anthropic/claude-opus", spec_id="native")
+        self.store_cli_machine("openai/gpt-5", spec_id="native")
         self.host.outcomes["review"] = {
             "status": "done",
             "answer": f"Done.\n```json\n{json.dumps(self.VALID)}\n```",
@@ -8762,7 +8854,7 @@ class FactoryCliOutputsTest(_ExecutorTestCase):
 
     @async_test
     async def test_native_child_factory_outputs_block_binds(self) -> None:
-        self.store_cli_machine("anthropic/claude-opus", spec_id="native")
+        self.store_cli_machine("openai/gpt-5", spec_id="native")
         self.host.outcomes["review"] = {"status": "done", "answer": self.block(self.VALID)}
         status = await self.finish("native")
 
@@ -15308,3 +15400,36 @@ class RunTuningKnobsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProviderErrorDetectionTest(unittest.TestCase):
+    def test_auth_and_quota_banners_match(self) -> None:
+        self.assertEqual(
+            _detect_provider_auth_or_quota_error(None, "Invalid API key · Fix external API key"),
+            "Invalid API key · Fix external API key",
+        )
+        self.assertEqual(
+            _detect_provider_auth_or_quota_error(
+                "\n⚠ Individual quota reached. Please upgrade your subscription to increase your "
+                "limits. Resets in 4h52m9s.",
+                None,
+            ),
+            "⚠ Individual quota reached. Please upgrade your subscription to increase your limits. "
+            "Resets in 4h52m9s.",
+        )
+        self.assertIsNotNone(_detect_provider_auth_or_quota_error("Not logged in · Please run /login", None))
+
+    def test_a_long_answer_about_quotas_does_not_match(self) -> None:
+        prose = (
+            "The client retries when the API returns quota exceeded or rate limit reached. "
+            + "It backs off exponentially and logs each attempt. " * 20
+        )
+        self.assertGreater(len(prose), 500)
+        self.assertIsNone(_detect_provider_auth_or_quota_error(prose, None))
+        self.assertIsNone(_detect_provider_auth_or_quota_error("All tests pass.", None))
+        self.assertIsNone(_detect_provider_auth_or_quota_error(None, "child worker unreachable"))
+
+    def test_the_summary_is_capped(self) -> None:
+        detail = _detect_provider_auth_or_quota_error(None, "quota exceeded: " + "x" * 400)
+        self.assertIsNotNone(detail)
+        self.assertLessEqual(len(detail), 220)

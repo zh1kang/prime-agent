@@ -52,12 +52,21 @@ import json
 import math
 import os
 import re
+import shutil
 import signal
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any, Callable
 from uuid import uuid4
+
+from .model_router import (
+    admission_decision,
+    fallback_after_failure,
+    is_recognized_model,
+    note_provider_failure,
+    router_disabled,
+)
 
 FAILURE_POLICIES: tuple[str, ...] = ("fail_fast", "continue", "escalate")
 PORT_TYPES: tuple[str, ...] = ("text", "json")
@@ -1275,8 +1284,84 @@ that attempt may write instead of a fenced ``factory-outputs`` block."""
 _FACTORY_OUTPUTS_BLOCK_RE = re.compile(r"```factory[-_]outputs[ \t]*\r?\n(.*?)```", re.DOTALL)
 
 
+def _claude_cli_available() -> bool:
+    """Mirror ``pa_ai::claude_cli::is_available``."""
+    explicit = os.environ.get("PA_CLAUDE_BIN")
+    if explicit is not None:
+        trimmed = explicit.strip()
+        if trimmed.lower() == "none" or trimmed == "0":
+            return False
+        if trimmed:
+            return True
+    if shutil.which("claude") is not None:
+        return True
+    home = os.environ.get("HOME")
+    if home:
+        for rel in (".local/bin/claude", ".claude/local/claude"):
+            candidate = Path(home) / rel
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return True
+    return False
+
+
+def _is_real_anthropic_api_key(key: Any) -> bool:
+    return isinstance(key, str) and bool(key.strip()) and "sk-ant-oat" not in key
+
+
+def _anthropic_uses_claude_cli() -> bool:
+    """Mirror ``ModelRegistry::anthropic_uses_claude_cli``: ``anthropic/*``
+    routes through the ``claude`` CLI (no Python REPL) whenever ``claude`` is
+    installed and no explicit Anthropic API key override is configured."""
+    if not _claude_cli_available():
+        return False
+    opt_in = (os.environ.get("PA_ANTHROPIC_USE_API_KEY") or "").strip().lower()
+    if opt_in in ("1", "true") and _is_real_anthropic_api_key(os.environ.get("ANTHROPIC_API_KEY")):
+        return False
+    raw_dir = (
+        os.environ.get("PRIME_AGENT_CODING_AGENT_DIR")
+        or os.environ.get("PI_CODING_AGENT_DIR")
+        or str(Path.home() / ".prime" / "agent")
+    )
+    agent_dir = Path(raw_dir).expanduser()
+    try:
+        auth = json.loads((agent_dir / "auth.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        auth = None
+    if isinstance(auth, dict):
+        cred = auth.get("anthropic")
+        if (
+            isinstance(cred, dict)
+            and cred.get("type") == "api_key"
+            and _is_real_anthropic_api_key(cred.get("key"))
+        ):
+            return False
+    try:
+        models_doc = json.loads((agent_dir / "models.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        models_doc = None
+    if isinstance(models_doc, dict):
+        providers = models_doc.get("providers")
+        if isinstance(providers, dict):
+            cfg = providers.get("anthropic")
+            if isinstance(cfg, dict):
+                if (
+                    cfg.get("headers")
+                    or cfg.get("authHeader") is not None
+                    or _is_real_anthropic_api_key(cfg.get("apiKey"))
+                ):
+                    return False
+    return True
+
+
 def _is_cli_backed_model(model: str | None) -> bool:
-    return isinstance(model, str) and model.lower().startswith(CLI_BACKED_MODEL_PREFIXES)
+    if not isinstance(model, str):
+        return False
+    lowered = model.lower()
+    if lowered.startswith(CLI_BACKED_MODEL_PREFIXES):
+        return True
+    if lowered.startswith("anthropic/"):
+        return _anthropic_uses_claude_cli()
+    return False
 
 
 def _emit_file_path(run_id: str, state_id: str, entry_index: int, instance_index: int, attempt: int) -> Path | None:
@@ -1500,6 +1585,14 @@ def _state_role(state: "_StateRun") -> str | None:
     return role if isinstance(role, str) else None
 
 
+def _state_specialist(state: "_StateRun") -> str | None:
+    subagent = state.spec.get("subagent")
+    if not isinstance(subagent, dict):
+        return None
+    specialist = subagent.get("specialist")
+    return specialist.strip() if isinstance(specialist, str) and specialist.strip() else None
+
+
 def _instance_display_name(
     run_name: str | None, state: "_StateRun", entry: "_StateEntry", instance: "_NodeInstance"
 ) -> str:
@@ -1602,6 +1695,45 @@ def _is_infra_error(message: str) -> bool:
     from a failed kickoff). Infra, not the task's failure."""
     lowered = message.lower()
     return any(marker in lowered for marker in _INFRA_ERROR_MARKERS)
+
+
+_PROVIDER_ERROR_MARKERS = (
+    "invalid api key",
+    "fix external api key",
+    "authentication_error",
+    "no api key found",
+    "individual quota reached",
+    "quota exceeded",
+    "rate limit reached",
+    "please upgrade your subscription",
+    "not logged in",
+)
+
+_PROVIDER_ANSWER_SCAN_LIMIT = 500
+"""Only an answer this short (trimmed) is scanned for provider banners: a
+CLI provider reports an auth or quota failure as a short plain-text answer
+with status done, while a real answer that discusses rate limits is long."""
+
+_PROVIDER_ERROR_DETAIL_CAP = 220
+
+
+def _detect_provider_auth_or_quota_error(answer: str | None, error: str | None) -> str | None:
+    """A short summary of a provider auth/quota failure, or None.
+
+    Retrying or steering a child cannot fix a missing key or a spent quota,
+    so the executor pauses the run for the operator instead."""
+    candidates = [error.strip()] if error and error.strip() else []
+    trimmed = (answer or "").strip()
+    if trimmed and len(trimmed) <= _PROVIDER_ANSWER_SCAN_LIMIT:
+        candidates.append(trimmed)
+    for text in candidates:
+        lowered = text.lower()
+        if any(marker in lowered for marker in _PROVIDER_ERROR_MARKERS):
+            detail = " ".join(text.split())
+            if len(detail) > _PROVIDER_ERROR_DETAIL_CAP:
+                detail = detail[: _PROVIDER_ERROR_DETAIL_CAP - 1].rstrip() + "…"
+            return detail
+    return None
 
 
 def _child_name(run_id: str, state_id: str, instance_index: int, attempt: int) -> str:
@@ -5364,6 +5496,10 @@ class FactoryExecutor:
                 return "stopped"
 
         instance.attempt += 1
+        hold_reason = self._route_admission(run, state, entry, instance)
+        if hold_reason is not None:
+            await self._hold_for_provider_quota(run, state, entry, instance, hold_reason)
+            return "failed"
         child_name = _spawn_label(state.name, run.run_id, state.state_id, instance.index, instance.attempt)
         # The admission intent: the child is about to exist under this
         # label. A kernel death between the supervisor creating the child
@@ -5697,6 +5833,12 @@ class FactoryExecutor:
         run.settle_count += 1
         run.tool_use_total += instance.tool_uses
         _add_result_usage(run, result)
+        provider_error = _detect_provider_auth_or_quota_error(
+            result.answer_text or result.answer_preview, result.error
+        )
+        if provider_error is not None:
+            await self._pause_for_provider_error(run, state, entry, instance, provider_error)
+            return
         child_reason: str | None = None
         if result.status == "error":
             child_reason = result.error or f"child settled with status {result.status!r}"
@@ -6155,6 +6297,149 @@ class FactoryExecutor:
         )
         return None
 
+    def _route_admission(
+        self, run: FactoryRun, state: _StateRun, entry: _StateEntry, instance: _NodeInstance
+    ) -> str | None:
+        """Apply the model router before spawn. Returns a pause reason when
+        every pool for this tier is already exhausted, else None."""
+        decision = admission_decision(
+            prompt=state.prompt_template or "",
+            state_id=state.state_id,
+            role=_state_role(state),
+            specialist=_state_specialist(state),
+            attempt=instance.attempt,
+            pinned_model=state.model,
+            pinned_thinking=state.thinking,
+        )
+        if decision is None:
+            return None
+        if decision.exhausted and not decision.model:
+            detail = decision.reason or "every eligible pool is exhausted"
+            return f"Provider auth/quota error in state '{state.state_id}': {detail}"
+        previous = state.model
+        if decision.model and decision.model != state.model:
+            state.model = decision.model
+            if decision.thinking:
+                state.thinking = decision.thinking
+            self._event(
+                run,
+                "model_rerouted",
+                node=state.state_id,
+                entry=entry.index,
+                instance=instance.index,
+                detail=(
+                    f"{previous} -> {decision.model} ({decision.tier}, {decision.thinking}): "
+                    f"{decision.reason}"
+                ),
+                model=decision.model,
+                thinking=decision.thinking or "",
+                tier=decision.tier,
+            )
+        elif decision.thinking and decision.thinking != (state.thinking or ""):
+            state.thinking = decision.thinking
+        return None
+
+    def _prepare_provider_failure(
+        self, run: FactoryRun, state: _StateRun, entry: _StateEntry, instance: _NodeInstance, detail: str
+    ) -> str | None:
+        """Reroute a recognized model onto a healthy pool. None means the
+        instance was re-queued. Otherwise the pause reason, enriched when
+        every remaining pool is exhausted or open."""
+        reason = f"Provider auth/quota error in state '{state.state_id}': {detail}"
+        if (
+            router_disabled()
+            or not is_recognized_model(state.model)
+            or instance.status != "running"
+            or entry.status != "running"
+            or run.state != "running"
+        ):
+            return reason
+        note_provider_failure(state.model or "", detail)
+        decision = fallback_after_failure(
+            prompt=state.prompt_template or "",
+            state_id=state.state_id,
+            role=_state_role(state),
+            specialist=_state_specialist(state),
+            attempt=instance.attempt,
+            model=state.model or "",
+            thinking=state.thinking,
+        )
+        if decision.model and not decision.exhausted and decision.model != state.model:
+            previous = state.model
+            state.model = decision.model
+            if decision.thinking:
+                state.thinking = decision.thinking
+            instance.status = "pending"
+            instance.error = None
+            instance.awaiting_outputs_until = None
+            instance.answer = None
+            instance.provisional = False
+            self._event(
+                run,
+                "settled",
+                node=state.state_id,
+                entry=entry.index,
+                instance=instance.index,
+                status="error",
+                error=reason,
+                duration_ms=instance.duration_ms,
+            )
+            self._event(
+                run,
+                "model_rerouted",
+                node=state.state_id,
+                entry=entry.index,
+                instance=instance.index,
+                detail=(
+                    f"{previous} -> {decision.model} ({decision.tier}, {decision.thinking}): "
+                    f"{decision.reason}"
+                ),
+                model=decision.model,
+                thinking=decision.thinking or "",
+                tier=decision.tier,
+            )
+            return None
+        extra = decision.reason.strip() if decision.exhausted and decision.reason else ""
+        if extra and extra not in reason:
+            return f"{reason}. {extra}"
+        return reason
+
+    async def _hold_for_provider_quota(
+        self, run: FactoryRun, state: _StateRun, entry: _StateEntry, instance: _NodeInstance, reason: str
+    ) -> None:
+        """Hold the entry under escalate. Resume re-admits it as a fresh attempt."""
+        instance.status = "error"
+        instance.error = reason
+        instance.awaiting_outputs_until = None
+        self._event(
+            run,
+            "settled",
+            node=state.state_id,
+            entry=entry.index,
+            instance=instance.index,
+            status="error",
+            error=reason,
+            duration_ms=instance.duration_ms,
+        )
+        await self._apply_entry_failure_policy(run, state, entry, reason, escalate=True)
+
+    async def _pause_for_provider_error(
+        self, run: FactoryRun, state: _StateRun, entry: _StateEntry, instance: _NodeInstance, detail: str
+    ) -> None:
+        """Fail the instance without a retry or a repair request and hold
+        the entry under escalate: a missing key or a spent quota fails every
+        attempt the same way until the operator fixes the provider, and
+        resume() then re-admits the entry as a fresh attempt.
+
+        A recognized provider model with a healthy fallback is re-queued on
+        that model instead of pausing. The ``model_rerouted`` ledger row
+        names the move.
+        """
+        reason = self._prepare_provider_failure(run, state, entry, instance, detail)
+        if reason is None:
+            return
+        await self._hold_for_provider_quota(run, state, entry, instance, reason)
+
     def _pause_for_unverified_task_activity(
         self, run: FactoryRun, state: _StateRun, entry: _StateEntry, instance: _NodeInstance
     ) -> None:
@@ -6189,6 +6474,7 @@ class FactoryExecutor:
         status: str | None = None,
         settled: bool = False,
         answer: str | None = None,
+        result_error: str | None = None,
     ) -> None:
         """Re-read a repairing child's outputs, failing only after it is idle."""
         if (
@@ -6216,6 +6502,13 @@ class FactoryExecutor:
         if task_busy is None:
             self._pause_for_unverified_task_activity(run, state, entry, instance)
             return
+        if settled and not task_busy:
+            provider_error = _detect_provider_auth_or_quota_error(
+                answer, result_error if status == "error" else None
+            )
+            if provider_error is not None:
+                await self._pause_for_provider_error(run, state, entry, instance, provider_error)
+                return
         # On a daemonless (--print / factory-host) host, agent_message.send
         # queues the repair turn synchronously and collect reports settled and
         # not busy only after that repair turn and its background bash finish.
@@ -6439,11 +6732,20 @@ class FactoryExecutor:
         await self._apply_entry_failure_policy(run, state, entry, reason)
 
     async def _apply_entry_failure_policy(
-        self, run: FactoryRun, state: _StateRun, entry: _StateEntry, reason: str, *, stuck: bool = False
+        self,
+        run: FactoryRun,
+        state: _StateRun,
+        entry: _StateEntry,
+        reason: str,
+        *,
+        stuck: bool = False,
+        escalate: bool = False,
     ) -> None:
         """Fail the entry under its state's policy. ``stuck`` (one error
         repeated across consecutive attempts) always escalates: the entry
-        is held and the run pauses as ``stuck_repeat_error``."""
+        is held and the run pauses as ``stuck_repeat_error``. ``escalate``
+        holds the entry and pauses the run with ``reason`` whatever the
+        state's policy."""
         # The verify mark is oversight, not failure-policy bookkeeping: a
         # later foreach sibling can exit with a provisional answer AFTER
         # the entry already went terminal (a sibling failed it first), so
@@ -6483,7 +6785,7 @@ class FactoryExecutor:
             self._event(run, "needs_verify", node=state.state_id, entry=entry.index, detail=detail)
         if entry.status in TERMINAL_ENTRY_STATUSES:
             return  # the policy already ran for this entry
-        policy = "escalate" if stuck else state.spec.get("failure_policy", RUN_FAILURE_POLICY_DEFAULT)
+        policy = "escalate" if stuck or escalate else state.spec.get("failure_policy", RUN_FAILURE_POLICY_DEFAULT)
         entry.status = "error"
         entry.error = reason
         state.error = reason
@@ -7010,6 +7312,7 @@ class FactoryExecutor:
                     status=None if result is None else result.status,
                     settled=False if result is None else bool(result.settled),
                     answer=None if result is None else (result.answer_text or None),
+                    result_error=None if result is None else result.error,
                 )
             for state, entry, instance in python_calls:
                 if run.loop_generation != generation:

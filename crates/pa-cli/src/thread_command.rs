@@ -252,7 +252,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
                 command.arg("login");
                 command
             }
-            "prime" => bail!("Open Prime Agent and run /login to connect a Prime model provider"),
+            "prime" => bail!("Open radiata and run /login to connect a Prime model provider"),
             _ => bail!("Unknown provider {provider}"),
         };
         ensure!(login.status()?.success(), "{provider} login failed");
@@ -383,6 +383,8 @@ fn run_captain(args: &[&str]) -> Result<()> {
                 include_str!("captain_wake.py"),
                 "\n",
                 include_str!("captain_schedules.py"),
+                "\n",
+                include_str!("captain_router.py"),
                 "\n",
                 include_str!("captain_jobs.py"),
                 "\n",
