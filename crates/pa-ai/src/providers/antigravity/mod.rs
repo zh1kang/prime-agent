@@ -635,6 +635,101 @@ pub fn models() -> Vec<Model> {
     builtin_models()
 }
 
+/// Sign-in state reported by `<antigravity_bin> models`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AntigravityCliAuthStatus {
+    pub logged_in: bool,
+    pub model_count: usize,
+    pub detail: Option<String>,
+}
+
+/// Interpret `<antigravity_bin> models` output into an account status.
+#[must_use]
+pub fn parse_auth_models_status(
+    stdout: &str,
+    stderr: &str,
+    success: bool,
+) -> AntigravityCliAuthStatus {
+    let parsed = parse_models_output(stdout);
+    if success && !parsed.is_empty() {
+        return AntigravityCliAuthStatus {
+            logged_in: true,
+            model_count: parsed.len(),
+            detail: None,
+        };
+    }
+    let detail = stderr
+        .lines()
+        .chain(stdout.lines())
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.eq_ignore_ascii_case("fetching available models..."))
+        .map(str::to_string);
+    AntigravityCliAuthStatus {
+        logged_in: false,
+        model_count: 0,
+        detail,
+    }
+}
+
+/// Check whether the installed `agy` / `antigravity` CLI has an active Google session.
+///
+/// Reuses the warm process model cache unless `force` is true so `/login` stays fast.
+#[must_use]
+pub fn auth_status(force: bool) -> Option<AntigravityCliAuthStatus> {
+    let bin = antigravity_bin()?;
+    if !force {
+        if let Ok(guard) = model_cache().lock() {
+            if let Some((fetched_at, cached)) = guard.as_ref() {
+                if fetched_at.elapsed() < MODEL_CACHE_TTL && !cached.is_empty() {
+                    return Some(AntigravityCliAuthStatus {
+                        logged_in: true,
+                        model_count: cached.len(),
+                        detail: None,
+                    });
+                }
+            }
+        }
+    }
+    let mut child = std::process::Command::new(bin)
+        .arg("models")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Some(AntigravityCliAuthStatus {
+                    logged_in: false,
+                    model_count: 0,
+                    detail: Some("agy models timed out".to_string()),
+                });
+            }
+        }
+    }
+    let output = child.wait_with_output().ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let status = parse_auth_models_status(&stdout, &stderr, output.status.success());
+    if status.logged_in {
+        let parsed = parse_models_output(&stdout);
+        if !parsed.is_empty() {
+            if let Ok(mut guard) = model_cache().lock() {
+                *guard = Some((Instant::now(), parsed));
+            }
+        }
+    }
+    Some(status)
+}
+
 /// Query `<antigravity_bin> models` synchronously and refresh the process-wide cache.
 #[must_use]
 pub fn refresh_models(force: bool) -> Vec<Model> {
@@ -2641,5 +2736,29 @@ done
             "\n▸ view_file /a/b.rs\n"
         );
         assert_eq!(tool_progress_line("finish", &Value::Null), "\n▸ finish\n");
+    }
+
+    #[test]
+    fn parses_antigravity_auth_models_status() {
+        let ok = parse_auth_models_status(
+            "Fetching available models...\ngemini-4-neon-high\tGemini 4 Neon (High)\ngemini-4-neon-low\tGemini 4 Neon (Low)\n",
+            "",
+            true,
+        );
+        assert!(ok.logged_in);
+        assert_eq!(ok.model_count, 1);
+        assert_eq!(ok.detail, None);
+
+        let unauth = parse_auth_models_status(
+            "Fetching available models...\n",
+            "Not signed in. Run `agy` to sign in.\n",
+            false,
+        );
+        assert!(!unauth.logged_in);
+        assert_eq!(unauth.model_count, 0);
+        assert_eq!(
+            unauth.detail.as_deref(),
+            Some("Not signed in. Run `agy` to sign in.")
+        );
     }
 }

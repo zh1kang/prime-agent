@@ -177,6 +177,62 @@ async fn login_options_list_the_claude_account_and_api_key_rows() {
         .expect("the Anthropic API-key row renders");
     assert_eq!(api_key.name, "Anthropic");
     assert_eq!(api_key.flow, AuthFlow::ApiKeyPrompt);
+
+    let antigravity = rows
+        .iter()
+        .find(|row| row.id == "antigravity" && row.auth_type == AuthType::Oauth)
+        .expect("the Antigravity subscription row renders");
+    assert_eq!(antigravity.name, "Antigravity (Google Subscription)");
+    assert_eq!(antigravity.flow, AuthFlow::TerminalFlow);
+    assert!(antigravity.status.is_some());
+
+    let cursor = rows
+        .iter()
+        .find(|row| row.id == "cursor" && row.auth_type == AuthType::Oauth)
+        .expect("the Cursor account row renders");
+    assert_eq!(cursor.name, "Cursor (Cursor Account)");
+    assert_eq!(cursor.flow, AuthFlow::TerminalFlow);
+    assert!(cursor.status.is_some());
+}
+
+#[test]
+fn the_antigravity_and_cursor_statuses_follow_their_clis() {
+    use pa_ai::antigravity::AntigravityCliAuthStatus;
+    use pa_ai::cursor_cli::CursorCliAuthStatus;
+
+    let (status, configured) = antigravity_account_status(false, None);
+    assert_eq!(status.style, AuthStatusStyle::Muted);
+    assert_eq!(status.label, "install agy CLI");
+    assert!(!configured);
+
+    let (status, configured) = antigravity_account_status(
+        true,
+        Some(&AntigravityCliAuthStatus {
+            logged_in: true,
+            model_count: 6,
+            detail: None,
+        }),
+    );
+    assert_eq!(status.style, AuthStatusStyle::Success);
+    assert_eq!(status.label, "agy CLI (6 models)");
+    assert!(configured);
+
+    let (status, configured) = cursor_account_status(false, None);
+    assert_eq!(status.style, AuthStatusStyle::Muted);
+    assert_eq!(status.label, "install cursor-agent CLI");
+    assert!(!configured);
+
+    let (status, configured) = cursor_account_status(
+        true,
+        Some(&CursorCliAuthStatus {
+            logged_in: true,
+            account: Some("dev@example.com".to_string()),
+            team: Some("Acme".to_string()),
+        }),
+    );
+    assert_eq!(status.style, AuthStatusStyle::Success);
+    assert_eq!(status.label, "dev@example.com (Acme)");
+    assert!(configured);
 }
 
 #[test]

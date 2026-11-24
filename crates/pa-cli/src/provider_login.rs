@@ -71,6 +71,18 @@ const CLAUDE_ACCOUNT_ROW: (&str, &str) = (
     "Anthropic (Claude Account)",
 );
 
+/// The Antigravity subscription row: reuses the `agy` / `antigravity` CLI session.
+const ANTIGRAVITY_ACCOUNT_ROW: (&str, &str) = (
+    pa_ai::antigravity::ANTIGRAVITY_PROVIDER,
+    "Antigravity (Google Subscription)",
+);
+
+/// The Cursor subscription row: signs in through the `cursor-agent` CLI.
+const CURSOR_ACCOUNT_ROW: (&str, &str) = (
+    pa_ai::cursor_cli::CURSOR_PROVIDER,
+    "Cursor (Cursor Account)",
+);
+
 /// The display name of a provider id (else the id itself).
 fn display_name(provider_id: &str) -> String {
     BUILT_IN_PROVIDER_DISPLAY_NAMES
@@ -209,6 +221,118 @@ fn claude_account_row() -> ProviderRow {
     let installed = pa_ai::claude_cli::is_available();
     let auth_status = installed.then(pa_ai::claude_cli::auth_status).flatten();
     let (status, configured) = claude_account_status(installed, auth_status.as_ref());
+    ProviderRow {
+        id: id.to_string(),
+        name: name.to_string(),
+        auth_type: AuthType::Oauth,
+        status: Some(status),
+        flow: AuthFlow::TerminalFlow,
+        configured,
+        available: true,
+    }
+}
+
+/// The Antigravity row's status from the `agy` / `antigravity` CLI.
+fn antigravity_account_status(
+    cli_installed: bool,
+    status: Option<&pa_ai::antigravity::AntigravityCliAuthStatus>,
+) -> (AuthStatusIndicator, bool) {
+    if !cli_installed {
+        return (
+            AuthStatusIndicator {
+                style: AuthStatusStyle::Muted,
+                label: "install agy CLI".to_string(),
+            },
+            false,
+        );
+    }
+    match status {
+        Some(status) if status.logged_in => {
+            let label = if status.model_count > 0 {
+                format!("agy CLI ({} models)", status.model_count)
+            } else {
+                "agy CLI".to_string()
+            };
+            (
+                AuthStatusIndicator {
+                    style: AuthStatusStyle::Success,
+                    label,
+                },
+                true,
+            )
+        }
+        _ => (
+            AuthStatusIndicator {
+                style: AuthStatusStyle::Muted,
+                label: "unconfigured".to_string(),
+            },
+            false,
+        ),
+    }
+}
+
+fn antigravity_account_row() -> ProviderRow {
+    let (id, name) = ANTIGRAVITY_ACCOUNT_ROW;
+    let installed = pa_ai::antigravity::is_available();
+    let auth_status = installed
+        .then(|| pa_ai::antigravity::auth_status(false))
+        .flatten();
+    let (status, configured) = antigravity_account_status(installed, auth_status.as_ref());
+    ProviderRow {
+        id: id.to_string(),
+        name: name.to_string(),
+        auth_type: AuthType::Oauth,
+        status: Some(status),
+        flow: AuthFlow::TerminalFlow,
+        configured,
+        available: true,
+    }
+}
+
+/// The Cursor row's status from `cursor-agent status`.
+fn cursor_account_status(
+    cli_installed: bool,
+    status: Option<&pa_ai::cursor_cli::CursorCliAuthStatus>,
+) -> (AuthStatusIndicator, bool) {
+    if !cli_installed {
+        return (
+            AuthStatusIndicator {
+                style: AuthStatusStyle::Muted,
+                label: "install cursor-agent CLI".to_string(),
+            },
+            false,
+        );
+    }
+    match status {
+        Some(status) if status.logged_in => {
+            let account = status.account.as_deref().unwrap_or("signed in");
+            let label = match status.team.as_deref() {
+                Some(team) => format!("{account} ({team})"),
+                None => account.to_string(),
+            };
+            (
+                AuthStatusIndicator {
+                    style: AuthStatusStyle::Success,
+                    label,
+                },
+                true,
+            )
+        }
+        _ => (
+            AuthStatusIndicator {
+                style: AuthStatusStyle::Muted,
+                label: "unconfigured".to_string(),
+            },
+            false,
+        ),
+    }
+}
+
+fn cursor_account_row() -> ProviderRow {
+    let (id, name) = CURSOR_ACCOUNT_ROW;
+    let installed = pa_ai::cursor_cli::is_available();
+    let auth_status = installed.then(pa_ai::cursor_cli::auth_status).flatten();
+    let (status, configured) = cursor_account_status(installed, auth_status.as_ref());
     ProviderRow {
         id: id.to_string(),
         name: name.to_string(),
@@ -396,7 +520,20 @@ impl ProviderAuth {
                 });
             }
 
-            rows.push(claude_account_row());
+            // Probe CLI-backed subscription rows in parallel so `/login` stays snappy.
+            let (claude_row, antigravity_row, cursor_row) = std::thread::scope(|scope| {
+                let claude = scope.spawn(claude_account_row);
+                let antigravity = scope.spawn(antigravity_account_row);
+                let cursor = scope.spawn(cursor_account_row);
+                (
+                    claude.join().expect("claude account probe"),
+                    antigravity.join().expect("antigravity account probe"),
+                    cursor.join().expect("cursor account probe"),
+                )
+            });
+            rows.push(claude_row);
+            rows.push(antigravity_row);
+            rows.push(cursor_row);
 
             // The API-key model providers.
             let registry = ModelRegistry::create(
@@ -632,6 +769,18 @@ fn login_blocking_on_panel(
     {
         return claude_account_login(&agent_dir, &panel);
     }
+    // The Antigravity subscription verifies/guides the `agy` CLI session.
+    if provider_row.id == pa_ai::antigravity::ANTIGRAVITY_PROVIDER
+        && provider_row.auth_type == AuthType::Oauth
+    {
+        return antigravity_account_login(&panel);
+    }
+    // The Cursor subscription runs `cursor-agent login`.
+    if provider_row.id == pa_ai::cursor_cli::CURSOR_PROVIDER
+        && provider_row.auth_type == AuthType::Oauth
+    {
+        return cursor_account_login(&panel);
+    }
     // The GitHub Copilot login.
     if provider_row.id == pa_core::auth::GITHUB_COPILOT_PROVIDER_ID {
         return tokio::runtime::Builder::new_current_thread()
@@ -712,16 +861,116 @@ fn claude_account_login(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    let mut child = match cmd.spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            return ProviderAuthOutcome::Error(format!(
-                "Failed to start {} auth login: {error}",
-                bin.display()
+    let exit = match run_streaming_cli_login(
+        cmd,
+        panel,
+        "Running claude auth login. Finish the sign-in in your browser.",
+        &format!("{} auth login", bin.display()),
+    ) {
+        Ok(Some(exit)) => exit,
+        Ok(None) => return ProviderAuthOutcome::Cancelled,
+        Err(message) => return ProviderAuthOutcome::Error(message),
+    };
+
+    if pa_ai::claude_cli::auth_status().is_some_and(|status| status.logged_in) {
+        return finish_claude_account_login(agent_dir);
+    }
+    ProviderAuthOutcome::Error(if exit.success() {
+        "claude auth login finished, but claude auth status does not report a signed-in account."
+            .to_string()
+    } else {
+        format!("claude auth login failed ({exit}).")
+    })
+}
+
+/// Verifies the `agy` / `antigravity` CLI Google session (forcing a live `models` check).
+fn antigravity_account_login(
+    panel: &pa_tui::auth_panel::AuthPanelHandle,
+) -> ProviderAuthOutcome {
+    if !pa_ai::antigravity::is_available() {
+        return ProviderAuthOutcome::Error(
+            "Antigravity CLI (agy) is not installed. Install Antigravity CLI and try again."
+                .into(),
+        );
+    }
+    panel.progress_line("Checking Antigravity CLI (agy) account session...");
+    if let Some(status) = pa_ai::antigravity::auth_status(true) {
+        if status.logged_in {
+            return ProviderAuthOutcome::Status(format!(
+                "Signed in to Antigravity (agy CLI, {} models available). Antigravity models route through the agy CLI.",
+                status.model_count
             ));
         }
+        let extra = status
+            .detail
+            .map(|detail| format!(" ({detail})"))
+            .unwrap_or_default();
+        return ProviderAuthOutcome::Error(format!(
+            "Antigravity CLI (agy) is not signed in yet{extra}. Sign in via the Antigravity app or run `agy` in a terminal, then select this row again."
+        ));
+    }
+    ProviderAuthOutcome::Error(
+        "Could not query Antigravity CLI (agy). Ensure `agy` is signed in and try again.".into(),
+    )
+}
+
+/// Signs in with `cursor-agent login`.
+fn cursor_account_login(panel: &pa_tui::auth_panel::AuthPanelHandle) -> ProviderAuthOutcome {
+    let Some(bin) = pa_ai::cursor_cli::cursor_bin() else {
+        return ProviderAuthOutcome::Error(
+            "Cursor CLI (cursor-agent) is not installed. Install it from https://cursor.com/cli and try again."
+                .into(),
+        );
     };
-    panel.progress_line("Running claude auth login. Finish the sign-in in your browser.");
+    if let Some(status) = pa_ai::cursor_cli::auth_status().filter(|status| status.logged_in) {
+        let who = status.account.as_deref().unwrap_or("Cursor");
+        return ProviderAuthOutcome::Status(format!(
+            "Signed in to Cursor ({who}). Cursor models route through the cursor-agent CLI."
+        ));
+    }
+
+    let mut cmd = std::process::Command::new(&bin);
+    cmd.arg("login")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let exit = match run_streaming_cli_login(
+        cmd,
+        panel,
+        "Running cursor-agent login. Finish the sign-in in your browser.",
+        &format!("{} login", bin.display()),
+    ) {
+        Ok(Some(exit)) => exit,
+        Ok(None) => return ProviderAuthOutcome::Cancelled,
+        Err(message) => return ProviderAuthOutcome::Error(message),
+    };
+
+    if let Some(status) = pa_ai::cursor_cli::auth_status().filter(|status| status.logged_in) {
+        let who = status.account.as_deref().unwrap_or("Cursor");
+        return ProviderAuthOutcome::Status(format!(
+            "Signed in to Cursor ({who}). Cursor models route through the cursor-agent CLI."
+        ));
+    }
+    ProviderAuthOutcome::Error(if exit.success() {
+        "cursor-agent login finished, but cursor-agent status does not report a signed-in account."
+            .to_string()
+    } else {
+        format!("cursor-agent login failed ({exit}).")
+    })
+}
+
+/// Run a browser-login CLI subprocess while forwarding lines/URLs into the auth panel.
+/// Returns `Ok(None)` if cancelled by the user.
+fn run_streaming_cli_login(
+    mut cmd: std::process::Command,
+    panel: &pa_tui::auth_panel::AuthPanelHandle,
+    progress_banner: &str,
+    label: &str,
+) -> Result<Option<std::process::ExitStatus>, String> {
+    let mut child = cmd
+        .spawn()
+        .map_err(|error| format!("Failed to start {label}: {error}"))?;
+    panel.progress_line(progress_banner);
 
     let (lines_tx, lines_rx) = std::sync::mpsc::channel::<String>();
     let readers: Vec<_> = [
@@ -768,16 +1017,14 @@ fn claude_account_login(
         if panel.cancelled() {
             let _ = child.kill();
             let _ = child.wait();
-            return ProviderAuthOutcome::Cancelled;
+            return Ok(None);
         }
         match child.try_wait() {
             Ok(Some(exit)) => break exit,
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
             Err(error) => {
                 let _ = child.kill();
-                return ProviderAuthOutcome::Error(format!(
-                    "Failed waiting for claude auth login: {error}"
-                ));
+                return Err(format!("Failed waiting for {label}: {error}"));
             }
         }
     };
@@ -787,16 +1034,7 @@ fn claude_account_login(
     for line in lines_rx.try_iter() {
         forward(line);
     }
-
-    if pa_ai::claude_cli::auth_status().is_some_and(|status| status.logged_in) {
-        return finish_claude_account_login(agent_dir);
-    }
-    ProviderAuthOutcome::Error(if exit.success() {
-        "claude auth login finished, but claude auth status does not report a signed-in account."
-            .to_string()
-    } else {
-        format!("claude auth login failed ({exit}).")
-    })
+    Ok(Some(exit))
 }
 
 /// The first `http(s)://` URL in a CLI output line.

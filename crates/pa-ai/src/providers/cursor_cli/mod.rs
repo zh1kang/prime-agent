@@ -126,6 +126,95 @@ pub fn is_available() -> bool {
     cursor_bin().is_some()
 }
 
+/// Sign-in state reported by `cursor-agent status`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorCliAuthStatus {
+    pub logged_in: bool,
+    pub account: Option<String>,
+    pub team: Option<String>,
+}
+
+/// Parse `cursor-agent status` output (ANSI-stripped).
+#[must_use]
+pub fn parse_auth_status(raw: &str) -> Option<CursorCliAuthStatus> {
+    let cleaned = clean_output(raw);
+    let mut logged_in = false;
+    let mut account = None;
+    let mut team = None;
+    for line in cleaned.lines().map(str::trim) {
+        if line.is_empty() {
+            continue;
+        }
+        let lower = line.to_ascii_lowercase();
+        if let Some(idx) = lower.find("logged in as ") {
+            logged_in = true;
+            let rest = line[idx + "logged in as ".len()..].trim();
+            if !rest.is_empty() {
+                account = Some(rest.to_string());
+            }
+        } else if lower.contains("not logged in") {
+            return Some(CursorCliAuthStatus {
+                logged_in: false,
+                account: None,
+                team: None,
+            });
+        } else if let Some(rest) = line.strip_prefix("Team:").or_else(|| line.strip_prefix("team:")) {
+            let trimmed = rest.trim();
+            let name = trimmed
+                .split(" (id ")
+                .next()
+                .map(str::trim)
+                .unwrap_or(trimmed);
+            if !name.is_empty() {
+                team = Some(name.to_string());
+            }
+        }
+    }
+    if logged_in {
+        Some(CursorCliAuthStatus {
+            logged_in: true,
+            account,
+            team,
+        })
+    } else {
+        None
+    }
+}
+
+/// Query `cursor-agent status` synchronously with a short timeout.
+#[must_use]
+pub fn auth_status() -> Option<CursorCliAuthStatus> {
+    let bin = cursor_bin()?;
+    let mut child = std::process::Command::new(bin)
+        .arg("status")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let output = child.wait_with_output().ok()?;
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    parse_auth_status(&combined)
+}
+
 fn clean_output(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
@@ -1613,5 +1702,19 @@ claude-4.6-opus-max-thinking - Claude Opus 4.6 1M Max Thinking\n";
             &serde_json::json!({"inputTokens": 0, "outputTokens": 0}),
         );
         assert_eq!(empty.cost.total.as_f64(), 0.0);
+    }
+
+    #[test]
+    fn parses_cursor_cli_auth_status() {
+        let status = parse_auth_status("✓ Logged in as dev@example.com\nTeam: Acme Corp (id 12345)\n")
+            .expect("logged in status");
+        assert!(status.logged_in);
+        assert_eq!(status.account.as_deref(), Some("dev@example.com"));
+        assert_eq!(status.team.as_deref(), Some("Acme Corp"));
+
+        let out = parse_auth_status("Not logged in. Run `cursor-agent login`.\n")
+            .expect("logged out status");
+        assert!(!out.logged_in);
+        assert_eq!(out.account, None);
     }
 }
