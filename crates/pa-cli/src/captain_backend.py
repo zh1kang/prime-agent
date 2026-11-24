@@ -1894,16 +1894,36 @@ def _ranked_models(models):
     return sorted(ranked, key=lambda m: m not in FEATURED_MODELS)
 
 
-@functools.lru_cache(maxsize=1)
-def configured_models_summary():
-    """One line naming the models this user can run, a few per provider; empty when no
-    provider is configured. It sits in the cache-stable menus, so it must be deterministic."""
+MODEL_SUMMARY_CACHE_TTL = 3600.0
+
+
+def _file_mtime_ns(path):
+    try:
+        return Path(path).stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+def _model_summary_stamp():
+    return [
+        str(PA),
+        _file_mtime_ns(PA),
+        str(NATIVE),
+        _file_mtime_ns(NATIVE / "auth.json"),
+        _file_mtime_ns(NATIVE / "models.json"),
+        _file_mtime_ns(NATIVE / "settings.json"),
+    ]
+
+
+def _compute_configured_models_summary():
     groups = {}
     for provider, model in model_catalog():
         groups.setdefault(provider, []).append(model)
-    for provider, ids in (("antigravity", antigravity_models()), ("cursor", cursor_models())):
-        if ids and provider not in groups:
-            groups[provider] = [mid.removeprefix(provider + "/") for mid in ids]
+    for provider, loader in (("antigravity", antigravity_models), ("cursor", cursor_models)):
+        if provider not in groups:
+            ids = loader()
+            if ids:
+                groups[provider] = [mid.removeprefix(provider + "/") for mid in ids]
     parts = []
     for provider, models in groups.items():
         # Dated snapshots and -latest aliases repeat a base model already listed.
@@ -1916,6 +1936,33 @@ def configured_models_summary():
     if not parts:
         return ""
     return "Configured models (use only these, as provider/model): " + " | ".join(parts) + "\n"
+
+
+@functools.lru_cache(maxsize=1)
+def configured_models_summary():
+    """One line naming the models this user can run, a few per provider; empty when no
+    provider is configured. It sits in the cache-stable menus, so it must be deterministic.
+
+    Cached on disk per `(PA, NATIVE, auth/models/settings mtimes)` so Captain turns do not
+    block 2-5s running `pa model list` + provider CLI model probes on every prompt."""
+    cache_path = BASE / "model-summary-cache.json"
+    stamp = _model_summary_stamp()
+    now = time.time()
+    cached = read_json(cache_path)
+    if (
+        isinstance(cached, dict)
+        and cached.get("stamp") == stamp
+        and isinstance(cached.get("summary"), str)
+        and isinstance(cached.get("fetched_at"), (int, float))
+        and now - float(cached["fetched_at"]) <= MODEL_SUMMARY_CACHE_TTL
+    ):
+        return cached["summary"]
+    summary = _compute_configured_models_summary()
+    try:
+        write_json(cache_path, {"stamp": stamp, "fetched_at": now, "summary": summary})
+    except OSError:
+        pass
+    return summary
 
 
 @functools.lru_cache(maxsize=1)

@@ -378,6 +378,30 @@ class QuotaCacheTest(unittest.TestCase):
         self.assertIn("timed out", snapshot.error or "")
         self.assertEqual(snapshot.pools, {})
 
+    def test_stale_disk_cache_returns_immediately_without_blocking_codexbar(self) -> None:
+        root = TemporaryDirectory()
+        self.addCleanup(root.cleanup)
+        path = Path(root.name) / "router-quota-cache.json"
+        raw = json.dumps(
+            [{"provider": "claude", "rateWindowLabels": {"primary": "Session"}, "usage": {"primary": {"usedPercent": 42}}}]
+        )
+        path.write_text(json.dumps({"fetched_at": 1000.0, "raw": raw}), encoding="utf-8")
+        spawned: list[Path] = []
+        with patch.object(model_router, "_spawn_background_quota_refresh", side_effect=lambda p, _t: spawned.append(p)):
+            with patch.object(model_router, "_run_codexbar", side_effect=AssertionError("must not block")):
+                snap = load_quota_snapshot(now=5000.0, cache_path=path, ttl=60.0)
+        self.assertTrue(snap.stale)
+        self.assertAlmostEqual(snap.pools["claude"].used_percent, 42.0)
+        self.assertEqual(spawned, [path])
+
+        empty_path = Path(root.name) / "missing-cache.json"
+        spawned.clear()
+        with patch.object(model_router, "_spawn_background_quota_refresh", side_effect=lambda p, _t: spawned.append(p)):
+            with patch.object(model_router, "_run_codexbar", side_effect=AssertionError("must not block")):
+                cold = load_quota_snapshot(now=5000.0, cache_path=empty_path, ttl=60.0, allow_blocking=False)
+        self.assertEqual(cold.pools, {})
+        self.assertEqual(spawned, [empty_path])
+
 
 class BriefTest(unittest.TestCase):
     def test_brief_names_headroom_and_a_model_per_tier(self) -> None:
@@ -385,6 +409,7 @@ class BriefTest(unittest.TestCase):
         text = format_captain_router_brief(
             snapshot=snapshot,
             available=_providers("claude", "codex", "antigravity", "cursor"),
+            health={},
             now=NOW,
             spend_usd=12.5,
             input_tokens=1000,

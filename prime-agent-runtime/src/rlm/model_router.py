@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -1349,6 +1350,56 @@ def find_codexbar() -> Path | None:
 
 
 _MEMORY_QUOTA: dict[str, tuple[float, str]] = {}
+_BACKGROUND_REFRESH_GUARD_SECONDS = 30.0
+
+
+def _spawn_background_quota_refresh(path: Path, timeout: float) -> None:
+    """Refresh ``router-quota-cache.json`` in a detached subprocess so callers never stall."""
+
+    binary = find_codexbar()
+    if binary is None:
+        return
+    stamp = path.with_suffix(".refreshing")
+    now = time.time()
+    try:
+        if stamp.exists() and now - stamp.stat().st_mtime < _BACKGROUND_REFRESH_GUARD_SECONDS:
+            return
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.write_text(str(os.getpid()), encoding="utf-8")
+    except OSError:
+        return
+    script = (
+        "import json, os, pathlib, subprocess, sys, time\n"
+        "binary, out_path, stamp_path, timeout = sys.argv[1], pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3]), float(sys.argv[4])\n"
+        "try:\n"
+        "    res = subprocess.run([binary, 'usage', '--json-only'], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout, check=False)\n"
+        "    if res.stdout.strip():\n"
+        "        out_path.parent.mkdir(parents=True, exist_ok=True)\n"
+        "        tmp = out_path.with_name(f'.{out_path.name}.{os.getpid()}.tmp')\n"
+        "        tmp.write_text(json.dumps({'fetched_at': time.time(), 'raw': res.stdout}), encoding='utf-8')\n"
+        "        os.replace(tmp, out_path)\n"
+        "except Exception:\n"
+        "    pass\n"
+        "finally:\n"
+        "    try:\n"
+        "        stamp_path.unlink(missing_ok=True)\n"
+        "    except OSError:\n"
+        "        pass\n"
+    )
+    try:
+        subprocess.Popen(
+            [sys.executable, "-c", script, str(binary), str(path), str(stamp), str(timeout)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except OSError:
+        try:
+            stamp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def load_quota_snapshot(
@@ -1358,12 +1409,15 @@ def load_quota_snapshot(
     cache_path: Path | None = None,
     ttl: float = QUOTA_CACHE_TTL_SECONDS,
     timeout: float = QUOTA_FETCH_TIMEOUT_SECONDS,
+    allow_blocking: bool = True,
 ) -> QuotaSnapshot:
     """Load quota, from memory, then disk, then ``codexbar``.
 
-    A fresh cache returns without a subprocess. A stale cache is returned
-    when the refresh errors or times out (stale-while-error). The subprocess
-    timeout stays under three seconds so a spawn cannot stall on it.
+    A fresh cache returns without a subprocess. When a disk cache exists and
+    is stale (and no custom test ``runner`` is supplied), stale-while-revalidate
+    returns the cached snapshot immediately and refreshes ``codexbar`` in a
+    detached background subprocess so prompts and spawns never block for
+    seconds. ``allow_blocking=False`` also avoids blocking on a cold cache.
     ``PA_ROUTER_QUOTA_JSON`` short-circuits the CLI for tests and operators.
     """
 
@@ -1398,6 +1452,15 @@ def load_quota_snapshot(
     if disk_raw is not None and disk_at is not None and moment - disk_at <= ttl:
         _MEMORY_QUOTA[key] = (disk_at, disk_raw)
         return from_raw(disk_raw, disk_at, stale=False, error=None)
+
+    if runner is None and (disk_raw is not None and disk_at is not None):
+        _spawn_background_quota_refresh(path, timeout)
+        _MEMORY_QUOTA[key] = (disk_at, disk_raw)
+        return from_raw(disk_raw, disk_at, stale=True, error=None)
+
+    if runner is None and not allow_blocking:
+        _spawn_background_quota_refresh(path, timeout)
+        return QuotaSnapshot.empty(now=moment)
 
     def remember(raw: str, fetched_at: float) -> None:
         _MEMORY_QUOTA[key] = (fetched_at, raw)
@@ -1668,7 +1731,7 @@ def admission_decision(
     if router_disabled() or not is_recognized_model(pinned_model):
         return None
     explicit = router_explicit()
-    snapshot = load_quota_snapshot()
+    snapshot = load_quota_snapshot(allow_blocking=False)
     health = get_router().health
     if not explicit and attempt <= 1:
         if pool_is_hard_exhausted(pinned_model, snapshot=snapshot, health=health) is None:
@@ -1738,7 +1801,7 @@ def format_captain_router_brief(
     """Compact quota, spend, and per-tier recommendation for the Captain."""
 
     moment = time.time() if now is None else now
-    quota = snapshot if snapshot is not None else load_quota_snapshot(now=moment)
+    quota = snapshot if snapshot is not None else load_quota_snapshot(now=moment, allow_blocking=False)
     providers = available if available is not None else available_providers()
     scores = health if health is not None else get_router().health
     lines: list[str] = []
