@@ -244,6 +244,8 @@ async fn run_interactive_surface(
     // Background `pa thread captain` calls (the Captain panel and the breadcrumb) report here.
     let (captain_tx, mut captain_rx) =
         mpsc::unbounded_channel::<crate::session_ui::CaptainUpdate>();
+    // Background `/usage` loads (codexbar) report here.
+    let (usage_tx, mut usage_rx) = mpsc::unbounded_channel::<crate::session_ui::UsageUpdate>();
     // The double-Ctrl+C force-quit guard: the terminal reader observes the pair while this loop is
     // wedged in a daemon request; a std-thread watchdog enforces the exit deadline without the
     // runtime.
@@ -383,6 +385,7 @@ async fn run_interactive_surface(
                     let commands_tx = commands_tx.clone();
                     let page_tx = page_tx.clone();
                     let captain_tx = captain_tx.clone();
+                    let usage_tx = usage_tx.clone();
                     async move {
                         let (client, events) = match first {
                             Some(first) => first,
@@ -411,6 +414,7 @@ async fn run_interactive_surface(
                                 library: library_tx,
                                 commands: commands_tx,
                                 captain: captain_tx,
+                                usage: usage_tx,
                             },
                             page_tx,
                         )
@@ -1582,6 +1586,11 @@ async fn run_interactive_surface(
                 if let Some(update) = maybe_captain {
                     session.apply_captain_update(update, &mut view);
                     session.open_pending_captain_session(&mut view).await?;
+                }
+            }
+            maybe_usage = usage_rx.recv() => {
+                if let Some(update) = maybe_usage {
+                    session.apply_usage_update(update, &mut view);
                 }
             }
             maybe_library = library_rx.recv() => {

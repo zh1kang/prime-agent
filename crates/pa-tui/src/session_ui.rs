@@ -18,10 +18,12 @@ mod notes;
 mod panels;
 mod prompt;
 mod queue;
+mod router;
 mod sessions_fork;
 mod settings;
 mod share;
 mod stream;
+mod usage;
 mod window;
 mod workspace;
 pub(crate) use window::TranscriptPageNote;
@@ -57,6 +59,7 @@ pub(crate) use stream::resume_hint_from_stats;
 use stream::streaming_tray_hint;
 use stream::LoaderTokenTracker;
 use stream::SpeedStats;
+pub(crate) use usage::UsageUpdate;
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
@@ -118,9 +121,14 @@ const EXIT_DETACH_TIMEOUT_MS: u64 = 600;
 /// never able to hold the exit open.
 const EXIT_STATS_TIMEOUT_MS: u64 = 500;
 
-/// Ban-risk warning a completed Anthropic subscription login shows once
-/// per session; the settings toggle `warnings.anthropicExtraUsage` gates it.
-const ANTHROPIC_SUBSCRIPTION_AUTH_WARNING: &str = "Anthropic subscription auth is active. Usage draws from your plan limits, but Prime Agent identifies as Claude Code and this may violate Anthropic's terms — your account can be restricted or banned. An Anthropic API key avoids the risk. Manage usage at https://claude.ai/settings/usage.";
+/// Optimistic local user message + loader shown on the exact frame Enter is
+/// pressed so submits have zero perceived latency before the daemon round-trip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OptimisticUserEcho {
+    pub(crate) entry_index: usize,
+    pub(crate) text: String,
+    pub(crate) started_loader: bool,
+}
 
 /// A landed `get_commands` refresh: the session's `skill:` commands for
 /// the autocomplete provider; an older refresh never applies.
@@ -269,6 +277,10 @@ pub(crate) struct SessionUi {
     /// turn at the boundary; `one-at-a-time` one per turn (product default `all`).
     pub(crate) steering_mode: String,
     streaming_index: Option<usize>,
+    /// An optimistic user bubble + loader painted on the exact frame Enter was
+    /// pressed; reconciled in place when the daemon echoes `message_start`, or
+    /// popped if the submit is rejected.
+    optimistic_user_echo: Option<OptimisticUserEcho>,
     working_tokens: LoaderTokenTracker,
     /// The turn already surfaced its error (a failed assistant message or
     /// a retry-exhausted banner); the `turn_end` error stays silent then.
@@ -433,6 +445,15 @@ pub(crate) struct SessionUi {
     workspace_command: Option<(&'static str, String)>,
     /// Where background `pa thread captain` calls deliver (the run loop folds them in).
     captain_updates: mpsc::UnboundedSender<CaptainUpdate>,
+    /// Where background `/usage` loads deliver.
+    usage_updates: mpsc::UnboundedSender<UsageUpdate>,
+    /// The latest `/usage` report and when its usage list was fetched; costs fill in as
+    /// the running load streams them.
+    usage_cache: Option<(crate::usage_view::UsageReport, Instant)>,
+    /// The one running `/usage` load.
+    usage_fetch: Option<usage::UsageFetch>,
+    /// The last load's generation; steps from older loads are dropped.
+    usage_generation: u64,
     /// A Captain text step that owns the prompt editor's submit and Esc.
     captain_compose: Option<captain::CaptainCompose>,
     /// The Captain project this chat belongs to: the breadcrumb and the crew picker.

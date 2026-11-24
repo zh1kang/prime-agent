@@ -3,7 +3,7 @@
 
 use crate::width::str_width;
 use crate::{Line, Span};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use serde_json::Value;
 
 use crate::theme::{Theme, ThemeBg, ThemeColor};
@@ -527,7 +527,8 @@ pub fn truncate_path_middle(value: &str, width: usize) -> String {
     truncate_to_width(&candidate, width, "…")
 }
 
-/// The pinned top bar: chat name centered, spend beside it.
+/// The pinned top bar: chat/project name on the left, subtle rule across the
+/// middle, and total spend on the right.
 pub fn render_top_bar(state: &ChromeState, theme: &Theme, width: usize) -> Line {
     let name = state
         .chat_name
@@ -537,19 +538,61 @@ pub fn render_top_bar(state: &ChromeState, theme: &Theme, width: usize) -> Line 
         .replace(char::is_whitespace, " ")
         .trim()
         .to_string();
-    if name.is_empty() {
+    if name.is_empty() || width == 0 {
         return Vec::new();
     }
+    let padding_x = usize::from(width > 2);
+    let inner = width.saturating_sub(padding_x * 2);
+    if inner == 0 {
+        return Vec::new();
+    }
+    let text = theme
+        .fg_style(ThemeColor::Text)
+        .add_modifier(Modifier::BOLD);
+    let muted = theme.fg_style(ThemeColor::Muted);
+    let rule_style = theme.fg_style(ThemeColor::BorderMuted);
+    let cost_label = state
+        .cost_usd
+        .filter(|cost| cost.is_finite() && *cost >= 0.0)
+        .map(|cost| format!("${cost:.2}"))
+        .filter(|label| str_width(label) + 2 <= inner);
+
+    let name_budget = match &cost_label {
+        Some(cost) => inner.saturating_sub(str_width(cost) + 1),
+        None => inner,
+    };
+    let name = truncate_to_width(&name, name_budget, "…");
+    let name_w = str_width(&name);
+    let cost_w = cost_label.as_ref().map_or(0, |c| str_width(c));
+    let gap = inner.saturating_sub(name_w + cost_w);
+
     let mut line: Line = Vec::new();
-    let name_width = str_width(&name);
-    let text = theme.fg_style(ThemeColor::Text);
-    let dim = theme.fg_style(ThemeColor::Dim);
-    let start = (width.saturating_sub(name_width)) / 2;
-    line.push(Span::styled(" ".repeat(start), Style::default()));
+    if padding_x > 0 {
+        line.push(Span::raw(" ".repeat(padding_x)));
+    }
     line.push(Span::styled(name, text));
-    if let Some(cost) = state.cost_usd.filter(|cost| *cost >= 0.0) {
-        line.push(Span::styled("  ".to_string(), Style::default()));
-        line.push(Span::styled(format!("${cost:.2}"), dim));
+    match cost_label {
+        Some(cost) => {
+            if gap >= 3 {
+                line.push(Span::raw(" "));
+                line.push(Span::styled("─".repeat(gap - 2), rule_style));
+                line.push(Span::raw(" "));
+            } else if gap > 0 {
+                line.push(Span::raw(" ".repeat(gap)));
+            }
+            line.push(Span::styled(cost, muted));
+        }
+        None => {
+            if gap >= 2 {
+                line.push(Span::raw(" "));
+                line.push(Span::styled("─".repeat(gap - 1), rule_style));
+            } else if gap > 0 {
+                line.push(Span::raw(" ".repeat(gap)));
+            }
+        }
+    }
+    if padding_x > 0 {
+        line.push(Span::raw(" ".repeat(padding_x)));
     }
     line
 }

@@ -300,7 +300,8 @@ impl SessionUi {
                 );
                 self.apply_auth_outcome(outcome, &provider, view).await;
                 if completed {
-                    self.maybe_warn_anthropic_subscription_auth(&provider, view);
+                    self.maybe_warn_anthropic_subscription_auth(&provider, view)
+                        .await;
                 }
             }
             AuthPanelRequest::McpSettled { note } => {

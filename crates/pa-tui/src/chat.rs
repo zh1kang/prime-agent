@@ -3,7 +3,9 @@
 //! working loader line. Tool-call cards live in `crate::tool_card`.
 
 mod geometry;
+mod thinking;
 pub(crate) use geometry::{assistant_row_count, user_block_row_count};
+pub(crate) use thinking::format_thinking_for_detail;
 
 use crate::snapshot::RetryStartReason;
 use crate::theme::{Theme, ThemeBg, ThemeColor};
@@ -14,9 +16,11 @@ use ratatui::style::Style;
 /// How much detail the conversation shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Detail {
-    /// `overview`: thinking hidden, tool output and edit diffs collapsed.
+    /// `overview`: thinking hidden except its tool-marker lines, tool output and edit diffs
+    /// collapsed.
     Overview,
-    /// `details`: thinking visible, edit diffs expanded, tool output collapsed.
+    /// `details`: thinking condensed to tool markers and one-line prose summaries, edit diffs
+    /// expanded, tool output collapsed.
     Details,
     /// `all`: thinking visible, edit diffs and tool output expanded.
     All,
@@ -168,11 +172,18 @@ impl AssistantMessage {
     /// messages, and messages not following tool activity.
     #[must_use]
     pub fn has_trailing_space(&self, detail: Detail, preceded_by_tool_activity: bool) -> bool {
-        let has_visible_content = self.blocks.iter().any(|block| match block {
-            MessageBlock::Thinking(text) => detail.show_thinking() && !text.trim().is_empty(),
+        self.has_tool_calls
+            && (self.has_visible_body(detail) || self.aborted || !preceded_by_tool_activity)
+    }
+
+    /// Whether any block renders at `detail` (the non-allocating twin of
+    /// the render path's visible-block filter).
+    #[must_use]
+    pub fn has_visible_body(&self, detail: Detail) -> bool {
+        self.blocks.iter().any(|block| match block {
+            MessageBlock::Thinking(text) => thinking::thinking_is_visible(text, detail),
             MessageBlock::Text(text) => !text.trim().is_empty(),
-        });
-        self.has_tool_calls && (has_visible_content || self.aborted || !preceded_by_tool_activity)
+        })
     }
 }
 
@@ -421,10 +432,10 @@ pub(crate) fn render_assistant_with_style(
     }
     for (index, block) in visible_blocks.iter().enumerate() {
         match block {
-            MessageBlock::Text(text) => {
+            geometry::VisibleBlock::Text(text) => {
                 out.extend(render_markdown_block(text, md, width, cache));
             }
-            MessageBlock::Thinking(text) => {
+            geometry::VisibleBlock::Thinking(text) => {
                 out.extend(render_thinking_block(text, theme, md, width, cache));
                 // Thinking adds spacing only when another visible block follows.
                 if index + 1 < visible_blocks.len() {

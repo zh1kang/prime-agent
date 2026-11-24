@@ -64,11 +64,15 @@ pub(crate) struct CaptainProject {
     pub unread_count: i64,
     /// Recent user notifications, newest first.
     pub notifications: Vec<CaptainNotification>,
-    /// The unread ones, from a backend that lists only those.
+    /// The unread ones, from a backend that lists only those (ignored when the backend sends an integer count).
+    #[serde(default, deserialize_with = "deserialize_unread_notifications")]
     pub unread_notifications: Vec<CaptainNotification>,
     pub usage: Usage,
+    #[serde(default)]
+    pub session_costs: std::collections::HashMap<String, f64>,
     pub budget: Budget,
     /// Per-event wake policy (`react`, `context`, or `ignore`) and `debounce_seconds`.
+    #[serde(default, deserialize_with = "deserialize_wake_policy")]
     pub wake_policy: serde_json::Map<String, Value>,
     pub schedules: Vec<CaptainSchedule>,
     pub decisions: Vec<Decision>,
@@ -168,9 +172,41 @@ impl<'de> serde::Deserialize<'de> for DriveListing {
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub(crate) struct PrStatus {
+    #[serde(default, deserialize_with = "null_as_empty")]
     pub state: String,
+    #[serde(default, deserialize_with = "null_as_empty")]
     pub checks: String,
+    #[serde(default, deserialize_with = "null_as_empty")]
     pub review_decision: String,
+}
+
+fn null_as_empty<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn deserialize_wake_policy<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<serde_json::Map<String, Value>, D::Error> {
+    match Option::<Value>::deserialize(deserializer)? {
+        Some(Value::Object(map)) => Ok(map),
+        Some(Value::String(raw)) => {
+            Ok(serde_json::from_str::<serde_json::Map<String, Value>>(&raw).unwrap_or_default())
+        }
+        _ => Ok(serde_json::Map::new()),
+    }
+}
+
+fn deserialize_unread_notifications<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<CaptainNotification>, D::Error> {
+    match Option::<Value>::deserialize(deserializer)? {
+        Some(Value::Array(items)) => items
+            .into_iter()
+            .map(serde_json::from_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(serde::de::Error::custom),
+        _ => Ok(Vec::new()),
+    }
 }
 
 /// `84k` for a token count.
@@ -486,6 +522,7 @@ pub(crate) struct CaptainMember {
     pub host_session: Option<String>,
     pub run_id: Option<String>,
     /// The human name, such as `eigen-pipeline · Phase 2 classical baselines`.
+    #[serde(default, deserialize_with = "null_as_empty")]
     pub display_name: String,
     pub unread: bool,
     pub unread_count: i64,
@@ -496,9 +533,12 @@ pub(crate) struct CaptainMember {
     pub step_agents: Vec<StepAgent>,
     pub usage: Usage,
     /// The member whose branch this one stacks on.
+    #[serde(default, deserialize_with = "null_as_empty")]
     pub depends_on: String,
     /// The place in its stack, such as `2/3`.
+    #[serde(default, deserialize_with = "null_as_empty")]
     pub stack_position: String,
+    #[serde(default, deserialize_with = "null_as_empty")]
     pub pr_url: String,
     pub pr_number: Option<u64>,
     pub pr_status: Option<PrStatus>,
@@ -509,15 +549,24 @@ pub(crate) struct CaptainMember {
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub(crate) struct StepAgent {
+    #[serde(default, deserialize_with = "null_as_empty")]
     pub state: String,
+    #[serde(default, deserialize_with = "null_as_empty")]
     pub role: String,
+    #[serde(default, deserialize_with = "null_as_empty")]
     pub model: String,
+    #[serde(default, deserialize_with = "null_as_empty")]
     pub thinking: String,
     /// running, queued, waiting, paused, error, failed, or done.
+    #[serde(default, deserialize_with = "null_as_empty")]
     pub status: String,
+    #[serde(default, deserialize_with = "null_as_empty")]
     pub child_id: String,
+    #[serde(default, deserialize_with = "null_as_empty")]
     pub child_name: String,
+    #[serde(default, deserialize_with = "null_as_empty")]
     pub session: String,
+    #[serde(default, deserialize_with = "null_as_empty")]
     pub session_id: String,
     pub attempt: Option<i64>,
     pub duration_ms: Option<f64>,
@@ -720,6 +769,30 @@ impl CaptainProject {
         self.display_state() == "active"
     }
 
+    /// Running lead and crew turns or runs that stop before an archive or delete settles.
+    fn running_work(&self) -> usize {
+        usize::from(self.lead_busy)
+            + self
+                .crew
+                .iter()
+                .filter(|m| m.busy || m.state == "running")
+                .count()
+    }
+
+    /// What reopens this Captain for new work.
+    fn reopen_verb(&self) -> &'static str {
+        if self.is_archived() {
+            "Unarchive"
+        } else {
+            "Resume"
+        }
+    }
+
+    /// An archived Captain keeps its rows but no longer owns its checkout.
+    fn is_archived(&self) -> bool {
+        self.state == "archived"
+    }
+
     fn counts(&self) -> (usize, usize, usize) {
         let needs = self.needs_items().len();
         let mut running = usize::from(self.lead_state == "running");
@@ -812,6 +885,8 @@ impl CaptainProject {
     fn summary_state(&self) -> &'static str {
         match self.display_state() {
             "paused" => return "paused",
+            "archived" => return "archived",
+            "archiving" => return "archiving",
             "stopping" | "deleting" => return "stopping",
             _ => {}
         }
@@ -893,10 +968,10 @@ impl CaptainProject {
         }
     }
 
-    /// Unread crew updates and notifications, for the Overview header badge.
-    fn unread_total(&self) -> usize {
-        let notes = self.inbox().iter().filter(|n| n.is_unread()).count();
-        usize::try_from(self.unread_count).unwrap_or(0).max(notes)
+    /// Unread Inbox notifications. Unread crew reports are marked on their own rows,
+    /// so the Overview badge counts only what `i` opens.
+    fn inbox_unread_count(&self) -> usize {
+        self.inbox().iter().filter(|n| n.is_unread()).count()
     }
 }
 
@@ -2113,6 +2188,12 @@ enum Confirm {
         project: String,
         name: String,
     },
+    /// Archive a Captain that has running work; an idle one archives without asking.
+    Archive {
+        project: String,
+        name: String,
+        running: usize,
+    },
     Delete {
         project: String,
         name: String,
@@ -2245,6 +2326,7 @@ pub(crate) struct CaptainView {
     factory: usize,
     /// One request id per Factories tab visit, so repeated design presses dedupe.
     design_request: String,
+    /// List archived crew threads and archived Captains (`H`).
     show_archived: bool,
     help: bool,
     mode: Mode,
@@ -2316,11 +2398,27 @@ fn status_glyph(state: &str) -> (&'static str, ThemeColor) {
     }
 }
 
+fn archive_action(project: &str) -> CaptainAction {
+    CaptainAction::Act {
+        op: "archive-project".into(),
+        args: json!({"project": project}),
+        done: "Captain archived. H shows archived Captains.".into(),
+    }
+}
+
+fn unarchive_action(project: &str) -> CaptainAction {
+    CaptainAction::Act {
+        op: "unarchive-project".into(),
+        args: json!({"project": project}),
+        done: "Captain unarchived.".into(),
+    }
+}
+
 fn summary_color(state: &str) -> ThemeColor {
     match state {
         "needs you" => ThemeColor::Warning,
         "running" => ThemeColor::Accent,
-        "paused" | "stopping" => ThemeColor::Error,
+        "paused" | "stopping" | "archiving" => ThemeColor::Error,
         _ => ThemeColor::Dim,
     }
 }
@@ -2442,7 +2540,7 @@ impl CaptainView {
                     self.snapshot
                         .projects
                         .iter()
-                        .position(|p| &p.root == here)
+                        .position(|p| &p.root == here && !p.is_archived())
                         .or_else(|| {
                             let current = self.snapshot.current.as_ref()?;
                             self.snapshot.projects.iter().position(|p| &p.id == current)
@@ -2454,6 +2552,7 @@ impl CaptainView {
                 self.project = target
                     .unwrap_or(self.project)
                     .min(self.snapshot.projects.len().saturating_sub(1));
+                self.clamp_project();
                 if let Some(key) = selected_entry {
                     if let Some(index) = self.entries().iter().position(|e| e.key() == key) {
                         self.member = index;
@@ -2492,6 +2591,9 @@ impl CaptainView {
                 .position(|p| p.name.to_lowercase().contains(&term))
         });
         if let Some(index) = found {
+            if self.snapshot.projects[index].is_archived() {
+                self.show_archived = true;
+            }
             self.project = index;
             self.focus = Focus::Projects;
             self.clamp_member();
@@ -2503,8 +2605,44 @@ impl CaptainView {
         &self.snapshot
     }
 
+    /// The selected project; a hidden archived Captain is not selectable.
     pub(crate) fn selected_project(&self) -> Option<&CaptainProject> {
-        self.snapshot.projects.get(self.project)
+        self.snapshot
+            .projects
+            .get(self.project)
+            .filter(|p| self.show_archived || !p.is_archived())
+    }
+
+    /// The rail's projects as snapshot indexes: live Captains, then archived ones when shown.
+    fn visible_projects(&self) -> Vec<usize> {
+        let projects = &self.snapshot.projects;
+        let live = (0..projects.len()).filter(|&i| !projects[i].is_archived());
+        let archived = (0..projects.len()).filter(|&i| projects[i].is_archived());
+        if self.show_archived {
+            live.chain(archived).collect()
+        } else {
+            live.collect()
+        }
+    }
+
+    fn archived_project_count(&self) -> usize {
+        self.snapshot
+            .projects
+            .iter()
+            .filter(|p| p.is_archived())
+            .count()
+    }
+
+    /// Keep the selection on a listed project: a hidden one moves to the first listed.
+    fn clamp_project(&mut self) {
+        let visible = self.visible_projects();
+        if !visible.contains(&self.project) {
+            if let Some(&first) = visible.first() {
+                self.project = first;
+            }
+            self.member = 0;
+        }
+        self.clamp_member();
     }
 
     /// The Overview's selectable rows: the first needs-you items, then the crew.
@@ -2593,7 +2731,7 @@ impl CaptainView {
                 .snapshot
                 .projects
                 .iter()
-                .any(|p| &p.root == here && p.state != "deleting")
+                .any(|p| &p.root == here && !matches!(p.state.as_str(), "deleting" | "archived"))
     }
 
     /// Point the panel at another draft directory (tests, or a custom hub).
@@ -3550,6 +3688,11 @@ impl CaptainView {
             self.move_selection(1);
             return CaptainAction::None;
         }
+        if matches!(key, "H" | "shift+h") {
+            self.show_archived = !self.show_archived;
+            self.clamp_project();
+            return CaptainAction::None;
+        }
         let Some(project) = self.selected_project().cloned() else {
             if key == "f" {
                 return CaptainAction::Act {
@@ -3576,9 +3719,21 @@ impl CaptainView {
                     self.notice = Some("Archive applies to crew threads.".into());
                     CaptainAction::None
                 }
+                None if project.is_archived() => unarchive_action(&pid),
+                None if matches!(project.display_state(), "active" | "paused" | "stopping") => {
+                    let running = project.running_work();
+                    if running == 0 {
+                        return archive_action(&pid);
+                    }
+                    self.mode = Mode::Confirm(Confirm::Archive {
+                        project: pid,
+                        name: project.name.clone(),
+                        running,
+                    });
+                    CaptainAction::None
+                }
                 None => {
-                    self.show_archived = !self.show_archived;
-                    self.clamp_member();
+                    self.notice = Some(format!("This Captain is {}.", project.display_state()));
                     CaptainAction::None
                 }
             },
@@ -3593,18 +3748,14 @@ impl CaptainView {
                 });
                 CaptainAction::None
             }
+            "R" if project.is_archived() => unarchive_action(&pid),
             "R" => CaptainAction::Act {
                 op: "resume".into(),
                 args: json!({"project": pid}),
                 done: "Captain resumed.".into(),
             },
             "D" => {
-                let running = usize::from(project.lead_busy)
-                    + project
-                        .crew
-                        .iter()
-                        .filter(|m| m.busy || m.state == "running")
-                        .count();
+                let running = project.running_work();
                 self.mode = Mode::Confirm(Confirm::Delete {
                     project: pid,
                     name: project.name.clone(),
@@ -3640,7 +3791,10 @@ impl CaptainView {
             }
             "d" => {
                 if !project.is_active() {
-                    self.notice = Some("Resume this Captain to assign work.".into());
+                    self.notice = Some(format!(
+                        "{} this Captain to assign work.",
+                        project.reopen_verb()
+                    ));
                     return CaptainAction::None;
                 }
                 self.mode = Mode::Pick(Picker::new(
@@ -3693,7 +3847,10 @@ impl CaptainView {
                 }
                 _ => {
                     if !project.is_active() {
-                        self.notice = Some("Resume this Captain to send messages.".into());
+                        self.notice = Some(format!(
+                            "{} this Captain to send messages.",
+                            project.reopen_verb()
+                        ));
                         return CaptainAction::None;
                     }
                     let to = member
@@ -4306,12 +4463,13 @@ impl CaptainView {
     fn move_selection(&mut self, delta: isize) {
         match self.focus {
             Focus::Projects => {
-                let count = self.snapshot.projects.len();
-                if count == 0 {
+                let visible = self.visible_projects();
+                if visible.is_empty() {
                     return;
                 }
-                self.project =
-                    (self.project as isize + delta).clamp(0, count as isize - 1) as usize;
+                let at = visible.iter().position(|&i| i == self.project).unwrap_or(0);
+                let at = (at as isize + delta).clamp(0, visible.len() as isize - 1) as usize;
+                self.project = visible[at];
                 self.member = 0;
                 self.digest_scroll = 0;
                 self.drive = 0;
@@ -4750,6 +4908,7 @@ impl CaptainView {
                 args: json!({"project": project}),
                 done: "Captain stopped. Press R to resume.".into(),
             },
+            Confirm::Archive { project, .. } => archive_action(&project),
             Confirm::Delete { project, .. } => CaptainAction::Act {
                 op: "delete".into(),
                 args: json!({"project": project}),
@@ -5625,11 +5784,15 @@ impl CaptainView {
         let muted = |t: &str| theme.fg_span(ThemeColor::Muted, t.to_string());
         // Header: title, project counts, this checkout.
         let projects = &self.snapshot.projects;
+        let archived = self.archived_project_count();
+        let live = projects.len() - archived;
         let mut summary = vec![format!(
-            "{} project{}",
-            projects.len(),
-            if projects.len() == 1 { "" } else { "s" }
+            "{live} project{}",
+            if live == 1 { "" } else { "s" }
         )];
+        if archived > 0 {
+            summary.push(format!("{archived} archived"));
+        }
         for state in ["needs you", "running", "paused"] {
             let count = projects
                 .iter()
@@ -5828,26 +5991,43 @@ impl CaptainView {
     }
 
     fn render_rail(&self, theme: &Theme, width: usize, rows: usize) -> Vec<Line> {
+        let archived = self.archived_project_count();
         let mut out: Vec<Line> = vec![vec![
             Span::raw("   "),
             theme.fg_span(ThemeColor::Dim, "projects"),
         ]];
         let projects = &self.snapshot.projects;
-        if projects.is_empty() {
+        let visible = self.visible_projects();
+        // Hidden archived Captains leave one hint row at the bottom.
+        let hint = (archived > 0 && !self.show_archived).then(|| {
+            vec![
+                Span::raw("   "),
+                theme.fg_span(ThemeColor::Dim, format!("{archived} archived · H show")),
+            ]
+        });
+        if visible.is_empty() {
+            let empty = if archived > 0 {
+                "No active projects"
+            } else {
+                "No projects yet"
+            };
             for text in [
                 "",
-                "No projects yet",
+                empty,
                 "n  set up a Captain",
                 "p  promote this chat",
                 "f  open factory",
             ] {
                 out.push(vec![Span::raw("   "), theme.fg_span(ThemeColor::Dim, text)]);
             }
+            out.extend(hint);
             return out;
         }
-        let slots = (rows.saturating_sub(1) / 2).max(1);
-        let top = self.project.saturating_sub(slots - 1);
-        for (index, project) in projects.iter().enumerate().skip(top).take(slots) {
+        let slots = (rows.saturating_sub(1 + usize::from(hint.is_some())) / 2).max(1);
+        let at = visible.iter().position(|&i| i == self.project).unwrap_or(0);
+        let top = at.saturating_sub(slots - 1);
+        for &index in visible.iter().skip(top).take(slots) {
+            let project = &projects[index];
             let selected = index == self.project;
             let state = project.summary_state();
             let (needs, running, done) = project.counts();
@@ -5893,6 +6073,7 @@ impl CaptainView {
                 theme.fg_span(summary_color(state), format!("{state}{here}")),
             ]);
         }
+        out.extend(hint);
         out
     }
 
@@ -5947,8 +6128,12 @@ impl CaptainView {
         let mut title = vec![
             theme.bold(theme.fg_span(ThemeColor::Text, clean(&project.name))),
             Span::raw("  "),
-            theme.fg_span(ThemeColor::MdLink, project.model_label()),
         ];
+        if project.is_archived() {
+            title.push(dim("archived".into()));
+            title.push(Span::raw("  "));
+        }
+        title.push(theme.fg_span(ThemeColor::MdLink, project.model_label()));
         if let Some(spend) = project.spend_label() {
             title.push(Span::raw("  "));
             title.push(if project.budget.exceeded {
@@ -5971,6 +6156,10 @@ impl CaptainView {
             lead.push(theme.fg_span(
                 color,
                 format!("captain  {glyph} {}", project.lead_state.replace('_', " ")),
+            ));
+        } else if project.is_archived() {
+            lead.push(dim(
+                "Archived Captain. Press A or R to unarchive before sending new work.".into(),
             ));
         } else {
             lead.push(theme.bold(theme.fg_span(
@@ -6003,10 +6192,10 @@ impl CaptainView {
         rows: usize,
     ) -> Vec<Line> {
         let mut out = Self::project_header(theme, width, project);
-        let unread = project.unread_total();
-        if unread > 0 {
+        let inbox_unread = project.inbox_unread_count();
+        if inbox_unread > 0 {
             out.push(vec![
-                theme.bold(theme.fg_span(ThemeColor::Accent, format!("•{unread} unread"))),
+                theme.bold(theme.fg_span(ThemeColor::Accent, format!("•{inbox_unread} unread"))),
                 theme.fg_span(ThemeColor::Dim, "  i inbox"),
             ]);
         }
@@ -6293,7 +6482,7 @@ impl CaptainView {
         }
         let archived = project.archived_count();
         if archived > 0 && !self.show_archived {
-            body.push((vec![dim(format!("{archived} archived · A show"))], false));
+            body.push((vec![dim(format!("{archived} archived · H show"))], false));
         }
         body
     }
@@ -6674,7 +6863,8 @@ impl CaptainView {
             "S schedules (specialists when none): Space pause · x delete",
             "w wake policies · Decision: 1-6 pick · m reply · Budget: b +$5 · c clear",
             "Drive: e edit · h history · r restore · reports/ and handoffs/ preview",
-            "s stop · R resume · D delete",
+            "s stop · R resume · A archive or unarchive · D delete",
+            "H show or hide archived crew threads and Captains",
             "In a Captain chat: F7 switch chat · F8/Shift+F8 next/previous · Shift+F7 captain",
             "r refresh · ? close help · Esc close",
         ];
@@ -6763,6 +6953,15 @@ impl CaptainView {
                     "Running crew turns and Captain-started factory runs stop.".into(),
                     "No new turns start, including digest wakeups, until you resume.".into(),
                     "Threads, transcripts, and worktrees stay.".into(),
+                ],
+            ),
+            Confirm::Archive { name, running, .. } => (
+                format!("archive the Captain of {name}?"),
+                vec![
+                    format!("{running} running turn(s) or run(s) stop first."),
+                    "The Captain leaves the project list. H shows archived Captains.".into(),
+                    "A new Captain can start in this repository.".into(),
+                    "A or R unarchives it. Threads, transcripts, and worktrees stay.".into(),
                 ],
             ),
             Confirm::Delete {

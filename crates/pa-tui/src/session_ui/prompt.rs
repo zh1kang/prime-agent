@@ -686,6 +686,9 @@ impl SessionUi {
                 .collect();
         self.input_submission_generation += 1;
         let generation = self.input_submission_generation;
+        if !self.turn_active && self.prompt_in_flight == 0 {
+            self.show_optimistic_submit(text, view);
+        }
         let stash_to_restore = self
             .prompt_stash
             .lock()
@@ -885,7 +888,9 @@ impl SessionUi {
                 // settling a queued later prompt.
                 if self.turn_ends_seen < note.expected_turn_end {
                     self.turn_active = true;
-                    self.start_loader(view);
+                    if view.working.is_none() {
+                        self.start_loader(view);
+                    }
                     self.dirty = true;
                 }
                 // TS `onSubmit`'s finally: the current submit's admitted prompt
@@ -974,6 +979,7 @@ impl SessionUi {
                 if crate::daemon_client::is_daemon_rejection(&error)
                     || crate::daemon_client::is_daemon_unreachable(&error)
                 {
+                    self.rollback_optimistic_submit(view);
                     // The daemon answered with a refusal for THIS request, or the connection
                     // refused the send (nothing reached the daemon): the error row surfaces it and
                     // the draft returns to the editor; a failed prompt never exits the UI.
@@ -987,9 +993,55 @@ impl SessionUi {
                     );
                     return Ok(());
                 }
+                self.rollback_optimistic_submit(view);
                 Err(error)
             }
         }
+    }
+
+    /// Paint the user's submitted prompt and working spinner immediately on the
+    /// Enter frame so idle submits have zero perceived latency before the daemon
+    /// or Captain worker round-trips.
+    pub(super) fn show_optimistic_submit(&mut self, text: &str, view: &mut AgentView) {
+        if self.optimistic_user_echo.is_some()
+            || view.working.is_some()
+            || text.trim().is_empty()
+            || text.trim_start().starts_with('/')
+        {
+            return;
+        }
+        view.push_entry(crate::chat::ChatEntry::User {
+            text: text.to_string(),
+        });
+        let entry_index = view.chat_len().saturating_sub(1);
+        self.start_loader(view);
+        self.optimistic_user_echo = Some(super::OptimisticUserEcho {
+            entry_index,
+            text: text.to_string(),
+            started_loader: true,
+        });
+        self.dirty = true;
+    }
+
+    /// Remove an unacknowledged optimistic user bubble and loader when a submit
+    /// is definitively rejected before reaching the daemon.
+    pub(super) fn rollback_optimistic_submit(&mut self, view: &mut AgentView) {
+        let Some(echo) = self.optimistic_user_echo.take() else {
+            return;
+        };
+        if echo.entry_index + 1 == view.chat_len()
+            && matches!(
+                view.chat.get(echo.entry_index),
+                Some(crate::chat::ChatEntry::User { text }) if text == &echo.text
+            )
+        {
+            let _ = view.pop_chat_entry();
+        }
+        if echo.started_loader && !self.turn_active {
+            view.working = None;
+            view.working_since = None;
+        }
+        self.dirty = true;
     }
 
     /// Retain a refused prompt's draft: the empty editor under the submit's own session and

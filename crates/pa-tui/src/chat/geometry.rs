@@ -1,9 +1,10 @@
 //! Shared chat framing decisions and count-only geometry.
-use super::{AssistantMessage, Detail, MessageBlock};
+use super::{format_thinking_for_detail, AssistantMessage, Detail, MessageBlock};
 use crate::markdown::{
     markdown_row_count, markdown_row_count_tagged, MarkdownBlockCache, MarkdownStyle,
 };
 use crate::theme::{Theme, ThemeColor};
+use std::borrow::Cow;
 
 pub(super) fn user_mask(text: &str) -> crate::prompt_highlight::PromptTokenMask {
     let (command_end, include_bare_separator) =
@@ -11,13 +12,29 @@ pub(super) fn user_mask(text: &str) -> crate::prompt_highlight::PromptTokenMask 
     crate::prompt_highlight::PromptTokenMask::new(text, command_end, include_bare_separator)
 }
 
-pub(super) fn visible_blocks(message: &AssistantMessage, detail: Detail) -> Vec<&MessageBlock> {
+/// A block as it renders at a detail level: thinking carries its
+/// detail-formatted text (see `super::thinking`).
+pub(super) enum VisibleBlock<'a> {
+    Text(&'a str),
+    Thinking(Cow<'a, str>),
+}
+
+/// The blocks that render at `detail`, in order. The paint and the count both
+/// read this list, so their rows agree.
+pub(super) fn visible_blocks(message: &AssistantMessage, detail: Detail) -> Vec<VisibleBlock<'_>> {
+    let last = message.blocks.len().saturating_sub(1);
     message
         .blocks
         .iter()
-        .filter(|block| match block {
-            MessageBlock::Thinking(text) => detail.show_thinking() && !text.trim().is_empty(),
-            MessageBlock::Text(text) => !text.trim().is_empty(),
+        .enumerate()
+        .filter_map(|(index, block)| match block {
+            MessageBlock::Thinking(text) => {
+                let streaming_last = message.streaming && index == last;
+                format_thinking_for_detail(text, detail, streaming_last).map(VisibleBlock::Thinking)
+            }
+            MessageBlock::Text(text) => {
+                (!text.trim().is_empty()).then_some(VisibleBlock::Text(text.as_str()))
+            }
         })
         .collect()
 }
@@ -83,10 +100,10 @@ pub(crate) fn assistant_row_count(
     let content_width = width.saturating_sub(2).max(1);
     for (index, block) in blocks.iter().enumerate() {
         match block {
-            MessageBlock::Text(text) => {
+            VisibleBlock::Text(text) => {
                 count += markdown_row_count_tagged(text.trim(), content_width, &md, "", cache);
             }
-            MessageBlock::Thinking(text) => {
+            VisibleBlock::Thinking(text) => {
                 count += markdown_row_count_tagged(
                     text.trim(),
                     content_width,

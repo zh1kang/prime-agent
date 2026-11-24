@@ -606,7 +606,7 @@ impl SessionUi {
                 view.overlay = Some(Overlay::Confirm {
                     panel: crate::confirm::ConfirmPanel::yes_no(
                         "Update radiata",
-                        "Update installs the latest radiata build;\nyour sessions and configuration (~/.prime/agent) are never touched.\n\nThe update runs in the background — restart prime-agent after it\nfinishes to run the new build.",
+                        "Update installs the latest radiata build;\nyour sessions and configuration (~/.prime/agent) are never touched.\n\nThe update runs in the background — restart radiata after it\nfinishes to run the new build.",
                     ),
                     pending: PendingConfirm::Update,
                 });
@@ -694,7 +694,35 @@ impl SessionUi {
                     }
                 }
             }
-            // `/context` (and its `/usage` alias): the agent tree with token/cost columns and
+            // `/usage [refresh]`: provider rate limits and spend from codexbar, loaded in the
+            // background; the panel opens immediately from the cached report.
+            "usage" => {
+                let refresh = match resolved.args.trim() {
+                    "" => false,
+                    "refresh" => true,
+                    _ => {
+                        view.editor.set_text(text);
+                        self.error_row("Usage: /usage [refresh]", view);
+                        return Ok(());
+                    }
+                };
+                self.open_usage_view(view, refresh);
+                self.track_menu_opened("usage", "command");
+            }
+            "router" => {
+                let refresh = match resolved.args.trim() {
+                    "" => false,
+                    "refresh" => true,
+                    _ => {
+                        view.editor.set_text(text);
+                        self.error_row("Usage: /router [refresh]", view);
+                        return Ok(());
+                    }
+                };
+                self.open_router_view(view, refresh);
+                self.track_menu_opened("router", "command");
+            }
+            // `/context`: the agent tree with token/cost columns and
             // context utilization. The optional `all` argument is a deliberate TS delta (TS takes
             // none): past the row budget the default view collapses to the highest-usage agents;
             // `all` renders the whole tree.

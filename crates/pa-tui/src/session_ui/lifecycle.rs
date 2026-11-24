@@ -122,6 +122,7 @@ impl SessionUi {
             last_prompt_turn_end: 0,
             steering_mode: "all".to_string(),
             streaming_index: None,
+            optimistic_user_echo: None,
             working_tokens: LoaderTokenTracker::default(),
             turn_error_shown: false,
             pending_tools: HashSet::default(),
@@ -208,6 +209,10 @@ impl SessionUi {
             suspend_requested: false,
             workspace_command: None,
             captain_updates: activity_updates.captain,
+            usage_updates: activity_updates.usage,
+            usage_cache: None,
+            usage_fetch: None,
+            usage_generation: 0,
             captain_compose: None,
             captain_context: None,
             captain_parked: None,
@@ -615,6 +620,7 @@ impl SessionUi {
     /// Fold the pending snapshot into the view (fresh transcript, footer
     /// labels). Called after attach and after every session switch.
     pub(crate) fn rebuild_view(&mut self, view: &mut AgentView, kind: &RebuildKind) {
+        self.optimistic_user_echo = None;
         let resync_bash = self.resync_bash.take();
         // The held cards' fate diverges by rebuild: a rebind drops them with the
         // old transcript, a resync keeps them mounted above the indicator.
@@ -646,6 +652,8 @@ impl SessionUi {
                 .factory_view_session
                 .as_deref()
                 .is_some_and(|session| session != self.session_id)
+                || (matches!(view.overlay, Some(Overlay::Factory(_)))
+                    && self.factory_view_session.as_deref() != Some(self.session_id.as_str()))
             {
                 view.close_overlay_if(|overlay| matches!(overlay, Overlay::Factory(_)));
                 self.factory_selected_run = None;
@@ -658,8 +666,14 @@ impl SessionUi {
             // The goal panel dies with the old session too: it is a
             // snapshot of the previous session's goal state, and until
             // the new session's own `goal_update` lands it would keep
-            // owning the frame over the rebind with stale content.
-            view.close_overlay_if(|overlay| matches!(overlay, Overlay::Goal(_) | Overlay::Info(_)));
+            // owning the frame over the rebind with stale content. The usage panel's
+            // session spend belongs to the old session as well.
+            view.close_overlay_if(|overlay| {
+                matches!(
+                    overlay,
+                    Overlay::Goal(_) | Overlay::Info(_) | Overlay::Usage(_) | Overlay::Router(_)
+                )
+            });
             // Preserve the browser across same-session reattach, like the factory page.
             if self
                 .library_view_session
@@ -999,6 +1013,7 @@ mod backfill_tests {
                 library: mpsc::unbounded_channel().0,
                 commands: mpsc::unbounded_channel().0,
                 captain: mpsc::unbounded_channel().0,
+                usage: mpsc::unbounded_channel().0,
             },
             backfill_tx,
         )
@@ -2181,6 +2196,7 @@ mod backfill_tests {
                 library: mpsc::unbounded_channel().0,
                 commands: mpsc::unbounded_channel().0,
                 captain: mpsc::unbounded_channel().0,
+                usage: mpsc::unbounded_channel().0,
             },
             mpsc::unbounded_channel().0,
         )

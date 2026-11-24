@@ -3,8 +3,7 @@
 //! rides it.
 use super::{
     format_goal_status, terminal_columns, AgentView, ChatEntry, DaemonCommand, Duration, Map,
-    Overlay, SessionUi, StatusKind, Value, ANTHROPIC_SUBSCRIPTION_AUTH_WARNING,
-    UI_REQUEST_TIMEOUT_MS,
+    Overlay, SessionUi, StatusKind, Value, UI_REQUEST_TIMEOUT_MS,
 };
 
 impl SessionUi {
@@ -124,7 +123,7 @@ impl SessionUi {
     /// The warning STACKS — `note_as` would rewrite the just-shown
     /// login-success row in place — and carries the same `⚠` prefix as
     /// the credential-detection arm.
-    pub(crate) fn maybe_warn_anthropic_subscription_auth(
+    pub(crate) async fn maybe_warn_anthropic_subscription_auth(
         &mut self,
         provider: &str,
         view: &mut AgentView,
@@ -137,10 +136,16 @@ impl SessionUi {
         {
             return;
         }
+        let Some(auth) = self.provider_auth.clone() else {
+            return;
+        };
+        let Some(warning) = auth.0.anthropic_subscription_warning().await else {
+            return;
+        };
         self.anthropic_subscription_warning_shown = true;
         self.mark_anthropic_warning_shown();
         view.push_entry(ChatEntry::Status {
-            text: format!("\u{26a0} {ANTHROPIC_SUBSCRIPTION_AUTH_WARNING}"),
+            text: format!("\u{26a0} {warning}"),
             kind: StatusKind::Warning,
         });
         self.last_status_index = None;

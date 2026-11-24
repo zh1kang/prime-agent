@@ -773,6 +773,7 @@ mod tests {
                 library: mpsc::unbounded_channel().0,
                 commands: mpsc::unbounded_channel().0,
                 captain: mpsc::unbounded_channel().0,
+                usage: mpsc::unbounded_channel().0,
             },
             page_tx.clone(),
         )

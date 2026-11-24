@@ -320,6 +320,75 @@ pub(crate) fn family_cost(roster: &[Value], session: &SessionIdentity) -> Option
         .map(|rollup| rollup.cost)
 }
 
+/// Whole-project spend across a Captain project's lead + all crew/factory root
+/// sessions and their live subagent trees.
+///
+/// For each root session id recorded by the Captain backend (`session_costs`,
+/// which holds the disk rollup including archived/historical subagents), takes
+/// `max(disk_cost, live_roster_family_cost)` so live streaming updates appear
+/// immediately without ever double-counting. If `current_session` is not yet in
+/// `session_costs`, its live family rollup is included too.
+pub(crate) fn project_cost(
+    roster: &[Value],
+    session_costs: &std::collections::HashMap<String, f64>,
+    current_session: &SessionIdentity,
+    reported_total: f64,
+) -> f64 {
+    let records = crate::agents_view_state::reconcile_unified_sessions(roster, &[], None);
+    let rollups = crate::agents_view_forest::compute_rollups(&records);
+    let mut live_by_key: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    for record in &records {
+        let Some(rollup) = rollups.get(&record.identity) else {
+            continue;
+        };
+        let summary = crate::agents_view_state::summary_for_record(record);
+        for key in summary_identity_keys(&summary) {
+            live_by_key
+                .entry(key)
+                .and_modify(|cost| *cost = cost.max(rollup.cost))
+                .or_insert(rollup.cost);
+        }
+    }
+
+    let current_keys = current_session.keys();
+    let mut current_covered = false;
+    let mut total = 0.0f64;
+    for (session_id, disk_cost) in session_costs {
+        let disk = if disk_cost.is_finite() && *disk_cost > 0.0 {
+            *disk_cost
+        } else {
+            0.0
+        };
+        let prefixed = format!("session:{session_id}");
+        let live = live_by_key
+            .get(&prefixed)
+            .or_else(|| live_by_key.get(session_id))
+            .copied()
+            .unwrap_or(0.0);
+        total += disk.max(live);
+        if current_keys
+            .iter()
+            .any(|key| key == &prefixed || key == session_id)
+        {
+            current_covered = true;
+        }
+    }
+    if !current_covered {
+        if let Some(live) = current_keys
+            .iter()
+            .filter_map(|key| live_by_key.get(key).copied())
+            .reduce(f64::max)
+        {
+            total += live;
+        }
+    }
+    if reported_total.is_finite() && reported_total > total {
+        reported_total
+    } else {
+        total
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -562,5 +631,51 @@ mod tests {
             &SessionIdentity::new(Some("p1-live".to_string()), Some("p1".to_string()), None),
         );
         assert_eq!(counts.running, 1);
+    }
+
+    #[test]
+    fn project_cost_rolls_up_lead_crew_and_factory_subagents_without_double_counting() {
+        let summary = |id: &str, depth: u32, usage_cost: f64| {
+            json!({
+                "sessionId": id,
+                "lifecycle": "live",
+                "activeSessionId": format!("{id}-live"),
+                "sessionFile": format!("/sessions/{id}.jsonl"),
+                "runtimeKind": "top-level",
+                "rlmDepth": depth,
+                "usage": { "cost": usage_cost },
+            })
+        };
+        // Captain lead has $0.50 live (disk had $0.30).
+        let lead = summary("lead", 0, 0.50);
+        // Factory host has $0.00 own cost, with an Opus subagent that has $8.40 live (disk had $4.00).
+        let factory_host = summary("fac-1", 0, 0.0);
+        let mut worker = summary("worker-1", 1, 8.40);
+        worker["runtimeKind"] = json!("subagent");
+        worker["rlmChildId"] = json!("sub-1");
+        worker["parentActiveSessionId"] = json!("fac-1-live");
+        worker["parentSessionId"] = json!("fac-1");
+        let roster = vec![
+            entry("lead", &lead, "idle"),
+            entry("fac-1", &factory_host, "running"),
+            entry("worker-1", &worker, "running"),
+        ];
+        // Archived crew session not in live roster still contributes its $2.36 from disk.
+        let mut session_costs = std::collections::HashMap::new();
+        session_costs.insert("lead".to_string(), 0.30);
+        session_costs.insert("fac-1".to_string(), 4.00);
+        session_costs.insert("archived-crew".to_string(), 2.36);
+
+        let identity = SessionIdentity::new(
+            Some("lead-live".to_string()),
+            Some("lead".to_string()),
+            Some("/sessions/lead.jsonl".to_string()),
+        );
+        let total = project_cost(&roster, &session_costs, &identity, 6.66);
+        // Expected: max(0.30, 0.50) + max(4.00, 8.40) + 2.36 = 11.26
+        assert!(
+            (total - 11.26).abs() < 1e-6,
+            "expected 11.26 (lead + factory subagent + archived crew), got {total}"
+        );
     }
 }

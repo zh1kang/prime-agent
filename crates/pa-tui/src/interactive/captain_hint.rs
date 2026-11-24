@@ -44,6 +44,15 @@ fn file_stamp(path: &Path) -> Option<FileStamp> {
     })
 }
 
+/// Project-wide usage totals published in `<hub>/captains/status/<project-id>.json`.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub(crate) struct CaptainStatusUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_usd: f64,
+}
+
 /// Deserialized `<hub>/captains/status/<project-id>.json`.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(default)]
@@ -53,6 +62,9 @@ pub(crate) struct CaptainStatusFile {
     pub root: String,
     pub state: String,
     pub lead_state: String,
+    pub lead_session_id: String,
+    pub usage: CaptainStatusUsage,
+    pub session_costs: HashMap<String, f64>,
     pub counts: CaptainStatusCounts,
     pub active: Vec<CaptainStatusActiveItem>,
     pub toast_states: HashMap<String, CaptainToastEntry>,
@@ -299,6 +311,11 @@ impl CaptainStatusWatcher {
     /// same index, with the id and kind the dock row does not carry.
     pub(crate) fn active_item(&self, index: usize) -> Option<&CaptainStatusActiveItem> {
         self.cached.as_ref()?.active.get(index)
+    }
+
+    /// The last parsed status file for this project's Captain, if any.
+    pub(crate) fn cached_status(&self) -> Option<&CaptainStatusFile> {
+        self.cached.as_ref()
     }
 
     pub(crate) fn hub_present(&self) -> bool {

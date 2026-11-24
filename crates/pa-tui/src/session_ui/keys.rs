@@ -339,12 +339,17 @@ impl SessionUi {
         }
         // Any non-Escape key re-arms the double-Esc tree shortcut (one shot per input chain);
         // Escape itself never resets, so repeated Escape converges to the inert empty state.
-        if view.overlay.is_none()
+        if (view.overlay.is_none() || matches!(view.overlay, Some(Overlay::Factory(_))))
             && id
                 .as_ref()
                 .is_some_and(|key| view.editor.keybindings().matches(key, "app.factory.toggle"))
         {
             self.escape_tree_shortcut_spent = false;
+            if matches!(view.overlay, Some(Overlay::Factory(_))) {
+                self.factory_selected_run = None;
+                self.factory_view_session = None;
+                view.overlay = None;
+            }
             // F6 is the project-level entry point: the native Captain panel. `/fsm` stays the
             // direct live-machine view. During a Captain text step it returns to the panel.
             if self.captain_compose_active() {
@@ -422,6 +427,8 @@ impl SessionUi {
             Some(Overlay::Bash(_)) => return self.handle_bash_view_key(key, view),
             Some(Overlay::Goal(_)) => return self.handle_goal_panel_key(key, view),
             Some(Overlay::Info(_)) => return self.handle_info_panel_key(key, view),
+            Some(Overlay::Usage(_)) => return self.handle_usage_view_key(key, view),
+            Some(Overlay::Router(_)) => return self.handle_router_view_key(key, view),
             Some(Overlay::Tree(_)) => return self.handle_tree_selector_key(key, view).await,
             Some(Overlay::Fork(_)) => return self.handle_fork_selector_key(key, view).await,
             Some(Overlay::Confirm { .. }) => return self.handle_confirm_key(key, view).await,

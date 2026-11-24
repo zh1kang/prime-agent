@@ -648,7 +648,7 @@ fn the_empty_state_names_the_surface() {
     let rows = frame_text(&mut view);
     let joined = rows.join("\n");
     assert!(joined.contains("No live factory runs."), "{joined}");
-    assert!(joined.contains("Press n"), "{joined}");
+    assert!(joined.contains("Press Esc to return to chat, or n"), "{joined}");
     assert_eq!(view.handle_key("n", &kb()), FactoryViewAction::New);
     assert!(
         joined.contains("move"),

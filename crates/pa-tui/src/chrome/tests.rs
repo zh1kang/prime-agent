@@ -927,17 +927,56 @@ fn splash_renders_logo_version_model_and_cwd() {
 }
 
 #[test]
-fn top_bar_centers_name_with_cost() {
+fn top_bar_anchors_name_left_and_cost_right_with_rule() {
     let state = ChromeState {
         chat_name: "shared-cwd".to_string(),
-        cost_usd: Some(0.0),
+        cost_usd: Some(12.34),
         ..Default::default()
     };
-    let line = render_top_bar(&state, &theme(), 120);
+    let line = render_top_bar(&state, &theme(), 40);
     let text = line.iter().map(|s| s.content.as_str()).collect::<String>();
-    assert!(text.contains("shared-cwd  $0.00"));
-    let start = text.find("shared-cwd").unwrap();
-    assert_eq!(start, 55);
+    assert_eq!(str_width(&text), 40);
+    assert!(text.starts_with(" shared-cwd ─"));
+    assert!(text.ends_with("─ $12.34 "));
+}
+
+#[test]
+fn top_bar_handles_missing_negative_and_narrow_cost() {
+    let state = |cost| ChromeState {
+        chat_name: "MOSAIC".to_string(),
+        cost_usd: cost,
+        ..Default::default()
+    };
+    let text = |line: Line| line.iter().map(|s| s.content.as_str()).collect::<String>();
+    let width = 41;
+    let with_cost = text(render_top_bar(&state(Some(0.0)), &theme(), width));
+    assert_eq!(str_width(&with_cost), width);
+    assert!(with_cost.starts_with(" MOSAIC ─"));
+    assert!(with_cost.ends_with("─ $0.00 "));
+
+    // Without a cost, the rule runs cleanly to the right padding.
+    let bare = text(render_top_bar(&state(None), &theme(), width));
+    assert_eq!(str_width(&bare), width);
+    assert!(bare.starts_with(" MOSAIC ─"));
+    assert!(bare.ends_with("─ "));
+    assert!(!bare.contains('$'));
+
+    // A negative cost is hidden cleanly.
+    let negative = text(render_top_bar(&state(Some(-1.0)), &theme(), width));
+    assert_eq!(negative, bare);
+
+    // Narrow width truncates the title without overflowing or dropping the cost.
+    let narrow = text(render_top_bar(
+        &ChromeState {
+            chat_name: "very-long-project-name".to_string(),
+            cost_usd: Some(9.50),
+            ..Default::default()
+        },
+        &theme(),
+        18,
+    ));
+    assert_eq!(str_width(&narrow), 18);
+    assert!(narrow.ends_with("$9.50 "));
 }
 
 #[test]

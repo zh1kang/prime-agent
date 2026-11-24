@@ -888,3 +888,191 @@ fn live_abort_text_matches_ts() {
         "Aborted after 2 retry attempts \u{00b7} 1m 05s"
     );
 }
+
+/// A CLI-provider thinking block: tool markers between long prose runs.
+fn cli_thinking() -> String {
+    let prose: Vec<String> = (1..=20)
+        .map(|n| format!("Reasoning paragraph {n} about the change."))
+        .collect();
+    format!(
+        "**Planning the fix**\n\n{}\n\u{25b8} write_file src/lib.rs\n\n{}",
+        prose[..10].join("\n\n"),
+        prose[10..].join("\n\n")
+    )
+}
+
+fn thinking_message(text: &str, streaming: bool) -> AssistantMessage {
+    AssistantMessage {
+        blocks: vec![
+            MessageBlock::Thinking(text.to_string()),
+            MessageBlock::Text("Done.".to_string()),
+        ],
+        has_tool_calls: true,
+        streaming,
+        error: None,
+        aborted: false,
+    }
+}
+
+fn rendered_text(message: &AssistantMessage, detail: Detail) -> Vec<String> {
+    render_assistant(
+        message,
+        detail,
+        &theme(),
+        "  ",
+        80,
+        false,
+        &mut crate::markdown::MarkdownBlockCache::default(),
+    )
+    .iter()
+    .map(|row| {
+        row.iter()
+            .map(|s| s.content.as_str())
+            .filter(|content| !content.starts_with('\u{1b}'))
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    })
+    .collect()
+}
+
+fn assert_count_matches_render(message: &AssistantMessage, detail: Detail) {
+    for width in [20, 40, 80, 120] {
+        let rows = render_assistant(
+            message,
+            detail,
+            &theme(),
+            "  ",
+            width,
+            false,
+            &mut crate::markdown::MarkdownBlockCache::default(),
+        );
+        let count = assistant_row_count(
+            message,
+            detail,
+            &theme(),
+            "  ",
+            width,
+            false,
+            &crate::markdown::MarkdownBlockCache::default(),
+        );
+        assert_eq!(count, rows.len(), "{detail:?} width {width}");
+    }
+}
+
+#[test]
+fn overview_hides_prose_thinking_but_keeps_tool_markers() {
+    let rows = rendered_text(&thinking_message(&cli_thinking(), false), Detail::Overview);
+    assert!(
+        rows.iter().any(|r| r == " \u{25b8} write_file src/lib.rs"),
+        "{rows:#?}"
+    );
+    assert!(!rows.iter().any(|r| r.contains("Reasoning")), "{rows:#?}");
+    assert!(!rows.iter().any(|r| r.contains("Planning")), "{rows:#?}");
+    // Pure prose thinking stays hidden: only the text block renders.
+    let prose = thinking_message("just thinking\n\nmore thinking", false);
+    let rows = rendered_text(&prose, Detail::Overview);
+    assert!(!rows.iter().any(|r| r.contains("thinking")), "{rows:#?}");
+    assert!(rows.iter().any(|r| r.contains("Done.")));
+}
+
+#[test]
+fn details_collapses_settled_thinking_runs() {
+    let rows = rendered_text(&thinking_message(&cli_thinking(), false), Detail::Details);
+    let body: Vec<&String> = rows.iter().filter(|r| !r.is_empty()).collect();
+    assert_eq!(
+        body,
+        [
+            " \u{2234} Planning the fix (+10 lines)",
+            " \u{25b8} write_file src/lib.rs",
+            " \u{2234} Reasoning paragraph 11 about the change. (+9 lines)",
+            " Done.",
+        ],
+        "{rows:#?}"
+    );
+}
+
+#[test]
+fn details_streaming_thinking_shows_a_rolling_tail() {
+    let prose: Vec<String> = (1..=20).map(|n| format!("paragraph {n}")).collect();
+    let message = AssistantMessage {
+        blocks: vec![MessageBlock::Thinking(prose.join("\n\n"))],
+        has_tool_calls: false,
+        streaming: true,
+        error: None,
+        aborted: false,
+    };
+    let rows = rendered_text(&message, Detail::Details);
+    let body: Vec<&String> = rows.iter().filter(|r| !r.is_empty()).collect();
+    assert_eq!(
+        body,
+        [
+            " \u{2234} Thinking\u{2026} (+18 earlier lines \u{b7} Ctrl+O for all)",
+            " paragraph 19",
+            " paragraph 20",
+        ],
+        "{rows:#?}"
+    );
+    // Once settled, the same block folds to one summary line.
+    let settled = AssistantMessage {
+        streaming: false,
+        ..message
+    };
+    let rows = rendered_text(&settled, Detail::Details);
+    let body: Vec<&String> = rows.iter().filter(|r| !r.is_empty()).collect();
+    assert_eq!(body, [" \u{2234} paragraph 1 (+19 lines)"], "{rows:#?}");
+}
+
+#[test]
+fn all_renders_full_thinking_verbatim() {
+    let rows = rendered_text(&thinking_message(&cli_thinking(), false), Detail::All);
+    for n in 1..=20 {
+        let needle = format!("Reasoning paragraph {n} about the change.");
+        assert!(
+            rows.iter().any(|r| r.trim() == needle),
+            "{needle}: {rows:#?}"
+        );
+    }
+    assert!(rows.iter().any(|r| r == " \u{25b8} write_file src/lib.rs"));
+}
+
+#[test]
+fn thinking_row_counts_match_render_at_every_detail() {
+    let prose: Vec<String> = (1..=20).map(|n| format!("paragraph {n}")).collect();
+    let cases = [
+        thinking_message(&cli_thinking(), false),
+        thinking_message(&cli_thinking(), true),
+        AssistantMessage {
+            blocks: vec![MessageBlock::Thinking(prose.join("\n\n"))],
+            has_tool_calls: false,
+            streaming: true,
+            error: None,
+            aborted: false,
+        },
+        thinking_message("only prose\n\nhere", false),
+        thinking_message(&"word ".repeat(80), false),
+    ];
+    for message in &cases {
+        for detail in [Detail::Overview, Detail::Details, Detail::All] {
+            assert_count_matches_render(message, detail);
+        }
+    }
+}
+
+#[test]
+fn trailing_space_counts_overview_tool_markers_as_visible() {
+    let markers = thinking_message("prose\n\u{25b8} run_command ls", false);
+    let markers = AssistantMessage {
+        blocks: markers.blocks[..1].to_vec(),
+        ..markers
+    };
+    assert!(markers.has_visible_body(Detail::Overview));
+    assert!(markers.has_trailing_space(Detail::Overview, true));
+    let prose = AssistantMessage {
+        blocks: vec![MessageBlock::Thinking("prose only".to_string())],
+        ..markers
+    };
+    assert!(!prose.has_visible_body(Detail::Overview));
+    assert!(!prose.has_trailing_space(Detail::Overview, true));
+    assert!(prose.has_visible_body(Detail::Details));
+}

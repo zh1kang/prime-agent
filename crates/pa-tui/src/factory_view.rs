@@ -1530,7 +1530,7 @@ impl FactoryView {
                 Span::raw("  "),
                 theme.fg_span(
                     ThemeColor::Muted,
-                    "Press n to choose a machine for this project.",
+                    "Press Esc to return to chat, or n to choose a machine for this project.",
                 ),
             ]);
         }

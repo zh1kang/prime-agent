@@ -16,6 +16,7 @@ pub(crate) struct ActivityUpdates {
     pub library: mpsc::UnboundedSender<crate::session_ui::LibraryUpdate>,
     pub commands: mpsc::UnboundedSender<CommandCatalogUpdate>,
     pub captain: mpsc::UnboundedSender<super::CaptainUpdate>,
+    pub usage: mpsc::UnboundedSender<super::UsageUpdate>,
 }
 
 impl SessionUi {
@@ -84,14 +85,64 @@ impl SessionUi {
         )
     }
 
+    /// Whole-project cost when this session belongs to a Captain project
+    /// (lead, crew thread, or factory host), combining persisted disk trees
+    /// across all project sessions with live roster rollups.
+    fn captain_project_cost(&self, identity: &crate::subagents::SessionIdentity) -> Option<f64> {
+        let keys = identity.keys();
+        if let Some(status) = self.captain_status_watcher.cached_status() {
+            let matches_sid = |sid: &str| {
+                !sid.is_empty() && {
+                    let prefixed = format!("session:{sid}");
+                    keys.iter().any(|k| k == &prefixed || k == sid)
+                }
+            };
+            let belongs = self
+                .captain_context
+                .as_ref()
+                .is_some_and(|ctx| ctx.project == status.project_id)
+                || matches_sid(&status.lead_session_id)
+                || status.session_costs.keys().any(|sid| matches_sid(sid));
+            if belongs && (!status.session_costs.is_empty() || status.usage.cost_usd > 0.0) {
+                return Some(crate::subagents::project_cost(
+                    &self.roster,
+                    &status.session_costs,
+                    identity,
+                    status.usage.cost_usd,
+                ));
+            }
+        }
+        let ctx = self.captain_context.as_ref()?;
+        let project = self
+            .captain_snapshot
+            .as_ref()?
+            .projects
+            .iter()
+            .find(|p| p.id == ctx.project)?;
+        let reported = project.usage.cost_usd.max(project.budget.spent_usd);
+        if !project.session_costs.is_empty() || reported > 0.0 {
+            Some(crate::subagents::project_cost(
+                &self.roster,
+                &project.session_costs,
+                identity,
+                reported,
+            ))
+        } else {
+            None
+        }
+    }
+
     /// Refresh the activity dock and the title's cost (the only writer
     /// of `chrome.cost_usd`).
     pub(super) fn update_subagent_summary(&mut self, view: &mut AgentView) {
         let identity = self.session_identity();
         self.subagent_counts = crate::subagents::count_descendants(&self.roster, &identity);
-        // The title's spend is the family rollup the agents view bills the
-        // session's row.
-        view.chrome.cost_usd = crate::subagents::family_cost(&self.roster, &identity);
+        // For a Captain project session (lead/crew/factory), show the full
+        // project-wide spend across all crew, factory runs, and subagents;
+        // otherwise show this session's RLM family rollup.
+        view.chrome.cost_usd = self
+            .captain_project_cost(&identity)
+            .or_else(|| crate::subagents::family_cost(&self.roster, &identity));
         let dock = self.activity_dock_state();
         // A focused selection must stay on a rendered group: only the goal group can leave the dock
         // (its goal ended), and the selection steps back to the group that is now last.
@@ -522,8 +573,9 @@ impl SessionUi {
     /// longer carries a heartbeat count beside the model name).
     pub(crate) fn sync_activity_dock(&mut self, view: &mut AgentView) {
         let previous = view.chrome.activity.clone();
+        let previous_cost = view.chrome.cost_usd;
         self.update_subagent_summary(view);
-        if previous != view.chrome.activity {
+        if previous != view.chrome.activity || previous_cost != view.chrome.cost_usd {
             self.dirty = true;
         }
     }

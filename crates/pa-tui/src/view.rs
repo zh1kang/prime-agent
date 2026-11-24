@@ -60,6 +60,10 @@ pub(crate) enum Overlay {
     ChoicePicker(crate::choice_picker::ChoicePicker),
     /// The `/mcp` connections view.
     Mcp(crate::mcp_view::McpView),
+    /// The `/usage` provider usage and spend panel.
+    Usage(crate::usage_view::UsageView),
+    /// The `/router` Ramp V2 model routing control panel.
+    Router(crate::router_view::RouterView),
     /// The factory page: the activity dock's factory group's destination.
     Factory(crate::factory_view::FactoryView),
     /// The machine library page: the activity dock's machine-library group's destination.
@@ -295,6 +299,8 @@ impl AgentView {
                 | Overlay::Bash(_)
                 | Overlay::Goal(_)
                 | Overlay::Info(_)
+                | Overlay::Usage(_)
+                | Overlay::Router(_)
                 | Overlay::Fork(_)
                 | Overlay::Confirm { .. }
                 | Overlay::ShareLoader(_)

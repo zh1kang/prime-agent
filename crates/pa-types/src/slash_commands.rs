@@ -55,7 +55,9 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: &[BuiltinSlashCommand] = &[
     BuiltinSlashCommand { name: "logs", description: "Show where daemon and client logs are saved", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
     BuiltinSlashCommand { name: "traces", description: "Preview, upload, or configure radiata traces", execution: SlashCommandExecution::Client, argument_hint: Some("[status|on|off|preview|upload|upload-current|upload-all|login]"), aliases: &[], takes_argument: false },
     BuiltinSlashCommand { name: "telemetry", description: "Show or change usage telemetry (pseudonymous metrics, never prompts or code)", execution: SlashCommandExecution::Client, argument_hint: Some("[status|on|off]"), aliases: &[], takes_argument: true },
-    BuiltinSlashCommand { name: "context", description: "Show token, cost, and context usage for agent and sub-agents", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &["usage"], takes_argument: false },
+    BuiltinSlashCommand { name: "context", description: "Show token, cost, and context usage for agent and sub-agents", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
+    BuiltinSlashCommand { name: "usage", description: "Show provider rate limits, quotas, and API-equivalent spend", execution: SlashCommandExecution::Client, argument_hint: Some("[refresh]"), aliases: &["quota", "providers"], takes_argument: false },
+    BuiltinSlashCommand { name: "router", description: "Configure quota- & complexity-aware model routing (Ramp Router V2)", execution: SlashCommandExecution::Client, argument_hint: Some("[refresh]"), aliases: &["routing", "switchyard"], takes_argument: false },
     BuiltinSlashCommand { name: "changelog", description: "Show changelog entries", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
     BuiltinSlashCommand { name: "update", description: "Update to the latest version (sessions preserved)", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
     BuiltinSlashCommand { name: "nightly", description: "Switch radiata updates to the nightly channel (unreleased builds, may be broken)", execution: SlashCommandExecution::Client, argument_hint: Some("[on|off|status]"), aliases: &[], takes_argument: true },
@@ -262,7 +264,11 @@ mod tests {
         let registry = SlashCommandRegistry::builtin();
         assert_eq!(registry.resolve_name("clear"), Some("new"));
         assert_eq!(registry.resolve_name("thinking"), Some("effort"));
-        assert_eq!(registry.resolve_name("usage"), Some("context"));
+        assert_eq!(registry.resolve_name("usage"), Some("usage"));
+        assert_eq!(registry.resolve_name("quota"), Some("usage"));
+        assert_eq!(registry.resolve_name("providers"), Some("usage"));
+        assert_eq!(registry.resolve_name("context"), Some("context"));
+        assert!(registry.get("context").unwrap().aliases.is_empty());
         assert_eq!(registry.resolve_name("rename"), Some("name"));
         assert_eq!(registry.resolve_name("side"), Some("btw"));
         assert!(registry.is_builtin("model"));

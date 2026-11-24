@@ -982,6 +982,9 @@ impl super::SessionUi {
         } else {
             ("lead", String::new())
         };
+        if !running {
+            self.show_optimistic_submit(text, view);
+        }
         self.captain_lead_queue.push_back(CaptainLead {
             project,
             text: text.to_owned(),
@@ -1003,7 +1006,6 @@ impl super::SessionUi {
         };
         self.captain_act(lead.op, captain_lead_args(&lead), lead.done.clone());
         self.captain_lead_inflight = Some(lead);
-        self.refresh_captain();
     }
 
     /// A `lead` or `steer` call answered. A `steer` an older backend refuses is sent again as
@@ -1021,11 +1023,13 @@ impl super::SessionUi {
             return;
         }
         if error.is_some() {
+            self.rollback_optimistic_submit(view);
             let mut texts = vec![lead.text];
             texts.extend(self.captain_lead_queue.drain(..).map(|lead| lead.text));
             prepend_draft(view, &texts.join("\n\n"));
             return;
         }
+        self.refresh_captain();
         self.send_next_captain_lead();
     }
 
@@ -1153,6 +1157,7 @@ impl super::SessionUi {
                             view.toasts.push(toast);
                         }
                         self.captain_snapshot = Some(snapshot);
+                        self.update_subagent_summary(view);
                     }
                 }
                 self.poll_captain_status(view);
@@ -1238,6 +1243,9 @@ impl super::SessionUi {
                         }
                         if op == "delete" && reply["state"] != "deleted" {
                             notice = "Deleting. Running work is ending.".into();
+                        }
+                        if op == "archive-project" && reply["state"] == "archiving" {
+                            notice = "Archiving. Running work is ending.".into();
                         }
                         if let Some(error) = reply.get("factory_error").and_then(Value::as_str) {
                             notice = format!("{notice} The factory did not start: {error}");
@@ -1483,10 +1491,17 @@ impl super::SessionUi {
         {
             if factory {
                 self.open_factory_page(view);
+            } else {
+                if matches!(view.overlay, Some(Overlay::Factory(_))) {
+                    self.factory_selected_run = None;
+                    self.factory_view_session = None;
+                }
+                view.overlay = None;
             }
             if let Some(draft) = draft {
                 prepend_draft(view, &draft);
             }
+            self.dirty = true;
             return Ok(());
         }
         let selection = SessionSelection::Resume(path.clone());
@@ -1524,6 +1539,12 @@ impl super::SessionUi {
         }
         if factory {
             self.open_factory_page(view);
+        } else {
+            if matches!(view.overlay, Some(Overlay::Factory(_))) {
+                self.factory_selected_run = None;
+                self.factory_view_session = None;
+            }
+            view.close_overlay_if(|overlay| matches!(overlay, Overlay::Factory(_)));
         }
         // The breadcrumb and the Captain routing follow the opened chat now, before the
         // status call answers, so a message typed at once still reaches the Captain.

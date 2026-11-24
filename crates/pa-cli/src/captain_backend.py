@@ -206,7 +206,7 @@ def database(write=False):
         if not _schema_ready:
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS projects (
-                    id TEXT PRIMARY KEY, root TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
+                    id TEXT PRIMARY KEY, root TEXT NOT NULL, name TEXT NOT NULL,
                     objective TEXT NOT NULL, rules TEXT NOT NULL DEFAULT '', plan TEXT NOT NULL DEFAULT '',
                     crew_rules TEXT NOT NULL DEFAULT '', lead TEXT NOT NULL UNIQUE, parallel INTEGER NOT NULL DEFAULT 2);
                 CREATE TABLE IF NOT EXISTS crew (
@@ -266,9 +266,13 @@ def database(write=False):
                     confidence TEXT NOT NULL DEFAULT 'Confirmed', line_hint INTEGER, message TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'open', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
             """)
+            # A table rebuild must not run ON DELETE actions or check references while the
+            # old table is dropped; the pragma is a no-op inside a transaction.
+            db.execute("PRAGMA foreign_keys=OFF")
             db.execute("BEGIN IMMEDIATE")
             migrate_schema(db)
             db.commit()
+            db.execute("PRAGMA foreign_keys=ON")
             _schema_ready = True
         if write:
             db.execute("BEGIN IMMEDIATE")
@@ -324,7 +328,7 @@ SCHEMA_COLUMNS = (
     ("projects", "thinking", "TEXT NOT NULL DEFAULT ''"),
     # Writer machines the user allowed the Captain to start without asking.
     ("projects", "grants", "TEXT NOT NULL DEFAULT '[]'"),
-    # active, stopping, paused, or deleting; see PROJECT_STATES.
+    # active, stopping, paused, archiving, archived, or deleting; see PROJECT_STATES.
     ("projects", "state", "TEXT NOT NULL DEFAULT 'active'"),
     # The models of a designed factory: JSON {mode, model, thinking}; see checked_factory_models.
     ("projects", "factory_models", "TEXT NOT NULL DEFAULT ''"),
@@ -356,12 +360,15 @@ SCHEMA_COLUMNS = (
     # The report file under <project>/.prime/captain/reports/.
     ("reports", "report_path", "TEXT NOT NULL DEFAULT ''"),
 )
-SCHEMA_VERSION = 2
+# Schema version 3: one Captain that is not archived per root; archived Captains keep theirs.
+SCHEMA_VERSION = 3
+ROOT_UNIQUE = re.compile(r"\broot\s+TEXT\s+NOT\s+NULL\s+UNIQUE\b", re.IGNORECASE)
 
 
 def migrate_schema(db):
-    """Bring the store to SCHEMA_VERSION inside the caller's transaction. Columns are checked
-    against PRAGMA table_info, so a store whose version was not recorded upgrades too."""
+    """Bring the store to SCHEMA_VERSION inside the caller's transaction, which runs with
+    foreign keys off. Columns are checked against PRAGMA table_info and the projects table
+    against its stored SQL, so a store whose version was not recorded upgrades too."""
     if db.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_VERSION:
         return
     columns = {}
@@ -371,7 +378,46 @@ def migrate_schema(db):
         if column not in columns[table]:
             db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
             columns[table].add(column)
+    drop_project_root_unique(db)
+    db.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS projects_active_root ON projects(root) WHERE state != 'archived'"
+    )
     db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+
+
+def drop_project_root_unique(db):
+    """Rebuild a projects table whose root column is UNIQUE without that constraint. The new
+    table is the stored CREATE statement with only the constraint removed, so every column,
+    default, and the lead constraint stay; rows keep their rowids."""
+    sql = db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='projects'"
+    ).fetchone()[0]
+    if not ROOT_UNIQUE.search(sql):
+        return
+    created = re.sub(
+        r'^\s*CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?["`\[]?projects["`\]]?',
+        "CREATE TABLE projects_new",
+        ROOT_UNIQUE.sub("root TEXT NOT NULL", sql, count=1),
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    if not created.startswith("CREATE TABLE projects_new"):
+        raise sqlite3.DatabaseError("Captain: unexpected projects table definition.")
+    names = ",".join(
+        '"' + r["name"] + '"' for r in db.execute("PRAGMA table_info(projects)")
+    )
+    before = db.execute("SELECT count(*) FROM projects").fetchone()[0]
+    db.execute("DROP TABLE IF EXISTS projects_new")
+    db.execute(created)
+    db.execute(
+        f"INSERT INTO projects_new(rowid,{names}) SELECT rowid,{names} FROM projects"
+    )
+    db.execute("DROP TABLE projects")
+    db.execute("ALTER TABLE projects_new RENAME TO projects")
+    after = db.execute("SELECT count(*) FROM projects").fetchone()[0]
+    broken = [r for r in db.execute("PRAGMA foreign_key_check") if r[2] == "projects"]
+    if after != before or broken:
+        raise sqlite3.IntegrityError("Captain: the projects table rebuild lost rows or references.")
 
 
 # Tables whose rows change what a project's status file shows, with the project of a row.
@@ -588,7 +634,7 @@ def snapshot():
                     member.pop(key, None)
                 member["session"] = member_session(member)
                 member["busy"] = member["id"] in busy
-                member["usage"] = job_usage(db, "member", member["id"])
+                member["usage"] = member_usage(db, member)
                 member["open_findings_count"] = db.execute(
                     "SELECT count(*) FROM review_findings WHERE project=? AND member=? AND status='open'",
                     (project["id"], member["id"]),
@@ -597,8 +643,11 @@ def snapshot():
                 enrich_member(member, project)
             stack_positions(project["crew"])
             project.update(project_notifications(db, project["id"]))
-            project["usage"] = job_usage(db, "project", project["id"])
-            project["budget"] = budget_state(db, project)
+            usage_detail = project_usage_detail(db, project, crew_rows=project["crew"])
+            project["usage"] = usage_detail["usage"]
+            project["session_costs"] = usage_detail["session_costs"]
+            project["budget"] = budget_state(db, project, usage=usage_detail["usage"])
+            project["wake_policy"] = wake_policy(project)
             project["schedules"] = project_schedules(db, project["id"])
             project["decisions"] = open_decisions(db, project["id"])
             project["drive_files"] = drive_files(project)
@@ -661,7 +710,9 @@ def snapshot():
         start_watch()
     return {
         "current_root": here,
-        "current": next((p["id"] for p in projects if p["root"] == here), None),
+        "current": next(
+            (p["id"] for p in projects if p["root"] == here and p["state"] != "archived"), None
+        ),
         "projects": projects,
     }
 
@@ -754,15 +805,18 @@ def action(op, project=None, **args):
     if op == "factory" and project is None:
         with database() as db:
             saved = db.execute(
-                "SELECT id FROM projects WHERE root=?", (current_root(),)
+                "SELECT id FROM projects WHERE root=? AND state!='archived'", (current_root(),)
             ).fetchone()
         if not saved:
             return handoff("factory")
         project = saved[0]
     with database() as db:
         if project is None:
+            # The Captain that is not archived, else the newest archived one, so
+            # `unarchive` works from the project folder.
             found = db.execute(
-                "SELECT id FROM projects WHERE root=?", (current_root(),)
+                "SELECT id FROM projects WHERE root=? ORDER BY state='archived',rowid DESC LIMIT 1",
+                (current_root(),),
             ).fetchone()
             if not found:
                 raise ValueError("Initialize a Captain for this project first.")
@@ -886,7 +940,7 @@ def action(op, project=None, **args):
             raise ValueError("That edit has no text to restore.")
         result = action("edit", project=project, field=row["field"], value=row["old_value"])
         return dict(result, restored=int(args["edit_id"]))
-    elif op in ("stop", "resume", "delete", "demote"):
+    elif op in ("stop", "resume", "delete", "demote", "archive-project", "unarchive-project"):
         return project_state_action(op, p)
     elif op == "adopt":
         ref = args["ref"]
@@ -1039,6 +1093,8 @@ def action(op, project=None, **args):
         if not m:
             raise ValueError("Choose the crew thread to roll back.")
         return checkpoint_rollback(p, m, args)
+    elif op in ("archive", "unarchive") and not member:
+        return project_state_action(op + "-project", p)
     elif op in ("archive", "unarchive"):
         if actor_kind() == "crew":
             raise ValueError("A crew thread cannot archive threads.")
@@ -1130,10 +1186,15 @@ def action(op, project=None, **args):
             session = thread_session(p["lead"])
             title = "captain"
         if session:
+            live_factory = bool(
+                m
+                and m["kind"] == "factory"
+                and m.get("state") in ("running", "needs_you")
+            )
             return handoff(
                 "resume",
                 session,
-                **({"panel": "factory"} if m and m["kind"] == "factory" else {}),
+                **({"panel": "factory"} if live_factory else {}),
             )
         tid = m["id"] if m else p["lead"]
         thread = durable(tid)
@@ -1280,8 +1341,9 @@ def drive_files(p):
     return [str(f.relative_to(folder)) for f in found[:200]]
 
 
-def budget_state(db, p):
-    usage = job_usage(db, "project", p["id"])
+def budget_state(db, p, usage=None):
+    if usage is None:
+        usage = project_usage_detail(db, p)["usage"]
     spent_tokens = usage["input_tokens"] + usage["output_tokens"]
     cap_usd, cap_tokens = p.get("budget_usd"), p.get("budget_tokens")
     exceeded = (cap_usd is not None and usage["cost_usd"] >= cap_usd) or (
@@ -1424,6 +1486,255 @@ def job_usage(db, where, value):
         (value,),
     ).fetchone()
     return {"input_tokens": row[0], "output_tokens": row[1], "cost_usd": round(row[2], 6)}
+
+
+_CLI_COST_APIS = {"antigravity-cli", "claude-cli", "cursor-cli"}
+_CLI_COST_PROVIDERS = {"antigravity", "cursor", "claude-cli"}
+_USAGE_FILE_CACHE = {}
+_USAGE_CACHE_LOADED = False
+_USAGE_CACHE_DIRTY = False
+
+
+def _usage_cache_path():
+    return BASE / "usage-cache.json"
+
+
+def _load_usage_cache():
+    global _USAGE_CACHE_LOADED
+    if _USAGE_CACHE_LOADED:
+        return
+    _USAGE_CACHE_LOADED = True
+    try:
+        raw = json.loads(_usage_cache_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if not isinstance(raw, dict):
+        return
+    for path_str, entry in raw.items():
+        if isinstance(entry, list) and len(entry) == 6:
+            _USAGE_FILE_CACHE[path_str] = tuple(entry)
+
+
+def _save_usage_cache():
+    global _USAGE_CACHE_DIRTY
+    if not _USAGE_CACHE_DIRTY:
+        return
+    _USAGE_CACHE_DIRTY = False
+    try:
+        if len(_USAGE_FILE_CACHE) > 4096:
+            # Keep the most recent entries by mtime_ns.
+            trimmed = dict(
+                sorted(_USAGE_FILE_CACHE.items(), key=lambda kv: kv[1][0], reverse=True)[:4096]
+            )
+            _USAGE_FILE_CACHE.clear()
+            _USAGE_FILE_CACHE.update(trimmed)
+        atomic_write_json(
+            _usage_cache_path(),
+            {k: list(v) for k, v in _USAGE_FILE_CACHE.items()},
+        )
+    except OSError:
+        pass
+
+
+def _cli_list_price(model):
+    """Per-million USD list prices (input, output, cache_read, cache_write) matching pa-ai."""
+    low = str(model or "").strip().lower()
+    if "/" in low:
+        low = low.rsplit("/", 1)[-1]
+    if not low or low == "auto":
+        return None
+    if "gemini-4-neon" in low or "gemini-3.5-pro" in low or "gemini-2.5-pro" in low:
+        return (2.5, 15.0, 0.25, 0.0)
+    if "gemini-4-argon" in low or "gemini-pro-orchestrator" in low:
+        return (1.25, 10.0, 0.125, 0.0)
+    if "gemini-4-hydrogen" in low or "gemini-3.8-flash" in low or "gemini" in low and "flash" in low:
+        return (0.5, 3.0, 0.05, 0.0)
+    if "gemini" in low:
+        return (2.5, 15.0, 0.25, 0.0)
+    if "claude-opus-4-1" in low or "claude-opus-4.1" in low or low == "claude-opus-4" or low.startswith("claude-opus-4-2025"):
+        return (15.0, 75.0, 1.5, 18.75)
+    if "claude-opus" in low:
+        return (5.0, 25.0, 0.5, 6.25)
+    if "claude-sonnet" in low:
+        return (3.0, 15.0, 0.3, 3.75)
+    if "claude-haiku" in low:
+        return (1.0, 5.0, 0.1, 1.25)
+    if "composer" in low:
+        return (1.25, 6.0, 0.125, 0.0)
+    if "gpt-5" in low or "gpt-6" in low or "codex" in low:
+        return (2.5, 15.0, 0.25, 0.0)
+    return None
+
+
+def _session_file_usage(path):
+    """Return (session_id, input_tokens, output_tokens, cost_usd) for one JSONL file."""
+    global _USAGE_CACHE_DIRTY
+    _load_usage_cache()
+    try:
+        resolved = Path(path).expanduser().resolve(strict=True)
+        stat = resolved.stat()
+    except OSError:
+        return None, 0, 0, 0.0
+    path_str = str(resolved)
+    cached = _USAGE_FILE_CACHE.get(path_str)
+    if cached is not None and cached[0] == stat.st_mtime_ns and cached[1] == stat.st_size:
+        return cached[2], cached[3], cached[4], cached[5]
+    sid = None
+    inp = 0
+    out = 0
+    cost = 0.0
+    try:
+        with resolved.open("r", encoding="utf-8", errors="replace") as stream:
+            for idx, line in enumerate(stream):
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if idx == 0 and isinstance(row, dict) and row.get("type") == "session":
+                    sid = str(row.get("id") or "") or None
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                msg = row.get("message") if isinstance(row.get("message"), dict) else row
+                if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                    continue
+                usage = msg.get("usage")
+                if not isinstance(usage, dict):
+                    continue
+                u_in = int(usage.get("input") or 0)
+                u_out = int(usage.get("output") or 0)
+                u_cr = int(usage.get("cacheRead") or 0)
+                u_cw = int(usage.get("cacheWrite") or 0)
+                inp += u_in
+                out += u_out
+                u_cost = usage.get("cost")
+                total = float(u_cost.get("total") or 0.0) if isinstance(u_cost, dict) else 0.0
+                if total <= 0.0 and (u_in + u_out + u_cr + u_cw) > 0:
+                    api = str(msg.get("api") or "")
+                    provider = str(msg.get("provider") or "")
+                    if api in _CLI_COST_APIS or provider in _CLI_COST_PROVIDERS:
+                        rates = _cli_list_price(msg.get("responseModel") or msg.get("model"))
+                        if rates is not None:
+                            r_in, r_out, r_cr, r_cw = rates
+                            total = (
+                                u_in * r_in + u_out * r_out + u_cr * r_cr + u_cw * r_cw
+                            ) / 1_000_000.0
+                cost += max(0.0, total)
+    except OSError:
+        return None, 0, 0, 0.0
+    final_sid = sid or resolved.stem
+    _USAGE_FILE_CACHE[path_str] = (stat.st_mtime_ns, stat.st_size, final_sid, inp, out, cost)
+    _USAGE_CACHE_DIRTY = True
+    return final_sid, inp, out, cost
+
+
+def _session_tree_usage(session_path, seen=None):
+    """Sum usage across a root session JSONL and all recursive subagent JSONLs under session-artifacts."""
+    if not session_path:
+        return None, {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
+    try:
+        root = Path(session_path).expanduser().resolve(strict=True)
+    except OSError:
+        return None, {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
+    if seen is None:
+        seen = set()
+    artifacts = NATIVE / "session-artifacts"
+    queue = [root]
+    root_sid = None
+    total_in = 0
+    total_out = 0
+    total_cost = 0.0
+    while queue:
+        current = queue.pop(0)
+        key = str(current)
+        if key in seen:
+            continue
+        seen.add(key)
+        sid, inp, out, cost = _session_file_usage(current)
+        if root_sid is None:
+            root_sid = sid
+        total_in += inp
+        total_out += out
+        total_cost += cost
+        if sid:
+            sub_base = artifacts / sid
+            if sub_base.is_dir():
+                try:
+                    for sub_dir in sub_base.iterdir():
+                        if not sub_dir.is_dir() or not sub_dir.name.startswith("sub-"):
+                            continue
+                        for child_file in sub_dir.glob("*.jsonl"):
+                            try:
+                                resolved_child = child_file.resolve(strict=True)
+                            except OSError:
+                                continue
+                            if str(resolved_child) not in seen:
+                                queue.append(resolved_child)
+                except OSError:
+                    pass
+    return root_sid, {
+        "input_tokens": total_in,
+        "output_tokens": total_out,
+        "cost_usd": round(total_cost, 6),
+    }
+
+
+def _merge_usage(a, b):
+    return {
+        "input_tokens": max(int(a.get("input_tokens") or 0), int(b.get("input_tokens") or 0)),
+        "output_tokens": max(int(a.get("output_tokens") or 0), int(b.get("output_tokens") or 0)),
+        "cost_usd": round(max(float(a.get("cost_usd") or 0.0), float(b.get("cost_usd") or 0.0)), 6),
+    }
+
+
+def member_usage(db, member):
+    jobs = job_usage(db, "member", member["id"])
+    _, tree = _session_tree_usage(member_session(member))
+    return _merge_usage(jobs, tree)
+
+
+def project_usage_detail(db, project, crew_rows=None):
+    """Project-wide spend across the Captain lead, every crew thread/factory (including archived),
+    and all of their subagent trees, merged with SQLite job usage."""
+    jobs = job_usage(db, "project", project["id"])
+    if crew_rows is None:
+        crew_rows = [dict(r) for r in db.execute("SELECT * FROM crew WHERE project=?", (project["id"],))]
+    seen = set()
+    session_costs = {}
+    tree_in = 0
+    tree_out = 0
+    tree_cost = 0.0
+
+    lead_path = thread_session(project["lead"])
+    lead_sid, lead_usage = _session_tree_usage(lead_path, seen=seen)
+    if lead_sid:
+        session_costs[lead_sid] = lead_usage["cost_usd"]
+    tree_in += lead_usage["input_tokens"]
+    tree_out += lead_usage["output_tokens"]
+    tree_cost += lead_usage["cost_usd"]
+
+    for member in crew_rows:
+        m_path = member_session(member)
+        m_sid, m_usage = _session_tree_usage(m_path, seen=seen)
+        if m_sid:
+            session_costs[m_sid] = round(session_costs.get(m_sid, 0.0) + m_usage["cost_usd"], 6)
+        tree_in += m_usage["input_tokens"]
+        tree_out += m_usage["output_tokens"]
+        tree_cost += m_usage["cost_usd"]
+
+    tree_total = {
+        "input_tokens": tree_in,
+        "output_tokens": tree_out,
+        "cost_usd": round(tree_cost, 6),
+    }
+    _save_usage_cache()
+    return {
+        "usage": _merge_usage(jobs, tree_total),
+        "lead_session_id": lead_sid or "",
+        "session_costs": session_costs,
+    }
 
 
 REQUEST_WINDOW = 30
@@ -2043,12 +2354,16 @@ def _status_payload(db, project, factories=None, factory_update=None, factory_re
     active = active_needs + active_working
     needs = needs_you_list(db, project, lead_state, crew, factory_rows)
     needs_you = len(needs)
+    usage_detail = project_usage_detail(db, project)
     return {
         "project_id": pid,
         "name": project["name"],
         "root": project["root"],
         "state": project.get("state") or "active",
         "lead_state": lead_state,
+        "lead_session_id": usage_detail["lead_session_id"],
+        "usage": usage_detail["usage"],
+        "session_costs": usage_detail["session_costs"],
         "digest_len": len(project.get("digest") or ""),
         "counts": {
             "working": working,
@@ -2094,7 +2409,8 @@ def _publish_project_statuses(
     db, project_id, factories_by_project, factory_update, factory_removed, project_ids
 ):
     all_projects = [dict(r) for r in db.execute("SELECT * FROM projects")]
-    index = {p["root"]: p["id"] for p in all_projects}
+    # At most one Captain per root is not archived; an archived one never shadows it.
+    index = {p["root"]: p["id"] for p in all_projects if p["state"] != "archived"}
     index_path = STATUS_DIR / "index.json"
     if read_json(index_path) != index:
         atomic_write_json(index_path, index)
@@ -2135,7 +2451,12 @@ def _publish_project_statuses(
 def write_roots():
     """Publish Captain roots so the chat screen can show a setup hint without Python."""
     with database() as db:
-        roots = sorted(r[0] for r in db.execute("SELECT root FROM projects"))
+        roots = sorted(
+            r[0]
+            for r in db.execute(
+                "SELECT DISTINCT root FROM projects WHERE state NOT IN ('archived','deleting')"
+            )
+        )
         publish_project_statuses(db)
     atomic_write_json(BASE / "roots.json", roots)
 
@@ -2195,7 +2516,10 @@ def create_project(op, args):
     factory_models = checked_factory_models(args.get("factory_models"))
     lead = thread["id"] if thread else str(uuid.uuid4())
     with database(True) as db:
-        existing = db.execute("SELECT * FROM projects WHERE root=?", (root,)).fetchone()
+        # An archived Captain keeps its root; a new Captain starts beside it.
+        existing = db.execute(
+            "SELECT * FROM projects WHERE root=? AND state!='archived'", (root,)
+        ).fetchone()
         if existing and op == "promote" and existing["lead"] != lead:
             raise ValueError("This project already has a Captain. Demote it first.")
         if existing:

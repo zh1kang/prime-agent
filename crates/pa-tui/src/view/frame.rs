@@ -35,10 +35,20 @@ impl AgentView {
         // An open overlay replaces the editor part of the dock (TS `showConfigurationMenu` /
         // `showSelector`); the prompt context stays above it. The onboarding splash covers the
         // whole pane instead (TS `showOverlay` 100%).
-        let mut dock = render_prompt_context(&self.detail_label(), &self.theme, width);
+        let full_page = matches!(
+            self.overlay,
+            Some(Overlay::Captain(_) | Overlay::Usage(_) | Overlay::Router(_))
+        ) || (matches!(self.overlay, Some(Overlay::ModelPicker(_)))
+            && matches!(self.modal_backdrop.as_deref(), Some(Overlay::Captain(_))));
+        let mut dock = if full_page {
+            Vec::new()
+        } else {
+            render_prompt_context(&self.detail_label(), &self.theme, width)
+        };
         // The info panel's CURRENT row budget (a resize re-budgets every frame).
         let info_viewport_rows = crate::session_ui::picker_viewport_rows(self.terminal_rows());
         let pane_row = dock.len();
+        let speed_rows = usize::from(self.chrome.speed_text.is_some());
         let kb = self.editor.keybindings();
         let overlay_dock: Option<Vec<Line>> = match self.overlay.as_mut() {
             None => None,
@@ -51,8 +61,11 @@ impl AgentView {
             }
             Some(Overlay::ModelPicker(picker)) if self.modal_backdrop.is_some() => {
                 // A machine-editor or Captain pick floats over its page instead of the chat.
-                let page_rows =
-                    height.saturating_sub(FULLSCREEN_MIN_TRANSCRIPT_ROWS + 1 + pane_row);
+                let page_rows = if full_page {
+                    height.saturating_sub(1 + speed_rows)
+                } else {
+                    height.saturating_sub(FULLSCREEN_MIN_TRANSCRIPT_ROWS + 1 + pane_row)
+                };
                 let backdrop = match self.modal_backdrop.as_deref_mut() {
                     Some(Overlay::Captain(panel)) => {
                         panel.set_viewport_rows(page_rows);
@@ -121,10 +134,8 @@ impl AgentView {
                 Some(dock)
             }
             Some(Overlay::Captain(panel)) => {
-                // The panel takes the pane above the prompt context, like a full-screen page.
-                panel.set_viewport_rows(
-                    height.saturating_sub(FULLSCREEN_MIN_TRANSCRIPT_ROWS + 1 + pane_row),
-                );
+                // The Captain panel fills the entire frame below the top bar.
+                panel.set_viewport_rows(height.saturating_sub(1 + speed_rows));
                 dock.extend(panel.render(&self.theme, width, kb));
                 Some(dock)
             }
@@ -164,6 +175,16 @@ impl AgentView {
                     &self.code_block_indent,
                     info_viewport_rows,
                 ));
+                Some(dock)
+            }
+            Some(Overlay::Usage(panel)) => {
+                let usage_rows = height.saturating_sub(1 + speed_rows);
+                dock.extend(panel.render(&self.theme, width, kb, usage_rows));
+                Some(dock)
+            }
+            Some(Overlay::Router(panel)) => {
+                let router_rows = height.saturating_sub(1 + speed_rows);
+                dock.extend(panel.render(&self.theme, width, kb, router_rows));
                 Some(dock)
             }
             Some(Overlay::Tree(selector)) => {
@@ -220,9 +241,12 @@ impl AgentView {
             }
             None => self.render_dock(width),
         };
-        let dock_height = dock
-            .len()
-            .min(height.saturating_sub(FULLSCREEN_MIN_TRANSCRIPT_ROWS));
+        let max_dock = if full_page {
+            height.saturating_sub(top_rows)
+        } else {
+            height.saturating_sub(FULLSCREEN_MIN_TRANSCRIPT_ROWS)
+        };
+        let dock_height = dock.len().min(max_dock);
         let cropped = dock.len().saturating_sub(dock_height);
         // The hardware cursor rides the dock's rows: a front crop removes
         // the first `cropped` rows, so subtract — or the reported cursor
@@ -235,10 +259,18 @@ impl AgentView {
         } else {
             dock
         };
-        let window_height = height
-            .saturating_sub(top_rows + dock.len())
-            .max(FULLSCREEN_MIN_TRANSCRIPT_ROWS.min(height.saturating_sub(top_rows + dock.len())));
-        let (window_rows, start) = self.visible_transcript_window(width, window_height);
+        let window_height = if full_page {
+            0
+        } else {
+            height.saturating_sub(top_rows + dock.len()).max(
+                FULLSCREEN_MIN_TRANSCRIPT_ROWS.min(height.saturating_sub(top_rows + dock.len())),
+            )
+        };
+        let (window_rows, start) = if window_height == 0 {
+            (Vec::new(), 0)
+        } else {
+            self.visible_transcript_window(width, window_height)
+        };
         self.window_rows = window_height;
         // The selection restyle diff: only the rows the selection change
         // touched re-style.
@@ -310,20 +342,13 @@ impl AgentView {
             self.toasts.active(now)
         };
         if !toasts.is_empty() {
-            // The action ack renders as the brand-purple pill (the
-            // operator directive): the theme's Accent token flipped onto
-            // the pill's background by REVERSED.
-            let style = self
-                .theme
-                .fg_style(crate::theme::ThemeColor::Accent)
-                .add_modifier(Modifier::REVERSED);
-            crate::toast::overlay_toasts(
+            crate::toast::overlay_themed_toasts(
                 &mut frame,
                 top_rows,
                 top_rows + window_height,
                 &toasts,
                 width,
-                style,
+                &self.theme,
             );
             // A click on the transient pill must not fire the hidden
             // row's target.

@@ -7,6 +7,7 @@
 
 use std::time::{Duration, Instant};
 
+use crate::theme::{Theme, ThemeBg, ThemeColor};
 use crate::{Line, Span};
 use ratatui::style::Style;
 
@@ -119,6 +120,109 @@ impl Toasts {
         for toast in &mut self.entries {
             toast.expires_at = toast.expires_at.checked_sub(age).unwrap_or(now);
         }
+    }
+}
+
+/// Semantic accent tone for a toast's leading indicator bar.
+fn toast_accent_color(text: &str) -> ThemeColor {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("failed") || lower.contains("error") {
+        ThemeColor::Error
+    } else if lower.contains("needs you")
+        || lower.contains("needs review")
+        || lower.contains("paused")
+    {
+        ThemeColor::Warning
+    } else if lower.ends_with(" done") || lower.contains(" done (x") || lower.contains("copied") {
+        ThemeColor::Success
+    } else {
+        ThemeColor::Accent
+    }
+}
+
+/// Composite subtle dark-surface toast chips over the frame's top transcript
+/// rows: each toast renders as a quiet dark chip (`UserMessageBg`) with a thin
+/// semantic left indicator bar (`▎`) and 1-column right margin, aligning with
+/// the top bar's right-side spend readout.
+pub fn overlay_themed_toasts(
+    frame: &mut [Line],
+    start: usize,
+    end: usize,
+    toasts: &[String],
+    width: usize,
+    theme: &Theme,
+) {
+    if width == 0 {
+        return;
+    }
+    let capacity = end.saturating_sub(start);
+    let skip = toasts.len().saturating_sub(capacity);
+    let right_margin = usize::from(width > 2);
+    let surface_bg = theme.bg_style(ThemeBg::UserMessageBg).bg;
+    let mut text_style = theme.fg_style(ThemeColor::Text);
+    if let Some(bg) = surface_bg {
+        text_style = text_style.bg(bg);
+    }
+    let max_pill_width = width.saturating_sub(right_margin);
+
+    for (offset, text) in toasts.iter().skip(skip).enumerate() {
+        if start + offset >= end {
+            break;
+        }
+        let Some(row) = frame.get_mut(start + offset) else {
+            break;
+        };
+        let mut bar_style = theme.fg_style(toast_accent_color(text));
+        if let Some(bg) = surface_bg {
+            bar_style = bar_style.bg(bg);
+        }
+
+        // Format: "▎ <text> " truncated cleanly to fit inside max_pill_width.
+        let body_budget = max_pill_width.saturating_sub(3);
+        let mut body = String::new();
+        if crate::width::str_width(text) <= body_budget {
+            body.push_str(text);
+        } else if body_budget > 1 {
+            let mut used = 0usize;
+            for ch in text.chars() {
+                let cw = crate::width::char_width(ch);
+                if used + cw + 1 > body_budget {
+                    break;
+                }
+                body.push(ch);
+                used += cw;
+            }
+            body.push('…');
+        }
+        let pill_spans: Vec<Span> = if max_pill_width >= 4 {
+            vec![
+                Span::styled("▎".to_string(), bar_style),
+                Span::styled(format!(" {body} "), text_style),
+            ]
+        } else {
+            vec![Span::styled(format!(" {body}"), text_style)]
+        };
+        let pill_width: usize = pill_spans
+            .iter()
+            .map(|span| crate::width::str_width(&span.content))
+            .sum();
+        let col = width.saturating_sub(pill_width + right_margin);
+        let (markers, rest) = crate::osc133::split_leading_markers(row);
+        let mut out: Line = markers;
+        let prefix = slice_columns_keeping_escapes(&rest, 0, col);
+        out.extend(prefix);
+        out.push(Span::raw(crate::hyperlinks::OSC8_CLOSE.to_string()));
+        let prefix_width = crate::width::line_width(&out);
+        if prefix_width < col {
+            out.push(Span::raw(" ".repeat(col - prefix_width)));
+        }
+        out.extend(pill_spans);
+        let suffix = slice_columns_keeping_escapes(&rest, col.saturating_add(pill_width), width);
+        out.extend(suffix);
+        if crate::width::line_width(&out) > width {
+            out = crate::width::truncate_line(&out, width, "");
+        }
+        *row = out;
     }
 }
 

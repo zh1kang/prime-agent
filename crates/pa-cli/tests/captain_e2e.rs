@@ -226,3 +226,22 @@ fn only_the_user_stops_a_captain_and_sessions_keep_their_own_actor() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn an_archived_captain_frees_its_root_and_unarchives_when_the_root_is_free() {
+    let temp = tempfile::tempdir().unwrap();
+    let test = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/captain_archive.py");
+    let output = std::process::Command::new("python3")
+        .arg(test)
+        .arg(env!("CARGO_BIN_EXE_prime-agent"))
+        .arg(temp.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

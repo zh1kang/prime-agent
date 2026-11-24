@@ -1700,17 +1700,17 @@ fn crew_rows_carry_activity_needs_you_and_right_aligned_metadata() {
 }
 
 #[test]
-fn archived_crew_hides_until_a_shows_it_and_a_unarchives() {
+fn archived_crew_hides_until_h_shows_it_and_a_unarchives() {
     let mut data = snapshot();
     data["projects"][0]["crew"][1]["archived"] = json!(true);
     let mut view = CaptainView::new(34);
     view.apply_snapshot(&data);
     let screen = text(&view.render(&theme(), 110, &kb())).join("\n");
     assert!(
-        !screen.contains("claude review") && screen.contains("1 archived · A show"),
+        !screen.contains("claude review") && screen.contains("1 archived · H show"),
         "{screen}"
     );
-    view.handle_key("A", &kb());
+    view.handle_key("H", &kb());
     let screen = text(&view.render(&theme(), 110, &kb())).join("\n");
     assert!(
         screen.contains("archived  1") && screen.contains("claude review"),
@@ -1724,6 +1724,163 @@ fn archived_crew_hides_until_a_shows_it_and_a_unarchives() {
         panic!()
     };
     assert_eq!(op, "unarchive");
+}
+
+/// The snapshot with alpha (this checkout's Captain) archived.
+fn archived_alpha() -> Value {
+    let mut data = snapshot();
+    data["projects"][0]["state"] = json!("archived");
+    data["projects"][0]["lead_busy"] = json!(false);
+    data
+}
+
+#[test]
+fn an_archived_captain_frees_its_checkout_for_a_new_one() {
+    let mut view = CaptainView::new(34);
+    view.apply_snapshot(&archived_alpha());
+    assert!(!view.here_has_captain());
+    assert_eq!(
+        view.handle_key("n", &kb()),
+        CaptainAction::LoadChoices {
+            project: None,
+            reference: None
+        }
+    );
+    // Archiving does not free the checkout until it settles.
+    let mut data = snapshot();
+    data["projects"][0]["state"] = json!("archiving");
+    view.apply_snapshot(&data);
+    assert!(view.here_has_captain());
+}
+
+#[test]
+fn archived_captains_hide_until_h_shows_them() {
+    let mut view = CaptainView::new(34);
+    view.apply_snapshot(&archived_alpha());
+    // The first status selects the live project, not the archived one at this checkout.
+    assert_eq!(
+        view.selected_project().map(|p| p.id.as_str()),
+        Some("p-beta")
+    );
+    let screen = text(&view.render(&theme(), 110, &kb())).join("\n");
+    assert!(
+        screen.contains("1 project · 1 archived"),
+        "the header counts both:\n{screen}"
+    );
+    assert!(
+        !screen.contains("■ alpha") && screen.contains("1 archived · H show"),
+        "{screen}"
+    );
+    view.handle_key("down", &kb());
+    assert_eq!(
+        view.selected_project().map(|p| p.id.as_str()),
+        Some("p-beta")
+    );
+
+    view.handle_key("H", &kb());
+    let screen = text(&view.render(&theme(), 110, &kb())).join("\n");
+    assert!(
+        screen.contains("■ alpha") && !screen.contains("H show"),
+        "{screen}"
+    );
+    let beta = screen.find("■ beta").unwrap();
+    let alpha = screen.find("■ alpha").unwrap();
+    assert!(beta < alpha, "archived Captains list last:\n{screen}");
+    view.handle_key("down", &kb());
+    assert_eq!(
+        view.selected_project().map(|p| p.id.as_str()),
+        Some("p-alpha")
+    );
+    let screen = text(&view.render(&theme(), 110, &kb())).join("\n");
+    assert!(
+        screen.contains("alpha  archived")
+            && screen.contains("Archived Captain. Press A or R to unarchive"),
+        "the Overview marks it archived:\n{screen}"
+    );
+
+    // Hiding again moves the selection off the hidden Captain.
+    view.handle_key("H", &kb());
+    assert_eq!(
+        view.selected_project().map(|p| p.id.as_str()),
+        Some("p-beta")
+    );
+}
+
+#[test]
+fn only_archived_captains_leave_an_empty_list_with_the_hint() {
+    let mut data = archived_alpha();
+    data["projects"].as_array_mut().unwrap().pop();
+    let mut view = CaptainView::new(34);
+    view.apply_snapshot(&data);
+    assert!(view.selected_project().is_none());
+    let screen = text(&view.render(&theme(), 110, &kb())).join("\n");
+    assert!(
+        screen.contains("No active projects") && screen.contains("1 archived · H show"),
+        "{screen}"
+    );
+    view.handle_key("H", &kb());
+    assert_eq!(
+        view.selected_project().map(|p| p.id.as_str()),
+        Some("p-alpha")
+    );
+}
+
+#[test]
+fn shift_a_archives_and_unarchives_the_selected_captain() {
+    let archive = |project: &str| CaptainAction::Act {
+        op: "archive-project".into(),
+        args: json!({"project": project}),
+        done: "Captain archived. H shows archived Captains.".into(),
+    };
+    let unarchive = |project: &str| CaptainAction::Act {
+        op: "unarchive-project".into(),
+        args: json!({"project": project}),
+        done: "Captain unarchived.".into(),
+    };
+    // Paused beta has no running work: it archives at once.
+    let mut panel = view(34);
+    panel.handle_key("down", &kb());
+    assert_eq!(panel.handle_key("A", &kb()), archive("p-beta"));
+
+    // Active alpha has running work: confirm first, as for stop and delete.
+    let mut view = view(34);
+    assert_eq!(view.handle_key("A", &kb()), CaptainAction::None);
+    let screen = text(&view.render(&theme(), 110, &kb())).join("\n");
+    assert!(
+        screen.contains("archive the Captain of alpha?")
+            && screen.contains("running turn(s) or run(s) stop first."),
+        "{screen}"
+    );
+    assert_eq!(view.handle_key("n", &kb()), CaptainAction::None);
+    view.handle_key("A", &kb());
+    assert_eq!(view.handle_key("y", &kb()), archive("p-alpha"));
+
+    // An archived Captain: A and R unarchive it.
+    let mut view = CaptainView::new(34);
+    view.apply_snapshot(&archived_alpha());
+    view.handle_key("H", &kb());
+    view.handle_key("down", &kb());
+    assert_eq!(view.handle_key("A", &kb()), unarchive("p-alpha"));
+    assert_eq!(view.handle_key("shift+a", &kb()), unarchive("p-alpha"));
+    assert_eq!(view.handle_key("R", &kb()), unarchive("p-alpha"));
+    // New work names the unarchive step.
+    assert_eq!(view.handle_key("m", &kb()), CaptainAction::None);
+    let screen = text(&view.render(&theme(), 110, &kb())).join("\n");
+    assert!(
+        screen.contains("Unarchive this Captain to send messages."),
+        "{screen}"
+    );
+}
+
+#[test]
+fn focusing_an_archived_captain_by_name_shows_it() {
+    let mut view = CaptainView::new(34);
+    view.apply_snapshot(&archived_alpha());
+    assert!(view.focus_project("alpha"));
+    assert_eq!(
+        view.selected_project().map(|p| p.id.as_str()),
+        Some("p-alpha")
+    );
 }
 
 #[test]
@@ -2329,7 +2486,7 @@ fn unread_dots_and_the_inbox_mark_all_read_and_open() {
     let mut view = live_view();
     let all = text(&view.render(&theme(), 110, &kb())).join("\n");
     assert!(
-        all.contains("•3 unread") && all.contains("i inbox"),
+        all.contains("•1 unread") && all.contains("i inbox"),
         "{all}"
     );
     assert_eq!(view.handle_key("i", &kb()), CaptainAction::None);
@@ -2364,6 +2521,32 @@ fn unread_dots_and_the_inbox_mark_all_read_and_open() {
     view.handle_key("i", &kb());
     view.handle_key("escape", &kb());
     assert!(view.inbox.is_none(), "Esc leaves the inbox, not the panel");
+}
+
+#[test]
+fn the_unread_badge_counts_only_inbox_notifications() {
+    let mut data = live_run_snapshot();
+    data["projects"][0]["unread_count"] = json!(4);
+    data["projects"][0]["notifications"] = json!([]);
+    let mut view = CaptainView::new(34);
+    view.apply_snapshot(&data);
+    let all = text(&view.render(&theme(), 110, &kb())).join("\n");
+    assert!(
+        !all.contains("unread") && !all.contains("i inbox"),
+        "unread crew reports alone must not point at an empty inbox: {all}"
+    );
+    assert!(
+        all.contains("● • eigen-pipeline"),
+        "the crew row keeps its unread dot: {all}"
+    );
+
+    data["projects"][0]["notifications"] = json!([
+        {"id": 2, "member": "d0e6edff", "kind": "done", "title": "implement finished"},
+        {"id": 1, "member": "1a2b3c4d", "kind": "needs_you", "title": "pick a library"}
+    ]);
+    view.apply_snapshot(&data);
+    let all = text(&view.render(&theme(), 110, &kb())).join("\n");
+    assert!(all.contains("•2 unread  i inbox"), "{all}");
 }
 
 #[test]

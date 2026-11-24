@@ -280,6 +280,7 @@ impl SessionUi {
                 if active_session_id == self.active_session_id {
                     self.turn_active = false;
                     self.run_open = false;
+                    self.optimistic_user_echo = None;
                     self.outcome_after_compaction = None;
                     view.working = None;
                     view.retry = None;
@@ -297,7 +298,7 @@ impl SessionUi {
                     self.update_subagent_summary(view);
                     match reason.as_str() {
                         "shutdown" => self.error_row(
-                            "The Prime Agent daemon shut down while this window was attached. The session transcript remains saved; restart Prime Agent and reopen it from Agents View.",
+                            "The radiata daemon shut down while this window was attached. The session transcript remains saved; restart radiata and reopen it from Agents View.",
                             view,
                         ),
                         "replaced" => self.error_row(
@@ -343,7 +344,7 @@ impl SessionUi {
                         .join(", ");
                     view.push_entry(crate::chat::ChatEntry::Status {
                         text: format!(
-                            "Prime Agent is updating — restarting the daemon (about {}s). {} will resume automatically.",
+                            "radiata is updating — restarting the daemon (about {}s). {} will resume automatically.",
                             update.est_seconds.max(1),
                             if names.is_empty() { "Your session".to_string() } else { names }
                         ),
@@ -420,9 +421,41 @@ impl SessionUi {
                     "the turn ended before this call returned",
                 );
                 self.aborted_tools.clear();
-                self.start_loader(view);
+                if !(self.optimistic_user_echo.is_some() && view.working.is_some()) {
+                    self.start_loader(view);
+                }
             }
             TurnUpdate::UserMessage(text) => {
+                if let Some(echo) = self.optimistic_user_echo.take() {
+                    let matches_slot = matches!(
+                        view.chat.get(echo.entry_index),
+                        Some(ChatEntry::User { text: existing }) if existing == &echo.text
+                    );
+                    if matches_slot {
+                        match crate::custom_message::skill_invocation_entries(&text) {
+                            None if text == echo.text => return,
+                            None => {
+                                view.prepare_entry_mutation(echo.entry_index);
+                                if let Some(ChatEntry::User { text: slot }) =
+                                    view.chat.get_mut(echo.entry_index)
+                                {
+                                    *slot = text;
+                                }
+                                view.mark_entry_stale(echo.entry_index);
+                                return;
+                            }
+                            Some(entries) => {
+                                if echo.entry_index + 1 == view.chat_len() {
+                                    let _ = view.pop_chat_entry();
+                                }
+                                for entry in entries {
+                                    view.push_entry(entry);
+                                }
+                                return;
+                            }
+                        }
+                    }
+                }
                 match crate::custom_message::skill_invocation_entries(&text) {
                     Some(entries) => {
                         for entry in entries {
@@ -515,6 +548,7 @@ impl SessionUi {
                 // One LLM turn ended; the run, and with it the busy state, lasts until
                 // `agent_end` (#3998). The OSC outcome tracks the run separately below.
                 self.streaming_index = None;
+                self.optimistic_user_echo = None;
                 self.turn_ends_seen += 1;
                 // An aborted settle ends the run (the abort fallback frame
                 // has no agent_end); a failed step leaves the run open for

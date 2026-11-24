@@ -1425,23 +1425,31 @@ fn action_toasts_render_as_a_pill_coalesce_and_auto_dismiss() {
         .find(|span| span.content.contains("Copied to clipboard"))
         .expect("the pill renders");
     assert!(
-        pill.style.add_modifier.contains(Modifier::REVERSED),
-        "the pill carries the reversed-chip style: {:?}",
+        !pill.style.add_modifier.contains(Modifier::REVERSED),
+        "the toast uses a subtle dark surface chip, not an inverted block: {:?}",
         pill.style
     );
-    // Regression (the operator's brand-purple directive): the pill's
-    // color is the theme's Accent token, never the Success green.
     assert_eq!(
         pill.style.fg,
-        view.theme.fg_style(ThemeColor::Accent).fg,
-        "the pill carries the brand-purple Accent style: {:?}",
+        view.theme.fg_style(ThemeColor::Text).fg,
+        "the toast label uses crisp body text: {:?}",
         pill.style
     );
-    assert_ne!(
-        pill.style.fg,
-        view.theme.fg_style(ThemeColor::Success).fg,
-        "the pill must not carry the action green: {:?}",
+    assert_eq!(
+        pill.style.bg,
+        view.theme.bg_style(crate::theme::ThemeBg::UserMessageBg).bg,
+        "the toast rides the subtle dark surface bg: {:?}",
         pill.style
+    );
+    let bar = frame[toast_row]
+        .iter()
+        .find(|span| span.content == "▎")
+        .expect("the toast carries a thin semantic left bar");
+    assert_eq!(
+        bar.style.fg,
+        view.theme.fg_style(ThemeColor::Success).fg,
+        "copy confirmation uses the subtle success indicator bar: {:?}",
+        bar.style
     );
     view.toasts.push("Copied to clipboard");
     view.toasts.push("Copied to clipboard");

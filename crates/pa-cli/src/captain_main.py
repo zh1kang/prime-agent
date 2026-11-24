@@ -1,13 +1,14 @@
 HELP = (
     "pa thread captain status              Show every project as JSON\n"
     "pa thread captain act OP              Read action arguments as JSON from standard input\n"
-    "pa thread captain stop|resume|delete [PROJECT]\n"
-    "                                      Stop, resume, or delete this project's Captain\n"
+    "pa thread captain stop|resume|archive|unarchive|delete [PROJECT]\n"
+    "                                      Stop, resume, archive, unarchive, or delete this project's Captain\n"
     "pa thread captain reconcile           Settle interrupted work once (safe to repeat)\n"
     "Open the Captain panel in pa with F6 or /captain.\n"
     "Actions: init, promote, edit, edit-history, edit-restore, crew-model, delegate, adopt, release,\n"
     "reply, answer, grant, grant-approve, grant-decline, archive, unarchive, worktree-recreate, lead, steer,\n"
     "open, transcript, choices, review, factory, consensus, stop, resume, delete,\n"
+    "archive-project, unarchive-project (archive and unarchive with no member act on the Captain),\n"
     "wake-policy, notifications, notifications-read, mark-read,\n"
     "factory-validate, factory-show, factory-approve, factory-preapprove, factory-delete, factory-design,\n"
     "factory-set-model, factory-clear-model-override, factory-set-default-model,\n"
@@ -34,9 +35,9 @@ def captain_main(args):
     if args in ([], ["--help"], ["help"]):
         print(HELP)
         return
-    if args and args[0] in ("stop", "resume", "delete") and len(args) <= 2:
+    if args and args[0] in ("stop", "resume", "archive", "unarchive", "delete") and len(args) <= 2:
         if actor_kind() != "user":
-            raise ValueError("Only you can stop, resume, or delete a Captain.")
+            raise ValueError("Only you can stop, resume, archive, or delete a Captain.")
         result = action(args[0], project=args[1] if len(args) == 2 else None)
         print(json.dumps(result, ensure_ascii=False))
         return

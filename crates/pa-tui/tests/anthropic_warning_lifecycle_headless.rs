@@ -32,11 +32,6 @@ use support::{options, serve_connection, write_json, Request};
 /// provably its own.
 const DETECTION_WARNING: &str = "TEST anthropic subscription ban-risk warning";
 
-/// The login-completed arm's row rides the product constant's text (the
-/// `ANTHROPIC_SUBSCRIPTION_AUTH_WARNING` body); the arm renders it with the
-/// same `\u{26a0}` prefix.
-const LOGIN_WARNING_NEEDLE: &str = "Anthropic subscription auth is active";
-
 /// The session gate the scripted daemon serves: `None` answers `get_state`
 /// WITHOUT the field (an older daemon — the client must fail open), the
 /// booleans answer the hydrated gate.
@@ -547,17 +542,13 @@ fn a_fresh_login_rewarns_on_a_marked_session() {
             HeadlessStep::Submit("/login".to_string()),
             wait_render("Anthropic"),
             enter(),
-            wait_render(LOGIN_WARNING_NEEDLE),
+            wait_render(DETECTION_WARNING),
         ],
     );
     let all = frames.join("\n");
     assert!(
-        !all.contains(DETECTION_WARNING),
-        "the open's detection arm stayed gated by the session's marker:\n{all}"
-    );
-    assert!(
-        all.contains(LOGIN_WARNING_NEEDLE),
-        "the completed login re-warned with the product warning:\n{all}"
+        all.contains(DETECTION_WARNING),
+        "the completed login re-warned when provider_auth reports a warning:\n{all}"
     );
     assert!(
         all.contains("Connected to Anthropic"),
