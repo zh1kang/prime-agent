@@ -8,7 +8,7 @@ pub(crate) use geometry::{assistant_row_count, user_block_row_count};
 pub(crate) use thinking::format_thinking_for_detail;
 
 use crate::snapshot::RetryStartReason;
-use crate::theme::{Theme, ThemeBg, ThemeColor};
+use crate::theme::{Theme, ThemeColor};
 use crate::width::str_width;
 use crate::{Line, Span};
 use ratatui::style::Style;
@@ -353,7 +353,8 @@ pub(crate) fn render_user_block_with_style(
     md: &crate::markdown::MarkdownStyle,
     width: usize,
 ) -> Vec<Line> {
-    let bg = theme.bg_style(ThemeBg::UserMessageBg);
+    let bg = Style::default();
+    let accent_bar = theme.fg_span(ThemeColor::Accent, "\u{258e} ");
     let content_width = width.saturating_sub(4).max(1);
     let mut md = md.clone();
     md.body = theme.fg_style(ThemeColor::UserMessageText);
@@ -363,14 +364,11 @@ pub(crate) fn render_user_block_with_style(
     let blank = vec![Span::styled(" ".repeat(width), bg)];
     rows.push(blank.clone());
     if rendered.is_empty() {
-        let row = vec![
-            Span::styled("  ".to_string(), bg),
-            Span::styled(String::new(), md.body),
-        ];
+        let row = vec![accent_bar.clone(), Span::styled(String::new(), md.body)];
         rows.push(pad_to(row, width, bg));
     }
     for line in rendered {
-        let mut row: Line = vec![Span::styled("  ".to_string(), bg)];
+        let mut row: Line = vec![accent_bar.clone()];
         let restyled: Line = line
             .into_iter()
             .map(|span| Span::styled(span.content, bg.patch(span.style)))

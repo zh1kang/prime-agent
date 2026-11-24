@@ -304,8 +304,15 @@ impl AutocompleteState {
             .saturating_sub(self.max_visible / 2)
             .min(self.items.len().saturating_sub(self.max_visible));
         let end = (start + self.max_visible).min(self.items.len());
+        let visible = &self.items[start..end];
+        let label_col = visible
+            .iter()
+            .map(|item| str_width(&item.label))
+            .max()
+            .unwrap_or(0)
+            .clamp(8, 22);
         let mut lines: Vec<Line> = Vec::new();
-        for (index, item) in self.items[start..end].iter().enumerate() {
+        for (index, item) in visible.iter().enumerate() {
             let index = start + index;
             let selected = index == self.selected_index;
             // The argument hint, then the source tag, both muted — TS colors the source
@@ -317,12 +324,21 @@ impl AutocompleteState {
             if let Some(tag) = item.source_tag.as_deref() {
                 trailing.push(crate::menu_panel::MenuSegment::muted(tag));
             }
+            let mut primary = vec![Span::raw(item.label.clone())];
+            if let Some(description) = item.description.as_deref().filter(|d| !d.trim().is_empty()) {
+                let pad = label_col.saturating_sub(str_width(&item.label)) + 2;
+                primary.push(Span::raw(" ".repeat(pad)));
+                primary.push(theme.fg_span(
+                    if selected {
+                        crate::theme::ThemeColor::Muted
+                    } else {
+                        crate::theme::ThemeColor::Dim
+                    },
+                    description,
+                ));
+            }
             lines.push(crate::menu_panel::menu_row(
-                theme,
-                width,
-                vec![Span::raw(item.label.clone())],
-                &trailing,
-                selected,
+                theme, width, primary, &trailing, selected,
             ));
         }
         if start > 0 || end < self.items.len() {
@@ -332,23 +348,6 @@ impl AutocompleteState {
                 self.selected_index + 1,
                 self.items.len(),
             ));
-        }
-        if let Some(description) = self
-            .items
-            .get(self.selected_index)
-            .and_then(|item| item.description.as_deref())
-            .filter(|d| !d.trim().is_empty())
-        {
-            let indent = if width >= 4 { "  " } else { "" };
-            let content_width = (width.saturating_sub(str_width(indent) + 2)).max(1);
-            lines.push(Vec::new());
-            for line in crate::width::wrap_text(description, content_width) {
-                let text: String = line.iter().map(|s| s.content.as_str()).collect();
-                lines.push(vec![
-                    Span::raw(indent.to_string()),
-                    theme.fg_span(crate::theme::ThemeColor::Muted, format!("{text} ")),
-                ]);
-            }
         }
         lines
     }

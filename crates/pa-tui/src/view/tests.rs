@@ -2,7 +2,7 @@ use super::frame::{composite_follow_hint, indicator_row};
 use super::*;
 use crate::chat::{AssistantMessage, MessageBlock};
 use crate::osc133::RowMarkers;
-use crate::theme::{ColorMode, Theme, ThemeBg, ThemeColor};
+use crate::theme::{ColorMode, Theme, ThemeColor};
 use crate::tool_card::{ToolCallCard, ToolResultView};
 use crate::width::str_width;
 use crate::Line;
@@ -229,9 +229,7 @@ fn bang_prompt_renders_in_place_of_the_typed_prefix() {
 }
 
 #[test]
-fn autocomplete_dropdown_rows_carry_the_popup_background() {
-    // Every span of a menu row must carry a background, so an
-    // unselected row does not blend into the transcript behind.
+fn autocomplete_dropdown_rows_are_transparent_with_selected_highlight() {
     let mut v = view();
     v.editor.handle_input("/");
     v.editor.handle_input("m");
@@ -244,11 +242,11 @@ fn autocomplete_dropdown_rows_carry_the_popup_background() {
         .expect("the dropdown renders its marker row");
     assert!(
         marker_row.iter().all(|span| span.style.bg.is_some()),
-        "dropdown row spans the popup background: {marker_row:?}"
+        "selected dropdown row carries soft selection highlight: {marker_row:?}"
     );
 }
 
-/// The dropdown opens with its top border (operator directive 2026-09-26).
+/// The dropdown opens with its top border rule on transparent background.
 #[test]
 fn autocomplete_panel_opens_with_the_top_border_rule() {
     let mut v = view();
@@ -269,13 +267,10 @@ fn autocomplete_panel_opens_with_the_top_border_rule() {
         "the panel opens with the full-width rule:\n{}",
         frame.iter().map(text_of).collect::<Vec<_>>().join("\n")
     );
-    let rule_style = v
-        .theme
-        .fg_style(ThemeColor::BorderMuted)
-        .patch(v.theme.bg_style(ThemeBg::ToolPanelBg));
+    let rule_style = v.theme.fg_style(ThemeColor::BorderMuted);
     assert!(
         rule.iter().all(|span| span.style == rule_style),
-        "the rule draws in the muted border color on the popup background: {rule:?}"
+        "the rule draws in the muted border color transparently: {rule:?}"
     );
 }
 
@@ -299,7 +294,7 @@ fn prompt_editor_box_is_transparent_with_hairline_borders() {
     assert!(frame[prompt_idx + 1].iter().all(|s| s.style.bg.is_none()));
 }
 
-/// The selected row's wash spans the panel's full width (operator directive 2026-09-26).
+/// The selected row's wash spans the panel's full width while unselected rows stay transparent.
 #[test]
 fn autocomplete_selected_row_washes_the_full_panel_width() {
     let mut v = view();
@@ -325,10 +320,9 @@ fn autocomplete_selected_row_washes_the_full_panel_width() {
     let unselected = frame
         .get(marker_row + 1)
         .expect("an unselected menu row follows");
-    let panel_bg = v.theme.bg_style(ThemeBg::ToolPanelBg).bg;
     assert!(
-        unselected.iter().all(|span| span.style.bg == panel_bg),
-        "an unselected menu row keeps the popup background: {unselected:?}"
+        unselected.iter().all(|span| span.style.bg.is_none()),
+        "an unselected menu row stays transparent: {unselected:?}"
     );
 }
 

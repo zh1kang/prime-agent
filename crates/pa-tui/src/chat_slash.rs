@@ -3,7 +3,7 @@
 //! in `success` / `mdLink`. The outcome rows render in the status-row class instead
 //! (operator ruling 2026-09-25: command output is system output, never user text).
 
-use crate::theme::{Theme, ThemeBg};
+use crate::theme::{Theme, ThemeColor};
 use crate::width::str_width;
 use crate::{Line, Span};
 use ratatui::style::Style;
@@ -14,10 +14,9 @@ fn content_width(width: usize) -> usize {
     width.saturating_sub(4).max(1)
 }
 
-/// Every content span carries the block background, so a fg-only styled token cannot
-/// open a transparent gap in the block.
-fn block_row(spans: Line, bg: Style, width: usize) -> Line {
-    let mut row: Line = vec![Span::styled("  ".to_string(), bg)];
+/// Transparent block row with a thin accent left bar (`▎ `) matching user messages.
+fn block_row(spans: Line, theme: &Theme, bg: Style, width: usize) -> Line {
+    let mut row: Line = vec![theme.fg_span(ThemeColor::Accent, "\u{258e} ")];
     for mut span in spans {
         if let Some(color) = bg.bg {
             span.style = span.style.bg(color);
@@ -35,18 +34,18 @@ fn block_row(spans: Line, bg: Style, width: usize) -> Line {
 /// `--` only for argument-taking commands; a wrapped token keeps its color on both halves.
 #[must_use]
 pub fn render_slash_command(text: &str, theme: &Theme, width: usize) -> Vec<Line> {
-    let bg = theme.bg_style(ThemeBg::UserMessageBg);
+    let bg = Style::default();
     let paragraphs = source_paragraphs(text, theme);
     let mut rows = vec![vec![Span::styled(" ".repeat(width), bg)]];
     let mut wrapped_any = false;
     for paragraph in &paragraphs {
         for line in crate::width::wrap_line(paragraph, content_width(width)) {
-            rows.push(block_row(line, bg, width));
+            rows.push(block_row(line, theme, bg, width));
             wrapped_any = true;
         }
     }
     if !wrapped_any {
-        rows.push(block_row(Vec::new(), bg, width));
+        rows.push(block_row(Vec::new(), theme, bg, width));
     }
     rows.push(vec![Span::styled(" ".repeat(width), bg)]);
     // Zone markers on the echo block; result rows render unmarked.
@@ -134,7 +133,7 @@ mod tests {
             plain(&rows),
             vec![
                 osc133::ZONE_START.to_string() + &" ".repeat(40),
-                format!("  {}  ", "/goal status") + &" ".repeat(40 - 2 - 12 - 2),
+                format!("\u{258e} {}  ", "/goal status") + &" ".repeat(40 - 2 - 12 - 2),
                 osc133::ZONE_END_PREFIX.to_string() + &" ".repeat(40),
             ]
         );
@@ -145,35 +144,30 @@ mod tests {
         let rows = render_slash_command("/goal make the verifier pass everywhere", &theme(), 30);
         let text = plain(&rows);
         assert_eq!(text.len(), 4);
-        assert!(text[1].starts_with("  /goal make the verifier"));
-        assert!(text[2].starts_with("  pass everywhere"));
+        assert!(text[1].starts_with("\u{258e} /goal make the verifier"));
+        assert!(text[2].starts_with("\u{258e} pass everywhere"));
     }
 
     fn spans_of(row: &Line) -> Vec<(String, Style)> {
         row.iter().map(|s| (s.content.clone(), s.style)).collect()
     }
 
-    /// The styled spans of one render at `Style` level: token colors on the block
-    /// background (the block paints the whole row) and the default foreground between.
+    /// The styled spans of one render at `Style` level: token colors on a
+    /// transparent background and default foreground between.
     fn echo_styles() -> (Style, Style, Style, Style, Style) {
         let theme = theme();
-        let bg = theme
-            .bg_style(ThemeBg::UserMessageBg)
-            .bg
-            .expect("the user-message background is set");
-        let on_bg = |style: Style| Style::default().bg(bg).patch(style);
         (
-            on_bg(theme.fg_style(ThemeColor::Accent)),
-            on_bg(theme.fg_style(ThemeColor::Success)),
-            on_bg(theme.fg_style(ThemeColor::MdLink)),
-            Style::default().bg(bg),
-            theme.bg_style(ThemeBg::UserMessageBg),
+            theme.fg_style(ThemeColor::Accent),
+            theme.fg_style(ThemeColor::Success),
+            theme.fg_style(ThemeColor::MdLink),
+            Style::default(),
+            Style::default(),
         )
     }
 
     #[test]
     fn echo_row_styles_command_and_tokens_like_ts() {
-        // Accent on the leading `/name`, default foreground between,
+        // Accent on the leading `▎ ` bar and `/name`, default foreground between,
         // `success`/`mdLink` on the tokens.
         let (accent, success, md_link, plain, pad) = echo_styles();
         let rows = render_slash_command("/compact fix @Cargo.toml --quiet", &theme(), 60);
@@ -181,7 +175,7 @@ mod tests {
         assert_eq!(
             styled,
             vec![
-                ("  ".to_string(), pad),
+                ("\u{258e} ".to_string(), accent),
                 ("/compact".to_string(), accent),
                 (" fix ".to_string(), plain),
                 ("@Cargo.toml".to_string(), success),
@@ -196,7 +190,7 @@ mod tests {
         assert_eq!(
             styled,
             vec![
-                ("  ".to_string(), pad),
+                ("\u{258e} ".to_string(), accent),
                 ("plain echo text".to_string(), accent),
                 (" ".repeat(43), pad),
             ]

@@ -751,10 +751,9 @@ impl RouterView {
     }
 
     fn render_summary_strip(&self, theme: &Theme, width: usize) -> Line {
-        let bg = theme.bg_style(ThemeBg::UserMessageBg);
-        let muted = bg.patch(theme.fg_style(ThemeColor::Muted));
-        let value = bg.patch(theme.fg_style(ThemeColor::Text)).add_modifier(Modifier::BOLD);
-        let dim = bg.patch(theme.fg_style(ThemeColor::Dim));
+        let muted = theme.fg_style(ThemeColor::Muted);
+        let value = theme.fg_style(ThemeColor::Text).add_modifier(Modifier::BOLD);
+        let dim = theme.fg_style(ThemeColor::Dim);
         let mode_short = match self.draft.routing_mode.as_str() {
             "on" => "Active",
             "off" => "Off",
@@ -766,9 +765,9 @@ impl RouterView {
         } else {
             "Off".to_string()
         };
-        let mut spans = vec![
+        let spans = vec![
             Span::raw("  "),
-            Span::styled(" Mode ", muted),
+            Span::styled("Mode ", muted),
             Span::styled(mode_short, value),
             Span::styled("   \u{b7}   ", dim),
             Span::styled("Priority ", muted),
@@ -777,12 +776,6 @@ impl RouterView {
             Span::styled("Switchyard ", muted),
             Span::styled(sw_short, value),
         ];
-        let used: usize = spans.iter().map(|s| str_width(&s.content)).sum();
-        let right_margin = if width >= 4 { 2 } else { 0 };
-        let fill = width.saturating_sub(used + right_margin);
-        if fill > 0 {
-            spans.push(Span::styled(" ".repeat(fill), bg));
-        }
         truncate_line(&spans, width, "\u{2026}")
     }
 

@@ -122,23 +122,22 @@ fn user_block_renders_box_rows() {
         .iter()
         .map(|s| s.content.as_str())
         .collect::<String>();
-    assert_eq!(text.trim(), "Run a quick check.");
-    assert_eq!(text.len(), 60);
+    assert_eq!(text.trim(), "\u{258e} Run a quick check.");
+    assert_eq!(crate::width::str_width(&text), 60);
 }
 
-/// The user block's styling tiers: the row background, the
+/// The user block's styling tiers: transparent background, the
 /// `userMessageText` body, and the prompt-highlight token colors.
 fn user_block_styles() -> (Style, Style, Style, Style, Style) {
     let theme = theme();
-    let bg = theme.bg_style(ThemeBg::UserMessageBg);
+    let bg = Style::default();
     let body = theme.fg_style(ThemeColor::UserMessageText);
-    let on_bg = |fg: Style| bg.patch(fg);
     (
         bg,
-        on_bg(body),
-        on_bg(theme.fg_style(ThemeColor::Accent)),
-        on_bg(theme.fg_style(ThemeColor::Success)),
-        on_bg(theme.fg_style(ThemeColor::MdLink)),
+        body,
+        theme.fg_style(ThemeColor::Accent),
+        theme.fg_style(ThemeColor::Success),
+        theme.fg_style(ThemeColor::MdLink),
     )
 }
 
@@ -162,14 +161,14 @@ fn row_runs(row: &Line) -> Vec<(String, Style)> {
 #[test]
 fn user_block_keeps_the_link_affordance() {
     crate::hyperlinks::set_hyperlinks_override(Some(false));
-    let (bg, body, _, _, _) = user_block_styles();
+    let (bg, body, accent, _, _) = user_block_styles();
     let link_url = bg.patch(theme().fg_style(ThemeColor::MdLinkUrl));
     let rows = render_user_block("see [docs](https://x.dev/a)", &theme(), "  ", 60);
     assert_eq!(rows.len(), 3);
     assert_eq!(
         row_runs(&rows[1]),
         vec![
-            ("  ".to_string(), bg),
+            ("\u{258e} ".to_string(), accent),
             ("see ".to_string(), body),
             (
                 format!(
@@ -189,14 +188,14 @@ fn user_block_keeps_the_link_affordance() {
 #[test]
 fn user_block_preserves_markdown_styles_on_its_background() {
     let theme = theme();
-    let (bg, body, _, _, _) = user_block_styles();
+    let (bg, body, accent, _, _) = user_block_styles();
     let code = bg.patch(theme.fg_style(ThemeColor::MdCode));
     let rows = render_user_block("Plain **bold** *italic* `path.rs`.", &theme, "  ", 60);
 
     assert_eq!(
         row_runs(&rows[1]),
         vec![
-            ("  ".to_string(), bg),
+            ("\u{258e} ".to_string(), accent),
             ("Plain ".to_string(), body),
             ("bold".to_string(), body.add_modifier(Modifier::BOLD)),
             (" ".to_string(), body),
@@ -213,13 +212,13 @@ fn user_block_preserves_markdown_styles_on_its_background() {
 fn user_block_highlights_argument_tokens() {
     // The argument tokens render in their own colors inside the
     // `userMessageText` body.
-    let (bg, body, _, success, md_link) = user_block_styles();
+    let (bg, body, accent, success, md_link) = user_block_styles();
     let rows = render_user_block("fix @Cargo.toml --quiet now", &theme(), "  ", 60);
     assert_eq!(rows.len(), 3);
     assert_eq!(
         row_runs(&rows[1]),
         vec![
-            ("  ".to_string(), bg),
+            ("\u{258e} ".to_string(), accent),
             ("fix ".to_string(), body),
             ("@Cargo.toml".to_string(), success),
             (" ".to_string(), body),
@@ -240,8 +239,7 @@ fn user_block_accents_a_recognized_leading_command() {
     assert_eq!(
         row_runs(&rows[1]),
         vec![
-            ("  ".to_string(), bg),
-            ("/hotkeys".to_string(), accent),
+            ("\u{258e} /hotkeys".to_string(), accent),
             (" ".repeat(40 - 2 - 8), bg),
         ]
     );
@@ -253,11 +251,12 @@ fn user_block_accents_a_recognized_leading_command() {
             .map(|(t, _)| t.as_str())
             .collect::<String>()
             .trim(),
-        "/definitely-not-builtin now"
+        "\u{258e} /definitely-not-builtin now"
     );
     assert!(
         styled
             .iter()
+            .skip(1)
             .filter(|(_, s)| s != &bg)
             .all(|(_, s)| s == &body),
         "no accent for unrecognized commands: {styled:?}"
@@ -288,7 +287,7 @@ fn user_block_mask_shields_tokens_from_markdown() {
 fn user_block_plain_sources_stay_plain() {
     // A source holding literal mask-range characters masks nothing:
     // the token colors would alias the literals.
-    let (bg, body, _, _, _) = user_block_styles();
+    let (bg, body, accent, _, _) = user_block_styles();
     let rows = render_user_block("look \u{E000} at @file", &theme(), "  ", 60);
     let styled: Vec<(String, Style)> = rows[1]
         .iter()
@@ -297,6 +296,7 @@ fn user_block_plain_sources_stay_plain() {
     assert!(
         styled
             .iter()
+            .skip(1)
             .filter(|(_, s)| s != &bg)
             .all(|(_, s)| s == &body),
         "a literal-mask source renders whole: {styled:?}"
@@ -309,6 +309,7 @@ fn user_block_plain_sources_stay_plain() {
         .iter()
         .flatten()
         .filter(|s| !s.content.contains('\u{1b}'))
+        .filter(|s| s.content != "\u{258e} " || s.style != accent)
         .filter(|s| s.style != body && s.style != bg)
         .map(|s| (s.content.clone(), s.style))
         .collect();

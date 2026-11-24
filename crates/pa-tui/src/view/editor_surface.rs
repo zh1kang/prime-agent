@@ -12,7 +12,7 @@ use crate::editor::Editor;
 use crate::prompt_highlight::{
     command_token, editor_chunk_highlights, editor_text_spans, find_arg_tokens, ArgTokenSpan,
 };
-use crate::theme::{Theme, ThemeBg, ThemeColor};
+use crate::theme::{Theme, ThemeColor};
 use crate::width::{str_width, truncate_to_width};
 use crate::{Line, Span};
 use pa_types::slash_commands::SlashCommandRegistry;
@@ -190,15 +190,14 @@ pub(crate) fn render(
     }
 }
 
-/// The autocomplete dropdown, mounted just above the editor surface. The panel
-/// opens with the one full-width muted rule every inline menu panel opens with (the
-/// operator's 2026-09-26 top-border directive), its rows float on the popup
-/// background, and the selected row's wash spans the panel's full width.
+/// The autocomplete dropdown, mounted just above the editor surface. Draws transparently
+/// over the terminal background (blending cleanly into Ghostty) with a muted top hairline
+/// and a soft selection wash on the active row only.
 pub(crate) fn overlay(editor: &Editor, theme: &Theme, width: usize) -> Vec<Line> {
     let Some(state) = editor.autocomplete_state() else {
         return Vec::new();
     };
-    let bg = theme.bg_style(ThemeBg::ToolPanelBg);
+    let bg = ratatui::style::Style::default();
     let selection = theme.soft_selection_style();
     let padding_x = 2usize;
     // The overlay anchors against the live prompt prefix (the `!`/`!!` prompts
@@ -206,24 +205,13 @@ pub(crate) fn overlay(editor: &Editor, theme: &Theme, width: usize) -> Vec<Line>
     let prompt_width = str_width(editor.bash_prompt_prefix().unwrap_or("> "));
     let content_width = width.saturating_sub(padding_x * 2).max(1);
     let input_width = content_width.saturating_sub(prompt_width).max(1);
-    let border = theme.fg_style(ThemeColor::BorderMuted).patch(bg);
+    let border = theme.fg_style(ThemeColor::BorderMuted);
     let mut rows: Vec<Line> = vec![vec![Span::styled("\u{2500}".repeat(width.max(1)), border)]];
-    let mut overlay = Vec::new();
-    overlay.extend(state.render(theme, input_width));
-    overlay.push(Vec::new());
-    for mut line in overlay {
-        // The shared menu rows pad with unstyled spans, so the popup background
-        // must ride on every span the row left unstyled. The selected row's edge
-        // padding washes with the selection too, so the band spans the panel's full
-        // width.
+    let overlay = state.render(theme, input_width);
+    for line in overlay {
         let selected = line.iter().any(|span| span.style.bg.is_some());
-        for span in &mut line {
-            if span.style.bg.is_none() {
-                span.style = span.style.patch(bg);
-            }
-        }
         let used: usize = line.iter().map(|s| str_width(&s.content)).sum();
-        let edge = if selected { bg.patch(selection) } else { bg };
+        let edge = if selected { selection } else { bg };
         let mut row: Line = vec![Span::styled(" ".repeat(padding_x + prompt_width), edge)];
         row.extend(line);
         row.push(Span::styled(

@@ -10,7 +10,7 @@
 
 use crate::keybindings::KeybindingsManager;
 use crate::menu_panel::{hint_row, menu_list_layout, scroll_row};
-use crate::theme::{Theme, ThemeBg, ThemeColor};
+use crate::theme::{Theme, ThemeColor};
 use crate::width::{str_width, truncate_line, truncate_to_width};
 use crate::{Line, Span};
 use serde_json::Value;
@@ -680,11 +680,13 @@ impl UsageView {
         if !has_today && !has_month && session.is_none() {
             return None;
         }
-        let bg = theme.bg_style(ThemeBg::UserMessageBg);
-        let muted = bg.patch(theme.fg_style(ThemeColor::Muted));
-        let value = bg.patch(theme.fg_style(ThemeColor::Text)).add_modifier(ratatui::style::Modifier::BOLD);
-        let dim = bg.patch(theme.fg_style(ThemeColor::Dim));
-        let mut spans: Vec<Span> = vec![Span::raw("  "), Span::styled(" ", bg)];
+        let bg = ratatui::style::Style::default();
+        let muted = theme.fg_style(ThemeColor::Muted);
+        let value = theme
+            .fg_style(ThemeColor::Text)
+            .add_modifier(ratatui::style::Modifier::BOLD);
+        let dim = theme.fg_style(ThemeColor::Dim);
+        let mut spans: Vec<Span> = vec![Span::raw("  ")];
         let mut first = true;
         let push_sep = |spans: &mut Vec<Span>, first: &mut bool| {
             if !*first {
