@@ -72,7 +72,7 @@ impl AgentsViewMode {
     pub(super) fn toggle_content_search(&mut self) {
         if !self.content_search.supported {
             self.set_status(
-                "Message search needs a newer background service: run `prime-agent shutdown`, then reopen",
+                "Message search needs a newer background service: run `radiata shutdown`, then reopen",
             );
             return;
         }

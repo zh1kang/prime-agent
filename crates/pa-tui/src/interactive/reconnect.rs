@@ -313,7 +313,7 @@ impl Connection {
             (Event::ReattachFailed(error), Connection::Recovering(driver)) => match driver.kind {
                 RecoveryKind::Update => ConnectionEffect::Exit {
                     note: format!(
-                        "reattach after the update failed: {error} — run `prime-agent attach` to resume"
+                        "reattach after the update failed: {error} — run `radiata attach` to resume"
                     ),
                     reason: "update_reattach_failed",
                 },
@@ -344,15 +344,15 @@ fn expiry(kind: RecoveryKind) -> ConnectionEffect {
     let (note, reason) = match kind {
         // The saved-transcript close (the session file survives on disk).
         RecoveryKind::Shutdown => (
-            "The Prime Agent daemon shut down while this window was attached. The session transcript remains saved; restart Prime Agent and reopen it from Agents View.",
+            "The radiata daemon shut down while this window was attached. The session transcript remains saved; restart radiata and reopen it from Agents View.",
             "daemon_closed",
         ),
         RecoveryKind::Lost => (
-            "could not reconnect to the daemon within 10 minutes — run `prime-agent attach` to resume.",
+            "could not reconnect to the daemon within 10 minutes — run `radiata attach` to resume.",
             "daemon_reconnect_failed",
         ),
         RecoveryKind::Update => (
-            "could not reconnect to the daemon within 10 minutes — the update finished but this window is detached. Run `prime-agent attach` to resume.",
+            "could not reconnect to the daemon within 10 minutes — the update finished but this window is detached. Run `radiata attach` to resume.",
             "update_reconnect_failed",
         ),
     };

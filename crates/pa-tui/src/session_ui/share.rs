@@ -71,7 +71,7 @@ impl SessionUi {
         match outcome {
             Ok(version) => {
                 self.note(
-                    &format!("updated to {version} — restart prime-agent to run it"),
+                    &format!("updated to {version} — restart radiata to run it"),
                     view,
                 );
             }

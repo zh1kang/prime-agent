@@ -683,7 +683,7 @@ impl LibraryView {
                 Span::raw("  "),
                 theme.fg_span(
                     ThemeColor::Muted,
-                    "No machines in the library (manage them with prime-agent factory import).",
+                    "No machines in the library (manage them with radiata factory import).",
                 ),
             ]);
         }
