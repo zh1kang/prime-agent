@@ -470,7 +470,7 @@ class RouterFactoryTest(_ExecutorTestCase):
             {
                 "PA_ROUTER_HOME": home.name,
                 "PA_ROUTER_PROVIDERS": "antigravity,codex",
-                "PA_ROUTER_QUOTA_JSON": self._quota(gemini=10, claude_gpt=99, codex=5),
+                "PA_ROUTER_QUOTA_JSON": self._quota(gemini=10, claude_gpt=10, codex=5),
                 "PA_CODEXBAR_BIN": "none",
             },
             remove=("PA_MODEL_ROUTER",),
@@ -492,6 +492,128 @@ class RouterFactoryTest(_ExecutorTestCase):
         self.assertEqual(len(rerouted), 1)
         self.assertIn("antigravity/claude-opus-5-5", rerouted[0]["detail"])
         self.assertIn("antigravity/gemini-4-neon", rerouted[0]["detail"])
+
+    @async_test
+    async def test_auto_mode_proactively_reroutes_hard_exhausted_pool_before_spawn(self) -> None:
+        home = TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        quota = json.dumps(
+            [
+                {
+                    "provider": "claude",
+                    "rateWindowLabels": {"primary": "Session", "secondary": "Weekly"},
+                    "usage": {
+                        "primary": {"usedPercent": 100, "resetsAt": RESET_SOON},
+                        "secondary": {"usedPercent": 100, "resetsAt": RESET_WEEK},
+                    },
+                },
+                {
+                    "provider": "antigravity",
+                    "extraRateWindows": [
+                        {"label": "Gemini weekly", "usedPercent": 10, "resetsAt": RESET_SOON},
+                        {"label": "Claude/GPT weekly", "usedPercent": 99, "resetsAt": RESET_WEEK},
+                    ],
+                },
+            ]
+        )
+        self._isolate(
+            {
+                "PA_ROUTER_HOME": home.name,
+                "PA_ROUTER_PROVIDERS": "claude,antigravity",
+                "PA_ROUTER_QUOTA_JSON": quota,
+                "PA_CODEXBAR_BIN": "none",
+            },
+            remove=("PA_MODEL_ROUTER",),
+        )
+        self._machine("anthropic/claude-opus-5-5")
+        self.host.outcomes["design"] = {"status": "done", "answer": "architecture is sound"}
+        started = await self.start()
+        await self.executor._runs[started["run_id"]].task
+        status = await rlm_module.rlm.factory.status(started["run_id"])
+
+        self.assertEqual(status["state"], "done", status.get("pause_reason") or status.get("last_error"))
+        models = [call["kwargs"].get("model") for call in self.host.spawn_calls("design")]
+        self.assertEqual(models, ["antigravity/gemini-4-neon"])
+        rerouted = [event for event in status["events"] if event["kind"] == "model_rerouted"]
+        self.assertEqual(len(rerouted), 1)
+        self.assertIn("anthropic/claude-opus-5-5 -> antigravity/gemini-4-neon", rerouted[0]["detail"])
+
+    @async_test
+    async def test_hidden_quota_behind_missing_output_reroutes_instead_of_pausing(self) -> None:
+        home = TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        sessions = TemporaryDirectory()
+        self.addCleanup(sessions.cleanup)
+        self.host.session_root = Path(sessions.name)
+        self._isolate(
+            {
+                "PA_ROUTER_HOME": home.name,
+                "PA_ROUTER_PROVIDERS": "antigravity,codex",
+                "PA_ROUTER_QUOTA_JSON": self._quota(gemini=10, claude_gpt=10, codex=99),
+                "PA_CODEXBAR_BIN": "none",
+            },
+            remove=("PA_MODEL_ROUTER",),
+        )
+        self.store_machine(
+            {
+                "states": [
+                    {
+                        "id": "design",
+                        "entry": True,
+                        "subagent": {
+                            "prompt": "Design the architecture of the quota router.",
+                            "model": "antigravity/claude-opus-5-5",
+                        },
+                        "outputs": [{"name": "summary", "type": "text"}],
+                        "emit": {"outputs": [{"name": "summary", "type": "text"}], "records": {}},
+                    }
+                ],
+                "transitions": [],
+            }
+        )
+        # First child settles with partial prose (no factory-outputs) while its session
+        # JSONL records a provider_retry_outcome quota banner from pa-daemon.
+        first_answer = "I'll start by checking the existing files."
+        self.host.outcomes["design"] = {"status": "done", "answer": first_answer}
+        gate = self.host.gate("rlm.collect", 1)
+        started = await self.start()
+        await asyncio.wait_for(self.host.gate_entered("rlm.collect", 1).wait(), 2)
+        run = self.executor._runs[started["run_id"]]
+        inst = run.states["design"].entries[0].instances[0]
+        assert inst.session_dir is not None
+        (Path(inst.session_dir) / "session.jsonl").write_text(
+            json.dumps(
+                {
+                    "type": "custom",
+                    "customType": "provider_retry_outcome",
+                    "data": {
+                        "message": (
+                            "Recovered after 8 retries: ⚠ Individual quota reached. "
+                            "Please upgrade your subscription to increase your limits. Resets in 4h."
+                        )
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        # Second attempt (after automatic reroute to gemini-4-neon) emits the required output.
+        gate2 = self.host.gate("rlm.collect", 2)
+        gate.set()
+        await asyncio.wait_for(self.host.gate_entered("rlm.collect", 2).wait(), 2)
+        self.host.outcomes["design"] = {
+            "status": "done",
+            "answer": 'Done.\n\n```factory-outputs\n{"summary": "implemented cleanly"}\n```',
+        }
+        gate2.set()
+        await run.task
+        status = await rlm_module.rlm.factory.status(started["run_id"])
+
+        self.assertEqual(status["state"], "done", status.get("pause_reason") or status.get("last_error"))
+        models = [call["kwargs"].get("model") for call in self.host.spawn_calls("design")]
+        self.assertEqual(models, ["antigravity/claude-opus-5-5", "antigravity/gemini-4-neon"])
+        rerouted = [event for event in status["events"] if event["kind"] == "model_rerouted"]
+        self.assertEqual(len(rerouted), 1)
 
     @async_test
     async def test_quota_error_pauses_when_every_pool_is_exhausted(self) -> None:
@@ -693,6 +815,139 @@ class RampRouterV2Tests(unittest.TestCase):
             receipt.write_text("{}", encoding="utf-8")
             gw_receipt = model_router.detect_ramp_router_gateway(env={}, home=home)
             self.assertEqual(gw_receipt, {"source": "receipt", "harnesses": ("claude-code",)})
+
+    def test_provider_error_markers_and_cross_process_health_reload(self) -> None:
+        for text in (
+            "You've hit your limit · resets 2am",
+            "Out of extra usage for Claude Max",
+            "Usage limit reached for this billing period",
+            "HTTP 429 Too Many Requests",
+            "Your credit balance is too low to access the Anthropic API.",
+        ):
+            self.assertTrue(model_router.is_provider_error_text(text), text)
+        for benign in ("completed in 429ms", "all tests passed cleanly", ""):
+            self.assertFalse(model_router.is_provider_error_text(benign), benign)
+
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            with patch.dict(os.environ, {"PA_ROUTER_HOME": str(home), "PA_CODEXBAR_BIN": "none"}, clear=False):
+                reset_router()
+                router = model_router.get_router()
+                self.assertFalse(router.pool_open("claude"))
+                # Simulate another process (e.g., Captain) opening the claude circuit on disk.
+                other = ModelRouter(home=home)
+                other.record_failure("claude", "You've hit your limit")
+                reloaded = model_router.get_router()
+                self.assertTrue(reloaded.pool_open("claude"))
+                reset_router()
+
+    def test_captain_router_pre_routes_and_records_fallback(self) -> None:
+        captain_router_path = (
+            Path(__file__).resolve().parents[2] / "crates" / "pa-cli" / "src" / "captain_router.py"
+        )
+        ns: dict[str, object] = {"os": os, "json": json, "Path": Path}
+        exec(compile(captain_router_path.read_text(encoding="utf-8"), str(captain_router_path), "exec"), ns)
+
+        quota_exhausted = json.dumps(
+            [
+                {
+                    "provider": "claude",
+                    "rateWindowLabels": {"primary": "Session", "secondary": "Weekly"},
+                    "usage": {
+                        "primary": {"usedPercent": 100, "resetsAt": RESET_SOON},
+                        "secondary": {"usedPercent": 100, "resetsAt": RESET_WEEK},
+                    },
+                },
+                {
+                    "provider": "antigravity",
+                    "extraRateWindows": [
+                        {"label": "Gemini weekly", "usedPercent": 15, "resetsAt": RESET_SOON},
+                        {"label": "Claude/GPT weekly", "usedPercent": 99, "resetsAt": RESET_WEEK},
+                    ],
+                },
+            ]
+        )
+        quota_healthy = json.dumps(
+            [
+                {
+                    "provider": "claude",
+                    "rateWindowLabels": {"primary": "Session"},
+                    "usage": {"primary": {"usedPercent": 20, "resetsAt": RESET_SOON}},
+                },
+                {
+                    "provider": "antigravity",
+                    "extraRateWindows": [
+                        {"label": "Gemini weekly", "usedPercent": 15, "resetsAt": RESET_SOON},
+                        {"label": "Claude/GPT weekly", "usedPercent": 99, "resetsAt": RESET_WEEK},
+                    ],
+                },
+            ]
+        )
+        with TemporaryDirectory() as tmp:
+            env_base = {
+                "PA_ROUTER_HOME": tmp,
+                "PA_ROUTER_PROVIDERS": "claude,antigravity",
+                "PA_CODEXBAR_BIN": "none",
+                "PA_MODEL_ROUTER_PY": str(Path(model_router.__file__).resolve()),
+            }
+            with patch.dict(os.environ, {**env_base, "PA_ROUTER_QUOTA_JSON": quota_exhausted}, clear=False):
+                os.environ.pop("PA_MODEL_ROUTER", None)
+                ns["_ROUTER_LOOKED"] = False
+                ns["_ROUTER_MOD"] = None
+                model, thinking, note = ns["captain_route_model"](
+                    "anthropic/claude-opus-5-5", "high", prompt="ok go ahead", role="captain", state_id="captain"
+                )
+                self.assertEqual(model, "antigravity/gemini-4-neon")
+                self.assertEqual(thinking, "xhigh")
+                self.assertIsNotNone(note)
+                self.assertIn("antigravity/gemini-4-neon", note)
+
+            with patch.dict(os.environ, {**env_base, "PA_ROUTER_QUOTA_JSON": quota_healthy}, clear=False):
+                os.environ.pop("PA_MODEL_ROUTER", None)
+                ns["_ROUTER_LOOKED"] = False
+                ns["_ROUTER_MOD"] = None
+                model, thinking, note = ns["captain_route_model"](
+                    "anthropic/claude-opus-5-5", "high", prompt="ok go ahead", role="captain", state_id="captain"
+                )
+                self.assertEqual(model, "anthropic/claude-opus-5-5")
+                self.assertIsNone(note)
+
+                fb_model, fb_thinking, fb_note, exhausted = ns["captain_record_and_fallback"](
+                    "anthropic/claude-opus-5-5",
+                    "high",
+                    "You've hit your limit · resets 2am",
+                    prompt="continue implementation",
+                    role="captain",
+                    state_id="captain",
+                )
+                self.assertEqual(fb_model, "antigravity/gemini-4-neon")
+                self.assertIsNone(exhausted)
+                self.assertIsNotNone(fb_note)
+                # Circuit is now persisted on disk so the very next pre-route also avoids claude!
+                model2, _, note2 = ns["captain_route_model"](
+                    "anthropic/claude-opus-5-5", "high", prompt="next turn", role="captain", state_id="captain"
+                )
+                self.assertEqual(model2, "antigravity/gemini-4-neon")
+                self.assertIsNotNone(note2)
+
+            session_jsonl = Path(tmp) / "captain-session.jsonl"
+            session_jsonl.write_text('{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"ok"}]}}\n', encoding="utf-8")
+            offset = session_jsonl.stat().st_size
+            self.assertIsNone(ns["captain_session_quota_error"](str(session_jsonl), offset))
+            with session_jsonl.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    json.dumps(
+                        {
+                            "type": "custom",
+                            "customType": "provider_retry_outcome",
+                            "data": {"message": "Recovered after 3 retries: You've hit your limit"},
+                        }
+                    )
+                    + "\n"
+                )
+            found = ns["captain_session_quota_error"](str(session_jsonl), offset)
+            self.assertIsNotNone(found)
+            self.assertIn("hit your limit", found)
 
 
 if __name__ == "__main__":

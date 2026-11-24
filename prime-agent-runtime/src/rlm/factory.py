@@ -61,10 +61,13 @@ from typing import IO, Any, Callable
 from uuid import uuid4
 
 from .model_router import (
+    PROVIDER_ERROR_MARKERS,
     admission_decision,
     fallback_after_failure,
+    is_provider_error_text,
     is_recognized_model,
     note_provider_failure,
+    pool_is_hard_exhausted,
     router_disabled,
 )
 
@@ -1697,17 +1700,7 @@ def _is_infra_error(message: str) -> bool:
     return any(marker in lowered for marker in _INFRA_ERROR_MARKERS)
 
 
-_PROVIDER_ERROR_MARKERS = (
-    "invalid api key",
-    "fix external api key",
-    "authentication_error",
-    "no api key found",
-    "individual quota reached",
-    "quota exceeded",
-    "rate limit reached",
-    "please upgrade your subscription",
-    "not logged in",
-)
+_PROVIDER_ERROR_MARKERS = PROVIDER_ERROR_MARKERS
 
 _PROVIDER_ANSWER_SCAN_LIMIT = 500
 """Only an answer this short (trimmed) is scanned for provider banners: a
@@ -1715,24 +1708,104 @@ CLI provider reports an auth or quota failure as a short plain-text answer
 with status done, while a real answer that discusses rate limits is long."""
 
 _PROVIDER_ERROR_DETAIL_CAP = 220
+_SESSION_TAIL_BYTES = 32_768
+_SESSION_TAIL_LINES = 40
+
+
+def _cap_provider_detail(text: str) -> str:
+    detail = " ".join(text.split())
+    if len(detail) > _PROVIDER_ERROR_DETAIL_CAP:
+        detail = detail[: _PROVIDER_ERROR_DETAIL_CAP - 1].rstrip() + "…"
+    return detail
 
 
 def _detect_provider_auth_or_quota_error(answer: str | None, error: str | None) -> str | None:
     """A short summary of a provider auth/quota failure, or None.
 
     Retrying or steering a child cannot fix a missing key or a spent quota,
-    so the executor pauses the run for the operator instead."""
+    so the executor reroutes to a healthy fallback pool (or pauses if none).
+    """
     candidates = [error.strip()] if error and error.strip() else []
     trimmed = (answer or "").strip()
     if trimmed and len(trimmed) <= _PROVIDER_ANSWER_SCAN_LIMIT:
         candidates.append(trimmed)
     for text in candidates:
-        lowered = text.lower()
-        if any(marker in lowered for marker in _PROVIDER_ERROR_MARKERS):
-            detail = " ".join(text.split())
-            if len(detail) > _PROVIDER_ERROR_DETAIL_CAP:
-                detail = detail[: _PROVIDER_ERROR_DETAIL_CAP - 1].rstrip() + "…"
-            return detail
+        if is_provider_error_text(text):
+            return _cap_provider_detail(text)
+    return None
+
+
+def _session_quota_error(session_dir: str | None) -> str | None:
+    """Inspect the tail of a child's newest session JSONL for a masked quota/auth error.
+
+    ``pa-daemon``'s internal retry loop can absorb a provider quota banner and
+    settle the child with partial text and a ``provider_retry_outcome`` entry.
+    Scanning the last few lines catches that failure when required outputs go missing.
+    """
+    if not session_dir:
+        return None
+    root = Path(session_dir)
+    if not root.is_dir():
+        return None
+    try:
+        candidates = sorted(
+            (p for p in root.glob("*.jsonl") if p.is_file()),
+            key=lambda p: p.stat().st_mtime_ns,
+            reverse=True,
+        )
+    except OSError:
+        return None
+    if not candidates:
+        return None
+    try:
+        with candidates[0].open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - _SESSION_TAIL_BYTES))
+            chunk = fh.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    lines = [line for line in chunk.splitlines() if line.strip()][-_SESSION_TAIL_LINES:]
+    for raw in reversed(lines):
+        try:
+            row = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        if row.get("type") == "custom" and row.get("customType") == "provider_retry_outcome":
+            data = row.get("data")
+            msg = data.get("message") if isinstance(data, dict) else None
+            if isinstance(msg, str) and is_provider_error_text(msg):
+                return _cap_provider_detail(msg)
+        if row.get("type") == "message":
+            msg = row.get("message")
+            if not isinstance(msg, dict):
+                continue
+            err_msg = msg.get("errorMessage")
+            if isinstance(err_msg, str) and is_provider_error_text(err_msg):
+                return _cap_provider_detail(err_msg)
+            if msg.get("role") == "assistant":
+                content = msg.get("content")
+                if isinstance(content, list):
+                    text_parts = [
+                        item.get("text", "")
+                        for item in content
+                        if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str)
+                    ]
+                    joined = "\n".join(text_parts).strip()
+                    if joined and len(joined) <= _PROVIDER_ANSWER_SCAN_LIMIT and is_provider_error_text(joined):
+                        return _cap_provider_detail(joined)
+    return None
+
+
+def _detect_hidden_provider_quota_error(instance: _NodeInstance, model: str | None) -> str | None:
+    """Detect quota/auth exhaustion masked behind a missing-output or suspended-repair failure."""
+    found = _session_quota_error(instance.session_dir)
+    if found is not None:
+        return found
+    if not router_disabled() and is_recognized_model(model):
+        return pool_is_hard_exhausted(model)
     return None
 
 
@@ -5929,6 +6002,10 @@ class FactoryExecutor:
             if entry.status != "running":
                 return  # a stop()/fail_fast pass claimed the entry mid-capture
             if capture_failure is not None:
+                hidden_quota = _detect_hidden_provider_quota_error(instance, state.model)
+                if hidden_quota is not None:
+                    await self._pause_for_provider_error(run, state, entry, instance, hidden_quota)
+                    return
                 # A declared output that never bound after the capture
                 # retry is the producing entry's task failure, not a silent
                 # valueless settle: no settle is queued (a dependent never
@@ -6137,6 +6214,10 @@ class FactoryExecutor:
             missing = owed.get(instance.index)
             if missing is None:
                 continue
+            hidden_quota = _detect_hidden_provider_quota_error(instance, state.model)
+            if hidden_quota is not None:
+                await self._pause_for_provider_error(run, state, entry, instance, hidden_quota)
+                return
             if instance.repair_sent:
                 await self._apply_instance_failure(
                     run,
@@ -6149,6 +6230,12 @@ class FactoryExecutor:
                 return
             reason = await self._request_repair(run, state, entry, instance, missing)
             if reason is not None:
+                repair_quota = _detect_provider_auth_or_quota_error(None, reason) or _detect_hidden_provider_quota_error(
+                    instance, state.model
+                )
+                if repair_quota is not None:
+                    await self._pause_for_provider_error(run, state, entry, instance, repair_quota)
+                    return
                 await self._apply_instance_failure(run, state, entry, instance, reason, retry=False)
                 return
 
@@ -6349,7 +6436,7 @@ class FactoryExecutor:
         if (
             router_disabled()
             or not is_recognized_model(state.model)
-            or instance.status != "running"
+            or instance.status not in ("running", "done")
             or entry.status != "running"
             or run.state != "running"
         ):
@@ -6372,8 +6459,12 @@ class FactoryExecutor:
             instance.status = "pending"
             instance.error = None
             instance.awaiting_outputs_until = None
+            instance.repair_sent = False
             instance.answer = None
             instance.provisional = False
+            instance.capture_failed = False
+            instance.text_outputs_checked = None
+            instance.text_outputs_error = None
             self._event(
                 run,
                 "settled",
@@ -6521,6 +6612,10 @@ class FactoryExecutor:
         )
         if not task_busy and (repair_finished or self._now_fn() >= instance.awaiting_outputs_until):
             instance.awaiting_outputs_until = None
+            hidden_quota = _detect_hidden_provider_quota_error(instance, state.model)
+            if hidden_quota is not None:
+                await self._pause_for_provider_error(run, state, entry, instance, hidden_quota)
+                return
             await self._apply_instance_failure(
                 run,
                 state,

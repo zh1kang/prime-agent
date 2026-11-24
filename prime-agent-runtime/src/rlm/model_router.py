@@ -110,6 +110,8 @@ _FAST_WORDS = ("typo", "format", "docs", "rename", "comment", "lint", "chore", "
 _ROLE_TIERS = {
     "architect": "frontier",
     "architecture": "frontier",
+    "captain": "frontier",
+    "lead": "frontier",
     "security": "frontier",
     "auditor": "frontier",
     "audit": "frontier",
@@ -926,11 +928,47 @@ def _relative_reset(detail: str, now: float) -> float | None:
     return now + hours * 3600 + minutes * 60 + seconds
 
 
+PROVIDER_ERROR_MARKERS: tuple[str, ...] = (
+    "invalid api key",
+    "fix external api key",
+    "authentication_error",
+    "no api key found",
+    "not logged in",
+    "individual quota reached",
+    "quota exceeded",
+    "exceeded your current quota",
+    "rate limit reached",
+    "rate_limit_error",
+    "too many requests",
+    "please upgrade your subscription",
+    "you've hit your limit",
+    "you have hit your limit",
+    "hit your limit",
+    "usage limit",
+    "out of extra usage",
+    "credit balance is too low",
+    "overloaded_error",
+)
+
+_HTTP_429_RE = re.compile(r"(?:http|status|error|code)[^a-z0-9]{0,4}429\b|\b429\s+(?:too many|rate)", re.IGNORECASE)
+
+
+def is_provider_error_text(text: str | None) -> bool:
+    """True when ``text`` describes a provider quota, rate-limit, or auth failure."""
+
+    if not isinstance(text, str) or not text.strip():
+        return False
+    lowered = text.lower()
+    if any(marker in lowered for marker in PROVIDER_ERROR_MARKERS):
+        return True
+    return _HTTP_429_RE.search(text) is not None
+
+
 def failure_kind(detail: str) -> str:
     text = detail.lower()
     if any(marker in text for marker in ("invalid api key", "authentication", "not logged in", "no api key", "unauthorized")):
         return "auth"
-    if any(marker in text for marker in ("429", "rate limit", "too many requests")):
+    if any(marker in text for marker in ("429", "rate limit", "rate_limit_error", "too many requests", "overloaded_error")):
         return "rate_limit"
     return "quota"
 
@@ -1418,20 +1456,39 @@ class ModelRouter:
     def __init__(self, home: Path | None = None) -> None:
         self.home = home or harness_dir()
         self.health: dict[str, ProviderHealth] = {}
+        self._health_mtime_ns: int | None = None
         self._load_health()
 
     def _health_path(self) -> Path:
         return self.home / HEALTH_NAME
 
+    def _current_health_mtime_ns(self) -> int | None:
+        try:
+            return self._health_path().stat().st_mtime_ns
+        except OSError:
+            return None
+
+    def reload_health_if_changed(self) -> None:
+        mtime = self._current_health_mtime_ns()
+        if mtime is not None and mtime != self._health_mtime_ns:
+            self._load_health()
+
     def _load_health(self) -> None:
-        document = _read_json(self._health_path())
+        path = self._health_path()
+        try:
+            self._health_mtime_ns = path.stat().st_mtime_ns
+        except OSError:
+            self._health_mtime_ns = None
+            return
+        document = _read_json(path)
         pools = document.get("pools") if isinstance(document, dict) else None
         if not isinstance(pools, dict):
             return
+        loaded: dict[str, ProviderHealth] = {}
         for pool, row in pools.items():
             if not isinstance(pool, str) or not isinstance(row, dict):
                 continue
-            self.health[pool] = ProviderHealth(
+            loaded[pool] = ProviderHealth(
                 pool=pool,
                 failure_ewma=float(row.get("failure_ewma") or 0.0),
                 latency_ewma_ms=float(row.get("latency_ewma_ms") or 0.0),
@@ -1441,6 +1498,7 @@ class ModelRouter:
                 last_error=row.get("last_error") if isinstance(row.get("last_error"), str) else None,
                 last_kind=row.get("last_kind") if isinstance(row.get("last_kind"), str) else None,
             )
+        self.health = loaded
 
     def save_health(self) -> None:
         payload = {
@@ -1459,6 +1517,7 @@ class ModelRouter:
         }
         try:
             _atomic_write(self._health_path(), json.dumps(payload))
+            self._health_mtime_ns = self._current_health_mtime_ns()
         except OSError:
             return
 
@@ -1534,6 +1593,8 @@ def get_router() -> ModelRouter:
     home = harness_dir()
     if _ROUTER is None or _ROUTER.home != home:
         _ROUTER = ModelRouter(home=home)
+    else:
+        _ROUTER.reload_health_if_changed()
     return _ROUTER
 
 
@@ -1552,6 +1613,37 @@ def note_provider_failure(model: str | None, detail: str, *, now: float | None =
     get_router().record_model_failure(model, detail, snapshot=snapshot, now=now)
 
 
+def pool_is_hard_exhausted(
+    model: str | None,
+    *,
+    snapshot: QuotaSnapshot | None = None,
+    health: Mapping[str, ProviderHealth] | None = None,
+    now: float | None = None,
+) -> str | None:
+    """Return a short reason if ``model``'s pool is >= HARD_THRESHOLD or circuit-open."""
+
+    if not is_recognized_model(model):
+        return None
+    assert model is not None
+    moment = time.time() if now is None else now
+    pool = pool_for_model(model)
+    scores = health if health is not None else get_router().health
+    if _health_open(scores, pool, moment):
+        row = scores.get(pool)
+        reason = (row.last_error or row.last_kind or "cooldown") if row is not None else "cooldown"
+        return f"{pool} circuit is open ({reason})"
+    if pool.startswith("cursor") and _health_open(scores, "cursor-total", moment):
+        row = scores.get("cursor-total")
+        reason = (row.last_error or row.last_kind or "cooldown") if row is not None else "cooldown"
+        return f"cursor-total circuit is open ({reason})"
+    quota = snapshot if snapshot is not None else load_quota_snapshot(now=moment)
+    used = pool_pressure(quota, pool)
+    if used >= HARD_THRESHOLD:
+        hint = _reset_hint(quota, [pool], moment)
+        return f"{pool} quota exhausted ({hint})" if hint else f"{pool} quota is at {used:.0f}%"
+    return None
+
+
 def admission_decision(
     *,
     prompt: str,
@@ -1564,19 +1656,23 @@ def admission_decision(
 ) -> RouteDecision | None:
     """A route that should change the spawn, or None to leave the state alone.
 
-    Auto mode leaves the first attempt on its pin so a stale health file
-    cannot rewrite a spawn. Later attempts escalate, and a provider error
-    reroutes through ``fallback_after_failure``. Explicit ``PA_MODEL_ROUTER=1``
-    also applies live quota before the first spawn. Unrecognized models,
-    including factory test doubles, are never rewritten.
+    Auto mode preserves a healthy pin on attempt 1, but proactively reroutes
+    before spawning whenever the pinned pool is already HARD-exhausted (>= 98%)
+    or circuit-open. Later attempts escalate and avoid exhausted pools, and a
+    provider error reroutes through ``fallback_after_failure``. Explicit
+    ``PA_MODEL_ROUTER=1`` (Active) also applies soft 90% steering and Switchyard
+    on attempt 1. Unrecognized models, including factory test doubles, are never
+    rewritten.
     """
 
     if router_disabled() or not is_recognized_model(pinned_model):
         return None
     explicit = router_explicit()
+    snapshot = load_quota_snapshot()
+    health = get_router().health
     if not explicit and attempt <= 1:
-        return None
-    snapshot = load_quota_snapshot() if explicit or os.environ.get("PA_ROUTER_QUOTA_JSON") is not None else QuotaSnapshot.empty()
+        if pool_is_hard_exhausted(pinned_model, snapshot=snapshot, health=health) is None:
+            return None
     decision = route_model(
         prompt=prompt,
         state_id=state_id,
@@ -1586,7 +1682,7 @@ def admission_decision(
         pinned_model=pinned_model,
         pinned_thinking=pinned_thinking,
         snapshot=snapshot,
-        health=get_router().health,
+        health=health,
         available=available_providers(),
         routing_profile=load_routing_profile(),
     )
@@ -1607,10 +1703,12 @@ def fallback_after_failure(
     attempt: int,
     model: str,
     thinking: str | None,
+    exclude_models: tuple[str, ...] = (),
 ) -> RouteDecision:
     """The next model after a provider auth or quota failure on ``model``."""
 
     snapshot = load_quota_snapshot()
+    excluded = tuple(dict.fromkeys((*exclude_models, model)))
     return route_model(
         prompt=prompt,
         state_id=state_id,
@@ -1622,7 +1720,7 @@ def fallback_after_failure(
         snapshot=snapshot,
         health=get_router().health,
         available=available_providers(),
-        exclude_models=(model,),
+        exclude_models=excluded,
         routing_profile=load_routing_profile(),
     )
 
@@ -1642,7 +1740,7 @@ def format_captain_router_brief(
     moment = time.time() if now is None else now
     quota = snapshot if snapshot is not None else load_quota_snapshot(now=moment)
     providers = available if available is not None else available_providers()
-    scores = health if health is not None else {}
+    scores = health if health is not None else get_router().health
     lines: list[str] = []
     if quota.error and not quota.pools:
         lines.append(f"Quota snapshot unavailable ({quota.error}).")

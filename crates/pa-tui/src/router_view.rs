@@ -98,8 +98,8 @@ pub const PRESETS: &[PresetSpec] = &[
 ];
 
 pub const MODES: &[(&str, &str)] = &[
-    ("auto", "Auto (reroute on errors & retries)"),
-    ("on", "Active (steer proactively on quota)"),
+    ("auto", "Auto (reroute on 98%+ quota, errors & retries)"),
+    ("on", "Active (steer proactively on 90%+ quota & Switchyard)"),
     ("off", "Off (always keep pinned models)"),
 ];
 

@@ -3286,14 +3286,24 @@ class _ExecutorTestCase(unittest.TestCase):
         self.settings_path.write_text(json.dumps(document), encoding="utf-8")
 
     def _isolate_agent_dir(self, agent_dir: str) -> None:
-        previous = os.environ.get("PRIME_AGENT_CODING_AGENT_DIR")
-        os.environ["PRIME_AGENT_CODING_AGENT_DIR"] = agent_dir
+        from rlm.model_router import reset_router
+
+        updates = {
+            "PRIME_AGENT_CODING_AGENT_DIR": agent_dir,
+            "PA_ROUTER_HOME": agent_dir,
+            "PA_CODEXBAR_BIN": "none",
+        }
+        previous = {key: os.environ.get(key) for key in updates}
+        os.environ.update(updates)
+        reset_router()
 
         def restore() -> None:
-            if previous is None:
-                os.environ.pop("PRIME_AGENT_CODING_AGENT_DIR", None)
-            else:
-                os.environ["PRIME_AGENT_CODING_AGENT_DIR"] = previous
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+            reset_router()
 
         self.addCleanup(restore)
 
@@ -11780,14 +11790,24 @@ class ExportMachineTest(unittest.TestCase):
         settings_path.write_text(json.dumps(document), encoding="utf-8")
 
     def _isolate_agent_dir(self, agent_dir: str) -> None:
-        previous = os.environ.get("PRIME_AGENT_CODING_AGENT_DIR")
-        os.environ["PRIME_AGENT_CODING_AGENT_DIR"] = agent_dir
+        from rlm.model_router import reset_router
+
+        updates = {
+            "PRIME_AGENT_CODING_AGENT_DIR": agent_dir,
+            "PA_ROUTER_HOME": agent_dir,
+            "PA_CODEXBAR_BIN": "none",
+        }
+        previous = {key: os.environ.get(key) for key in updates}
+        os.environ.update(updates)
+        reset_router()
 
         def restore() -> None:
-            if previous is None:
-                os.environ.pop("PRIME_AGENT_CODING_AGENT_DIR", None)
-            else:
-                os.environ["PRIME_AGENT_CODING_AGENT_DIR"] = previous
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+            reset_router()
 
         self.addCleanup(restore)
 

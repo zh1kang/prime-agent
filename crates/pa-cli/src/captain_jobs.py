@@ -1089,6 +1089,19 @@ def run_machine_job(j, p, m):
         else:
             env.pop("PRIME_AGENT_DAEMON_SOCKET")
         model, thinking = machine_host_model(j, factory_default_model(p))
+        if model:
+            try:
+                routed_model, routed_thinking, _note = captain_route_model(
+                    model,
+                    thinking,
+                    prompt=str(spec.get("params") or ""),
+                    role="implementer",
+                    state_id=str(spec.get("name") or "factory"),
+                )
+                if routed_model:
+                    model, thinking = routed_model, routed_thinking
+            except Exception:
+                pass
         host = [PA, "thread", "factory-host", str(cell), m["ref"]]
         if model:
             host += ["--model", model]
@@ -2030,24 +2043,51 @@ def work(jid):
                     (len(before["messages"]), prompt, tid, jid),
                 )
             extra = {}
+            is_prime = before.get("provider") == "prime"
+            reroute_notes = []
             if lead:
-                if p.get("model"):
-                    extra["PA_THREAD_MODEL"] = p["model"]
-                if p.get("thinking"):
-                    extra["PA_THREAD_THINKING"] = p["thinking"]
+                configured_model = p.get("model") or ""
+                configured_thinking = p.get("thinking") or ""
+                route_role = "captain"
+                route_state = "captain"
                 images = job_images(j)
                 if images:
                     extra["PA_CAPTAIN_IMAGES"] = "\n".join(images)
-                env = thread_env(PA_CAPTAIN_ACTOR=p["id"], **extra)
+                actor = p["id"]
             else:
-                crew_model = j.get("model") or (m.get("model") if m else "")
-                crew_thinking = j.get("thinking") or (m.get("thinking") if m else "")
-                if crew_model:
-                    extra["PA_THREAD_MODEL"] = crew_model
-                if crew_thinking:
-                    extra["PA_THREAD_THINKING"] = crew_thinking
+                configured_model = j.get("model") or (m.get("model") if m else "") or ""
+                configured_thinking = j.get("thinking") or (m.get("thinking") if m else "") or ""
+                route_role = (m.get("specialist") or None) if m else None
+                route_state = j.get("purpose") or "crew"
                 # A crew turn is never the user: Captain actions from it are refused.
-                env = thread_env(PA_CAPTAIN_ACTOR="crew:" + p["id"], **extra)
+                actor = "crew:" + p["id"]
+            active_model = configured_model or (captain_default_agent_model() if is_prime else "")
+            active_thinking = configured_thinking
+            if is_prime and active_model:
+                try:
+                    routed_model, routed_thinking, note = captain_route_model(
+                        active_model,
+                        active_thinking,
+                        prompt=prompt,
+                        role=route_role,
+                        state_id=route_state,
+                        attempt=1,
+                    )
+                    if routed_model and routed_model != active_model:
+                        active_model = routed_model
+                        active_thinking = routed_thinking or active_thinking
+                        if note:
+                            reroute_notes.append(note)
+                except Exception:
+                    pass
+            if configured_model or reroute_notes:
+                if active_model:
+                    extra["PA_THREAD_MODEL"] = active_model
+                if active_thinking:
+                    extra["PA_THREAD_THINKING"] = active_thinking
+            elif configured_thinking:
+                extra["PA_THREAD_THINKING"] = configured_thinking
+            env = thread_env(PA_CAPTAIN_ACTOR=actor, **extra)
             # The model reads the Captain's instructions and state as hidden context; the
             # transcript keeps only the visible text, which is also the job's `dispatch`.
             context_file = BASE / ("context-" + jid + ".txt")
@@ -2057,15 +2097,64 @@ def work(jid):
             # until then, so the stop settles only after the turn has ended.
             stop_requested = []
             signal.signal(signal.SIGTERM, lambda *_: stop_requested.append(True))
+            tried_models = set()
+            run = None
             try:
-                run = subprocess.run(
-                    [PA, "thread", tid, "send-stdin", "--context-file", str(context_file)],
-                    cwd=cwd,
-                    env=env,
-                    input=prompt,
-                    capture_output=True,
-                    text=True,
-                )
+                for attempt_idx in range(3):
+                    attempt_offset = (
+                        Path(session_file).stat().st_size
+                        if session_file and Path(session_file).exists()
+                        else session_offset
+                    )
+                    run = subprocess.run(
+                        [PA, "thread", tid, "send-stdin", "--context-file", str(context_file)],
+                        cwd=cwd,
+                        env=env,
+                        input=prompt,
+                        capture_output=True,
+                        text=True,
+                    )
+                    if stop_requested:
+                        break
+                    quota_err = None
+                    if run.returncode:
+                        err_text = (run.stderr or run.stdout or "Provider turn failed.").strip()[-1800:]
+                        if captain_is_provider_error(err_text):
+                            quota_err = err_text
+                        else:
+                            quota_err = captain_session_quota_error(session_file, attempt_offset)
+                    else:
+                        out_text = run.stdout.strip()
+                        if out_text and len(out_text) <= 500 and captain_is_provider_error(out_text):
+                            quota_err = out_text
+                    if not quota_err:
+                        break
+                    if is_prime and active_model and attempt_idx < 2 and not durable(tid).get("pending"):
+                        tried_models.add(active_model)
+                        fb_model, fb_thinking, fb_note, fb_exhausted = captain_record_and_fallback(
+                            active_model,
+                            active_thinking,
+                            quota_err,
+                            prompt=prompt,
+                            role=route_role,
+                            state_id=route_state,
+                            attempt=attempt_idx + 1,
+                            exclude=tried_models,
+                        )
+                        if fb_model:
+                            active_model = fb_model
+                            active_thinking = fb_thinking or active_thinking
+                            env["PA_THREAD_MODEL"] = active_model
+                            if active_thinking:
+                                env["PA_THREAD_THINKING"] = active_thinking
+                            if fb_note:
+                                reroute_notes.append(fb_note)
+                            continue
+                        if fb_exhausted:
+                            raise ValueError(f"{quota_err} ({fb_exhausted})")
+                    if run.returncode == 0:
+                        raise ValueError(quota_err)
+                    break
             finally:
                 context_file.unlink(missing_ok=True)
             if stop_requested:
@@ -2080,6 +2169,8 @@ def work(jid):
                 )
             native_delivered = bool(m and m["kind"] == "native")
             detail = run.stdout.strip() or "Turn completed."
+            if reroute_notes:
+                detail = f"_Auto-rerouted: {reroute_notes[-1]}_\n\n{detail}"
             state = result_state(detail)
             succeeded = True
         except (OSError, ValueError, subprocess.SubprocessError) as err:
