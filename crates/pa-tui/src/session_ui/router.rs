@@ -1,4 +1,4 @@
-//! The `/router` panel's session side: opens the Ramp V2 model router TUI,
+//! The `/router` panel's session side: opens the model router TUI,
 //! keeps its pool telemetry synced with the `/usage` cache, and triggers a
 //! fresh `codexbar` reload on `r`.
 

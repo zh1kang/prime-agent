@@ -1047,3 +1047,55 @@ fn an_assistant_growth_folds_at_its_own_slot() {
         "the paused selection keeps its content while the answer streams"
     );
 }
+
+#[test]
+fn a_silent_open_stream_reads_waiting_until_output_resumes() {
+    use crate::chat::WorkingState;
+    let mut view = AgentView::new(crate::theme::Theme::builtin(
+        "prime",
+        crate::theme::ColorMode::TrueColor,
+    ));
+    view.working = Some(WorkingState {
+        activity: "Writing",
+        message: None,
+        download: true,
+        tokens: 0,
+        elapsed_secs: 0,
+    });
+    let start = std::time::Instant::now();
+    view.stream_output_at = Some(start);
+
+    view.settle_quiet_stream(start + super::QUIET_STREAM_AFTER / 2);
+    assert_eq!(view.working.as_ref().map(|w| w.activity), Some("Writing"));
+
+    view.settle_quiet_stream(start + super::QUIET_STREAM_AFTER);
+    let working = view.working.as_ref().expect("loader");
+    assert_eq!(working.activity, "Waiting");
+    assert!(!working.download);
+
+    crate::session_ui::SessionUi::track_stream_activity(
+        &serde_json::json!({"type": "text_delta"}),
+        &mut view,
+    );
+    assert_eq!(view.working.as_ref().map(|w| w.activity), Some("Writing"));
+}
+
+#[test]
+fn a_running_tool_label_is_not_rewritten_by_the_quiet_gap() {
+    use crate::chat::WorkingState;
+    let mut view = AgentView::new(crate::theme::Theme::builtin(
+        "prime",
+        crate::theme::ColorMode::TrueColor,
+    ));
+    view.working = Some(WorkingState {
+        activity: "Executing",
+        message: None,
+        download: false,
+        tokens: 0,
+        elapsed_secs: 0,
+    });
+    let start = std::time::Instant::now();
+    view.stream_output_at = Some(start);
+    view.settle_quiet_stream(start + super::QUIET_STREAM_AFTER * 4);
+    assert_eq!(view.working.as_ref().map(|w| w.activity), Some("Executing"));
+}

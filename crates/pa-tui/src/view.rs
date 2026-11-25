@@ -62,7 +62,7 @@ pub(crate) enum Overlay {
     Mcp(crate::mcp_view::McpView),
     /// The `/usage` provider usage and spend panel.
     Usage(crate::usage_view::UsageView),
-    /// The `/router` Ramp V2 model routing control panel.
+    /// The `/router` model routing control panel.
     Router(crate::router_view::RouterView),
     /// The factory page: the activity dock's factory group's destination.
     Factory(crate::factory_view::FactoryView),
@@ -124,6 +124,9 @@ pub struct AgentView {
     pub pulse_frame: usize,
     /// When the current working loader started (elapsed label).
     pub working_since: Option<std::time::Instant>,
+    /// When the last provider stream delta arrived; a long gap turns a
+    /// streaming label into "Waiting".
+    pub stream_output_at: Option<std::time::Instant>,
     pub retry: Option<crate::chat::RetryState>,
     /// The one panel that owns the frame while open; `None` is the bare editor dock. One field holds
     /// it, so two panels can never be open at once, and keys, render, paste, mouse and cursor all
@@ -336,6 +339,7 @@ impl AgentView {
             compaction_generation: 0,
             pulse_frame: 0,
             working_since: None,
+            stream_output_at: None,
             retry: None,
             overlay: None,
             modal_backdrop: None,
@@ -687,13 +691,18 @@ impl AgentView {
     }
 
     /// Scroll the transcript window: scrolling up pauses following and
-    /// reaching the bottom resumes it.
-    pub fn scroll_by(&mut self, delta: isize) {
-        if let Some(window) = &mut self.sparse_window {
-            window.scroll_by(delta);
-            self.following = window.at_tail();
-            return;
+    /// reaching the bottom resumes it. Returns `true` when the viewport moved.
+    pub fn scroll_by(&mut self, delta: isize) -> bool {
+        if delta == 0 {
+            return false;
         }
+        let prev_following = self.following;
+        if let Some(window) = &mut self.sparse_window {
+            let moved = window.scroll_by(delta);
+            self.following = window.at_tail();
+            return moved || self.following != prev_following;
+        }
+        let prev_top = self.scroll_top;
         let base = if self.following {
             self.last_max_scroll
         } else {
@@ -704,6 +713,7 @@ impl AgentView {
         if self.following {
             self.scroll_top = self.last_max_scroll;
         }
+        self.scroll_top != prev_top || self.following != prev_following
     }
 
     /// Jump to the transcript start; an empty transcript keeps following.

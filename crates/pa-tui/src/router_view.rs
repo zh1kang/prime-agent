@@ -9,7 +9,7 @@
 
 use crate::keybindings::KeybindingsManager;
 use crate::menu_panel::hint_row;
-use crate::theme::{Theme, ThemeBg, ThemeColor};
+use crate::theme::{Theme, ThemeColor};
 use crate::usage_view::{bar_cells_width, bar_color, parse_usage, ProviderUsage, UsageReport};
 use crate::width::{str_width, truncate_line, truncate_to_width};
 use crate::{Line, Span};
@@ -34,12 +34,13 @@ pub struct PresetSpec {
     pub sensitivity: &'static str,
 }
 
+/// The workload presets of `ROUTING_PRESETS` in `prime-agent-runtime/src/rlm/model_router.py`.
 pub const PRESETS: &[PresetSpec] = &[
     PresetSpec {
         slug: "coding-agents",
         label: "Coding agents",
         cost_efficient: true,
-        priority: "quota_aware",
+        priority: "favor_cost",
         switchyard: false,
         efficient_model: "antigravity/gemini-3.8-flash",
         capable_model: "antigravity/gemini-4-neon",
@@ -126,6 +127,8 @@ struct CatalogEntry {
     thinking: &'static str,
 }
 
+/// Mirrors `CATALOG` in `prime-agent-runtime/src/rlm/model_router.py`: the preview must rank the
+/// same candidates the router launches.
 const CATALOG: &[CatalogEntry] = &[
     CatalogEntry { model: "anthropic/claude-opus-5-5", tier: "frontier", pool: "claude", cost: 25.0, thinking: "xhigh" },
     CatalogEntry { model: "openai-codex/gpt-5.5", tier: "frontier", pool: "codex", cost: 15.0, thinking: "xhigh" },
@@ -137,8 +140,10 @@ const CATALOG: &[CatalogEntry] = &[
     CatalogEntry { model: "openai-codex/gpt-5.3-codex", tier: "strong", pool: "codex", cost: 15.0, thinking: "high" },
     CatalogEntry { model: "antigravity/gemini-4-neon", tier: "strong", pool: "antigravity-gemini", cost: 15.0, thinking: "high" },
     CatalogEntry { model: "antigravity/claude-sonnet-5-5", tier: "strong", pool: "antigravity-claude-gpt", cost: 15.0, thinking: "high" },
+    CatalogEntry { model: "cursor/gpt-5.5", tier: "strong", pool: "cursor-third-party", cost: 15.0, thinking: "high" },
     CatalogEntry { model: "cursor/grok-4.7", tier: "strong", pool: "cursor-third-party", cost: 12.0, thinking: "high" },
     CatalogEntry { model: "anthropic/claude-sonnet-5-5", tier: "balanced", pool: "claude", cost: 15.0, thinking: "medium" },
+    CatalogEntry { model: "openai-codex/gpt-5.3-codex", tier: "balanced", pool: "codex", cost: 15.0, thinking: "medium" },
     CatalogEntry { model: "openai-codex/gpt-6-luna", tier: "balanced", pool: "codex", cost: 8.0, thinking: "medium" },
     CatalogEntry { model: "antigravity/gemini-4-argon", tier: "balanced", pool: "antigravity-gemini", cost: 10.0, thinking: "medium" },
     CatalogEntry { model: "antigravity/gpt-oss-120b", tier: "balanced", pool: "antigravity-claude-gpt", cost: 8.0, thinking: "medium" },
@@ -184,7 +189,8 @@ impl Default for RouterProfileDraft {
         Self {
             routing_mode: "auto".to_string(),
             preset_slug: base.slug.to_string(),
-            provider_priority: base.priority.to_string(),
+            // Matches `RoutingProfile()` default in `model_router.py` when no profile file exists.
+            provider_priority: "quota_aware".to_string(),
             cost_efficient: base.cost_efficient,
             switchyard_enabled: base.switchyard,
             efficient_model: base.efficient_model.to_string(),
@@ -313,6 +319,7 @@ pub struct PoolSnapshot {
     pub pool: String,
     pub used_percent: f64,
     pub circuit_open: bool,
+    pub failure_ewma: f64,
     pub latency_ms: f64,
 }
 
@@ -332,6 +339,8 @@ pub struct RouterView {
     selected: usize,
     pools: Vec<PoolSnapshot>,
     ramp_gateway: Option<String>,
+    /// The mode `PA_MODEL_ROUTER` forces over the saved profile, if set.
+    env_mode: Option<&'static str>,
     refreshing: bool,
     notice: Option<String>,
     error: Option<String>,
@@ -354,12 +363,13 @@ impl RouterView {
             selected: 0,
             pools: Vec::new(),
             ramp_gateway: detect_ramp_gateway(),
+            env_mode: env_router_mode(std::env::var("PA_MODEL_ROUTER").ok().as_deref()),
             refreshing,
             notice: None,
             error: None,
             home_dir,
         };
-        view.reload_telemetry(report);
+        view.reload_telemetry_inner(report);
         view
     }
 
@@ -369,6 +379,13 @@ impl RouterView {
 
     pub fn reload_telemetry(&mut self, report: Option<&UsageReport>) {
         self.refreshing = false;
+        if self.notice.as_deref() == Some("Refreshing quotas\u{2026}") {
+            self.notice = None;
+        }
+        self.reload_telemetry_inner(report);
+    }
+
+    fn reload_telemetry_inner(&mut self, report: Option<&UsageReport>) {
         let providers = match report {
             Some(UsageReport::Loaded(list)) => Some(list.clone()),
             _ => load_cached_providers(&self.home_dir.join(QUOTA_CACHE_FILENAME)),
@@ -418,7 +435,7 @@ impl RouterView {
         }
         if key == "right"
             || key == "l"
-            || key == " "
+            || key == "space"
             || key == "enter"
             || kb.matches(key, "tui.select.confirm")
         {
@@ -493,7 +510,7 @@ impl RouterView {
                 return RouterViewAction::None;
             }
         };
-        let tmp = path.with_extension("json.tmp");
+        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
         if let Err(err) = std::fs::write(&tmp, payload).and_then(|()| std::fs::rename(&tmp, &path))
         {
             self.error = Some(format!("Could not save router profile: {err}"));
@@ -523,15 +540,13 @@ impl RouterView {
         } else if self.is_dirty() {
             "unsaved changes (press s to save)".to_string()
         } else if let Some(gw) = &self.ramp_gateway {
-            format!("Ramp gateway: {gw}")
+            format!("Gateway: {gw}")
         } else {
             "saved".to_string()
         };
         let mut title: Line = vec![
             Span::raw("  "),
-            theme.bold(theme.fg_span(ThemeColor::Text, "Model Router")),
-            Span::raw("  "),
-            theme.fg_span(ThemeColor::Dim, "Ramp V2"),
+            theme.bold(theme.fg_span(ThemeColor::Text, "Router")),
         ];
         let left_w: usize = title.iter().map(|s| str_width(&s.content)).sum();
         let status_w = str_width(&status);
@@ -558,7 +573,7 @@ impl RouterView {
         ]);
         lines.push(Vec::new());
 
-        // Summary strip on UserMessageBg
+        // Summary strip
         lines.push(self.render_summary_strip(theme, width));
         lines.push(Vec::new());
 
@@ -568,7 +583,7 @@ impl RouterView {
             theme.bold(theme.fg_span(ThemeColor::Accent, "Routing Strategy")),
         ]);
         let controls: [(&str, String); ROW_COUNT] = [
-            ("Router mode", lookup_label(MODES, &self.draft.routing_mode)),
+            ("Router mode", self.mode_label()),
             (
                 "Workload preset",
                 PRESETS
@@ -610,23 +625,21 @@ impl RouterView {
             let prefix = if selected { "  \u{25b8} " } else { "    " };
             let label_pad = 22usize.saturating_sub(str_width(label));
             let row = if selected {
-                let bg = theme.bg_style(ThemeBg::UserMessageBg);
-                let accent = bg.patch(theme.fg_style(ThemeColor::Accent)).add_modifier(Modifier::BOLD);
-                let text = bg.patch(theme.fg_style(ThemeColor::Text)).add_modifier(Modifier::BOLD);
-                let muted = bg.patch(theme.fg_style(ThemeColor::Muted));
-                let mut spans = vec![
+                let sel = theme.soft_selection_style();
+                let accent = sel
+                    .patch(theme.fg_style(ThemeColor::Accent))
+                    .add_modifier(Modifier::BOLD);
+                let text = sel
+                    .patch(theme.fg_style(ThemeColor::Text))
+                    .add_modifier(Modifier::BOLD);
+                let muted = sel.patch(theme.fg_style(ThemeColor::Muted));
+                vec![
                     Span::styled(prefix, accent),
                     Span::styled(format!("{label}{}", " ".repeat(label_pad)), text),
                     Span::styled("  \u{25c2} ", muted),
                     Span::styled(val.clone(), text),
                     Span::styled(" \u{25b8}", muted),
-                ];
-                let used: usize = spans.iter().map(|s| str_width(&s.content)).sum();
-                let fill = width.saturating_sub(used + 2);
-                if fill > 0 {
-                    spans.push(Span::styled(" ".repeat(fill), bg));
-                }
-                spans
+                ]
             } else {
                 let label_color = if dimmed { ThemeColor::Dim } else { ThemeColor::Muted };
                 let val_color = if dimmed { ThemeColor::Dim } else { ThemeColor::Text };
@@ -750,11 +763,28 @@ impl RouterView {
         lines
     }
 
+    /// The mode the router runs with: `PA_MODEL_ROUTER` wins over the saved profile.
+    fn effective_mode(&self) -> &str {
+        self.env_mode.unwrap_or(self.draft.routing_mode.as_str())
+    }
+
+    fn mode_label(&self) -> String {
+        match self.env_mode {
+            Some(env) if env != self.draft.routing_mode => format!(
+                "{} (PA_MODEL_ROUTER override; saved: {})",
+                lookup_label(MODES, env),
+                self.draft.routing_mode
+            ),
+            Some(env) => format!("{} (PA_MODEL_ROUTER)", lookup_label(MODES, env)),
+            None => lookup_label(MODES, &self.draft.routing_mode),
+        }
+    }
+
     fn render_summary_strip(&self, theme: &Theme, width: usize) -> Line {
         let muted = theme.fg_style(ThemeColor::Muted);
         let value = theme.fg_style(ThemeColor::Text).add_modifier(Modifier::BOLD);
         let dim = theme.fg_style(ThemeColor::Dim);
-        let mode_short = match self.draft.routing_mode.as_str() {
+        let mode_short = match self.effective_mode() {
             "on" => "Active",
             "off" => "Off",
             _ => "Auto",
@@ -779,31 +809,44 @@ impl RouterView {
         truncate_line(&spans, width, "\u{2026}")
     }
 
-    fn pool_ok(&self, pool: &str, tier: &str) -> (bool, f64, f64) {
+    fn pool_ok(&self, pool: &str, tier: &str) -> (bool, f64, f64, f64) {
         let limit = if matches!(tier, "strong" | "frontier") {
             98.0
         } else {
             90.0
         };
         let snap = self.pools.iter().find(|p| p.pool == pool);
-        let cursor_blocked = pool.starts_with("cursor")
-            && self
-                .pools
-                .iter()
-                .find(|p| p.pool == "cursor-total")
-                .is_some_and(|p| p.circuit_open || p.used_percent >= limit);
-        if cursor_blocked {
-            return (false, 100.0, 0.0);
+        let cursor_total = pool
+            .starts_with("cursor")
+            .then(|| self.pools.iter().find(|p| p.pool == "cursor-total"))
+            .flatten();
+        if let Some(total) = cursor_total {
+            if total.circuit_open || total.used_percent >= limit {
+                return (false, 100.0, total.failure_ewma, total.latency_ms);
+            }
         }
+        let extra_pressure = cursor_total.map_or(0.0, |t| t.used_percent);
         match snap {
-            Some(p) => (!p.circuit_open && p.used_percent < limit, p.used_percent, p.latency_ms),
-            None => (true, 0.0, 0.0),
+            Some(p) => {
+                let pressure = p.used_percent.max(extra_pressure);
+                (
+                    !p.circuit_open && pressure < limit,
+                    pressure,
+                    p.failure_ewma,
+                    p.latency_ms,
+                )
+            }
+            None => (extra_pressure < limit, extra_pressure, 0.0, 0.0),
         }
     }
 
     fn preview_tier(&self, tier: &str) -> (String, String, String) {
-        if self.draft.routing_mode == "off" {
-            return ("pinned model".to_string(), String::new(), "router off".to_string());
+        if self.effective_mode() == "off" {
+            return (
+                "pinned model".to_string(),
+                String::new(),
+                "router off".to_string(),
+            );
         }
         let thinking = match tier {
             "fast" => "low",
@@ -823,47 +866,85 @@ impl RouterView {
                 &self.draft.efficient_model
             };
             if let Some(entry) = CATALOG.iter().find(|c| c.model == target) {
-                let (ok, _, _) = self.pool_ok(entry.pool, tier);
+                let (ok, _, _, _) = self.pool_ok(entry.pool, tier);
                 if ok {
-                    let tag = if use_capable { "switchyard capable" } else { "switchyard efficient" };
-                    return (entry.model.to_string(), thinking.to_string(), tag.to_string());
+                    let tag = if use_capable {
+                        "switchyard capable"
+                    } else {
+                        "switchyard efficient"
+                    };
+                    return (
+                        entry.model.to_string(),
+                        thinking.to_string(),
+                        tag.to_string(),
+                    );
                 }
             }
         }
-        let mut viable: Vec<(CatalogEntry, f64, f64)> = CATALOG
-            .iter()
-            .filter(|c| c.tier == tier)
-            .filter_map(|&c| {
-                let (ok, pressure, latency) = self.pool_ok(c.pool, tier);
-                ok.then_some((c, pressure, latency))
-            })
-            .collect();
-        if viable.is_empty() {
-            return ("none healthy".to_string(), String::new(), "all pools full".to_string());
-        }
-        viable.sort_by(|(a, ap, al), (b, bp, bl)| {
-            if matches!(
-                self.draft.provider_priority.as_str(),
-                "throughput_only" | "favor_throughput"
-            ) {
-                al.total_cmp(bl)
-                    .then_with(|| ap.total_cmp(bp))
-                    .then_with(|| a.cost.total_cmp(&b.cost))
-                    .then_with(|| a.model.cmp(b.model))
-            } else {
-                a.cost
-                    .total_cmp(&b.cost)
-                    .then_with(|| ((ap / 25.0) as u32).cmp(&((bp / 25.0) as u32)))
-                    .then_with(|| a.model.cmp(b.model))
+        const TIER_ORDER: [&str; 4] = ["fast", "balanced", "strong", "frontier"];
+        let start_idx = TIER_ORDER.iter().position(|&t| t == tier).unwrap_or(1);
+        for &candidate_tier in &TIER_ORDER[start_idx..] {
+            let mut viable: Vec<(CatalogEntry, f64, f64, f64)> = CATALOG
+                .iter()
+                .filter(|c| c.tier == candidate_tier)
+                .filter_map(|&c| {
+                    let (ok, pressure, failure, latency) = self.pool_ok(c.pool, candidate_tier);
+                    ok.then_some((c, pressure, failure, latency))
+                })
+                .collect();
+            if viable.is_empty() {
+                continue;
             }
-        });
-        let (best, pressure, _) = viable[0];
-        let note = if pressure > 0.0 {
-            format!("{} {:.0}%", best.pool, pressure)
-        } else {
-            best.pool.to_string()
-        };
-        (best.model.to_string(), best.thinking.to_string(), note)
+            viable.sort_by(|(a, ap, af, al), (b, bp, bf, bl)| {
+                match self.draft.provider_priority.as_str() {
+                    "throughput_only" => al
+                        .total_cmp(bl)
+                        .then_with(|| af.total_cmp(bf))
+                        .then_with(|| ap.total_cmp(bp))
+                        .then_with(|| a.cost.total_cmp(&b.cost))
+                        .then_with(|| a.model.cmp(b.model)),
+                    "favor_throughput" => al
+                        .total_cmp(bl)
+                        .then_with(|| af.total_cmp(bf))
+                        .then_with(|| a.cost.total_cmp(&b.cost))
+                        .then_with(|| ap.total_cmp(bp))
+                        .then_with(|| a.model.cmp(b.model)),
+                    "cost_only" | "favor_cost" => a
+                        .cost
+                        .total_cmp(&b.cost)
+                        .then_with(|| af.total_cmp(bf))
+                        .then_with(|| al.total_cmp(bl))
+                        .then_with(|| a.model.cmp(b.model)),
+                    _ => {
+                        // quota_aware (default): 25% pressure band, then cost, failure, latency.
+                        ((ap / 25.0) as u32)
+                            .cmp(&((bp / 25.0) as u32))
+                            .then_with(|| a.cost.total_cmp(&b.cost))
+                            .then_with(|| af.total_cmp(bf))
+                            .then_with(|| al.total_cmp(bl))
+                            .then_with(|| a.model.cmp(b.model))
+                    }
+                }
+            });
+            let (best, pressure, _, _) = viable[0];
+            let note = if candidate_tier != tier {
+                if pressure > 0.0 {
+                    format!("{} {:.0}% ({candidate_tier})", best.pool, pressure)
+                } else {
+                    format!("{} ({candidate_tier})", best.pool)
+                }
+            } else if pressure > 0.0 {
+                format!("{} {:.0}%", best.pool, pressure)
+            } else {
+                best.pool.to_string()
+            };
+            return (best.model.to_string(), best.thinking.to_string(), note);
+        }
+        (
+            "none healthy".to_string(),
+            String::new(),
+            "all pools full".to_string(),
+        )
     }
 }
 
@@ -878,6 +959,22 @@ fn lookup_label(pairs: &[(&str, &str)], key: &str) -> String {
         .iter()
         .find(|(k, _)| *k == key)
         .map_or_else(|| key.to_string(), |(_, label)| (*label).to_string())
+}
+
+/// `PA_MODEL_ROUTER` parsed as `router_mode()` in `model_router.py` reads it; an unset or
+/// unrecognized value leaves the saved profile in charge.
+fn env_router_mode(raw: Option<&str>) -> Option<&'static str> {
+    match raw?.trim().to_ascii_lowercase().as_str() {
+        "0" | "false" | "off" | "no" => Some("off"),
+        "1" | "true" | "on" | "yes" => Some("on"),
+        "auto" => Some("auto"),
+        _ => None,
+    }
+}
+
+/// `router-quota-cache.json` in the router home (`PA_ROUTER_HOME`, else `~/.prime/harness`).
+pub(crate) fn quota_cache_path() -> PathBuf {
+    default_harness_dir().join(QUOTA_CACHE_FILENAME)
 }
 
 fn default_harness_dir() -> PathBuf {
@@ -905,7 +1002,7 @@ fn load_cached_providers(path: &Path) -> Option<Vec<ProviderUsage>> {
     parse_usage(raw).ok()
 }
 
-fn load_health_map(path: &Path) -> HashMap<String, (bool, f64)> {
+fn load_health_map(path: &Path) -> HashMap<String, (bool, f64, f64)> {
     let mut out = HashMap::new();
     let Ok(text) = std::fs::read_to_string(path) else {
         return out;
@@ -924,45 +1021,73 @@ fn load_health_map(path: &Path) -> HashMap<String, (bool, f64)> {
             .get("open_until")
             .and_then(Value::as_f64)
             .unwrap_or(0.0);
+        let failure = entry
+            .get("failure_ewma")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
         let latency = entry
             .get("latency_ewma_ms")
             .and_then(Value::as_f64)
             .unwrap_or(0.0);
-        out.insert(pool.clone(), (now < open_until, latency));
+        out.insert(pool.clone(), (now < open_until, failure, latency));
     }
     out
 }
 
 fn build_pool_snapshots(
     providers: Option<&[ProviderUsage]>,
-    health: &HashMap<String, (bool, f64)>,
+    health: &HashMap<String, (bool, f64, f64)>,
 ) -> Vec<PoolSnapshot> {
     let mut map: HashMap<String, f64> = HashMap::new();
     if let Some(list) = providers {
         for p in list {
+            if p.error.is_some() && p.windows.is_empty() {
+                continue;
+            }
             let name = p.provider.to_ascii_lowercase();
             match name.as_str() {
                 "claude" | "codex" => {
-                    let max_pct = p
+                    if let Some(max_pct) = p
                         .windows
                         .iter()
                         .map(|w| w.used_percent)
-                        .fold(0.0_f64, f64::max);
-                    map.insert(name, max_pct);
+                        .reduce(f64::max)
+                    {
+                        map.insert(name, max_pct);
+                    }
                 }
                 "antigravity" => {
                     let mut gem = 0.0_f64;
                     let mut cg = 0.0_f64;
+                    let mut shared = 0.0_f64;
                     let mut has_gem = false;
                     let mut has_cg = false;
+                    let mut has_shared = false;
                     for w in &p.windows {
                         let lower = w.label.to_ascii_lowercase();
-                        if lower.contains("claude") || lower.contains("gpt") {
+                        if lower.contains("gemini") {
+                            gem = gem.max(w.used_percent);
+                            has_gem = true;
+                        } else if lower.contains("claude")
+                            || lower.contains("gpt")
+                            || lower.contains("opus")
+                            || lower.contains("sonnet")
+                        {
                             cg = cg.max(w.used_percent);
                             has_cg = true;
                         } else {
-                            gem = gem.max(w.used_percent);
+                            shared = shared.max(w.used_percent);
+                            has_shared = true;
+                        }
+                    }
+                    if has_shared {
+                        if !has_gem {
+                            gem = shared;
                             has_gem = true;
+                        }
+                        if !has_cg {
+                            cg = shared;
+                            has_cg = true;
                         }
                     }
                     if has_gem {
@@ -975,13 +1100,18 @@ fn build_pool_snapshots(
                 "cursor" => {
                     for w in &p.windows {
                         let lower = w.label.to_ascii_lowercase();
-                        if lower.contains("total") {
-                            map.insert("cursor-total".to_string(), w.used_percent);
-                        } else if lower.contains("third") {
-                            map.insert("cursor-third-party".to_string(), w.used_percent);
-                        } else if lower == "cursor" {
-                            map.insert("cursor".to_string(), w.used_percent);
-                        }
+                        let pool = if lower.contains("third") {
+                            "cursor-third-party"
+                        } else if lower.contains("total") {
+                            "cursor-total"
+                        } else if lower.contains("cursor") || lower.contains("composer") {
+                            "cursor"
+                        } else {
+                            "cursor-total"
+                        };
+                        map.entry(pool.to_string())
+                            .and_modify(|v| *v = v.max(w.used_percent))
+                            .or_insert(w.used_percent);
                     }
                 }
                 _ => {}
@@ -1001,11 +1131,12 @@ fn build_pool_snapshots(
         .iter()
         .filter_map(|&pool| {
             let used = map.get(pool).copied()?;
-            let (open, latency) = health.get(pool).copied().unwrap_or((false, 0.0));
+            let (open, failure, latency) = health.get(pool).copied().unwrap_or((false, 0.0, 0.0));
             Some(PoolSnapshot {
                 pool: pool.to_string(),
                 used_percent: used,
                 circuit_open: open,
+                failure_ewma: failure,
                 latency_ms: latency,
             })
         })
@@ -1092,7 +1223,8 @@ mod tests {
             .iter()
             .map(text)
             .collect();
-        assert!(rows.iter().any(|r| r.contains("Model Router")));
+        assert!(rows.iter().any(|r| r.contains("Router")));
+        assert!(!rows.iter().any(|r| r.contains("Ramp")));
         assert!(rows.iter().any(|r| r.contains("Routing Strategy")));
         assert!(rows.iter().any(|r| r.contains("Live Tier Preview")));
         assert!(rows.iter().any(|r| r.contains("antigravity-gemini")));
@@ -1103,11 +1235,47 @@ mod tests {
     }
 
     #[test]
+    fn env_override_names_the_effective_mode() {
+        assert_eq!(env_router_mode(None), None);
+        assert_eq!(env_router_mode(Some("")), None);
+        assert_eq!(env_router_mode(Some(" TRUE ")), Some("on"));
+        assert_eq!(env_router_mode(Some("no")), Some("off"));
+        assert_eq!(env_router_mode(Some("auto")), Some("auto"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut view = RouterView::open_in(dir.path().to_path_buf(), None, false);
+        view.env_mode = Some("off");
+        let rows: Vec<String> = view
+            .render(&theme(), 160, &kb(), 36)
+            .iter()
+            .map(text)
+            .collect();
+        assert!(rows.iter().any(|r| r.contains("Mode Off")), "{rows:#?}");
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("(PA_MODEL_ROUTER override; saved: auto)")),
+            "{rows:#?}"
+        );
+    }
+
+    #[test]
+    fn catalog_lists_the_python_router_rows() {
+        let has =
+            |model: &str, tier: &str| CATALOG.iter().any(|c| c.model == model && c.tier == tier);
+        assert!(has("openai-codex/gpt-5.3-codex", "balanced"));
+        assert!(has("cursor/gpt-5.5", "strong"));
+        assert_eq!(PRESETS[0].slug, "coding-agents");
+        assert_eq!(PRESETS[0].priority, "favor_cost");
+    }
+
+    #[test]
     fn switchyard_rejects_same_model_pair() {
-        let mut draft = RouterProfileDraft::default();
-        draft.switchyard_enabled = true;
-        draft.efficient_model = "antigravity/gemini-4-neon".to_string();
-        draft.capable_model = "antigravity/gemini-4-neon".to_string();
+        let draft = RouterProfileDraft {
+            switchyard_enabled: true,
+            efficient_model: "antigravity/gemini-4-neon".to_string(),
+            capable_model: "antigravity/gemini-4-neon".to_string(),
+            ..RouterProfileDraft::default()
+        };
         assert!(draft.validate_switchyard().is_some());
     }
 }

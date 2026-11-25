@@ -874,6 +874,9 @@ async fn run_interactive_surface(
     let mut last_render_at: Option<Instant> = None;
     let mut render_deadline: Option<Instant> = None;
     let mut quiet_tick_deadline: Option<Instant> = None;
+    // A handled non-mouse input whose inline paint is still owed: a chunk end paints inline only
+    // for it, so a mouse-only chunk leaves its frame to the coalescing frame gate.
+    let mut inline_paint_owed = false;
     let mut anim_started: Option<Instant> = None;
     // The spinner phase painted by the last frame (`usize::MAX` before the first): a quiet turn
     // only dirties when the 80ms phase advances.
@@ -1060,7 +1063,12 @@ async fn run_interactive_surface(
                     continue;
                 }
                 let chunk_end = matches!(input, UiInput::InputChunkEnd);
-                if !chunk_end {
+                // Mouse reports (a wheel or trackpad burst, hover motion) paint through the
+                // frame gate below: one coalesced frame per interval instead of one per report.
+                // The mouse arm dirties the frame only when the report changed something.
+                let mouse_input = matches!(input, UiInput::Mouse(_));
+                if !chunk_end && !mouse_input {
+                    inline_paint_owed = true;
                     session.dirty = true;
                 }
                 match input {
@@ -1211,7 +1219,16 @@ async fn run_interactive_surface(
                     // A mouse report reaches the transcript scroll dispatch's wheel branch;
                     // non-wheel reports are consumed inside.
                     UiInput::Mouse(event) => {
+                        // Hover motion and wheel turns are the high-rate reports: `handle_mouse`
+                        // dirties the frame only when the hovered target or the viewport moved.
+                        // A button press or release always repaints.
+                        let button_report = !(event.button == crate::mouse::BUTTON_NONE
+                            && event.motion)
+                            && crate::mouse::wheel_scroll_delta(&event).is_none();
                         session.handle_mouse(event, &mut view);
+                        if button_report {
+                            session.dirty = true;
+                        }
                     }
                     // The headless plan's pause step or the end of a terminal write: the queued
                     // keystroke batch ahead of this barrier is fully handled, so the parked
@@ -1262,10 +1279,24 @@ async fn run_interactive_surface(
                 // Paint the handled input in this iteration: the select below can otherwise wait
                 // out its 50ms tick before the next draw, felt as keystroke-to-render lag. A
                 // handoff paints nothing: the next surface owns the pane.
+                // A batch with more user input queued behind this one paints once, after its
+                // last input.
+                let more_input_queued = pending.front().is_some_and(|next| {
+                    !matches!(
+                        next,
+                        UiInput::WaitIdle { .. }
+                            | UiInput::SubmitAndSettle { .. }
+                            | UiInput::WaitRender { .. }
+                            | UiInput::WaitGone { .. }
+                            | UiInput::Timestamp(_)
+                    )
+                });
                 if let Some(renderer) = renderer
                     .is_terminal_mut()
-                    .filter(|_| !chunk_end || session.dirty)
+                    .filter(|_| inline_paint_owed && (!chunk_end || session.dirty))
+                    .filter(|_| !more_input_queued)
                 {
+                    inline_paint_owed = false;
                     if !session.open_agents_view && session.pending_selection.is_none() {
                         // The inline paint must reflect tray state the handled key just armed (the
                         // Ctrl+C exit hint): the refresh below the select only reaches the frame
@@ -1520,6 +1551,17 @@ async fn run_interactive_surface(
                         quiet_tick_deadline = None;
                     }
                     pending.push_back(input);
+                    // Take every input the reader already queued, so a burst (a wheel or
+                    // trackpad scroll) drains as one batch with one frame instead of one select
+                    // wake and one paint per report. Headless keeps one step per wake.
+                    if renderer.is_terminal() {
+                        while let Ok(input) = ui_rx.try_recv() {
+                            if matches!(input, UiInput::Key(_) | UiInput::Paste(_)) {
+                                quiet_tick_deadline = None;
+                            }
+                            pending.push_back(input);
+                        }
+                    }
                 }
             }
             maybe_note = notes_rx.recv() => {
@@ -1585,7 +1627,7 @@ async fn run_interactive_surface(
             maybe_captain = captain_rx.recv() => {
                 if let Some(update) = maybe_captain {
                     session.apply_captain_update(update, &mut view);
-                    session.open_pending_captain_session(&mut view).await?;
+                    session.open_pending_captain_session(&mut view).await;
                 }
             }
             maybe_usage = usage_rx.recv() => {
@@ -1775,7 +1817,7 @@ async fn run_interactive_surface(
                 last_bash_refresh = Instant::now();
                 session.spawn_bash_activity_refresh();
                 session.poll_captain_status(&mut view);
-                session.open_pending_captain_session(&mut view).await?;
+                session.open_pending_captain_session(&mut view).await;
                 session.refresh_expanded_dock(&mut view);
             }
             () = async {
@@ -1796,7 +1838,7 @@ async fn run_interactive_surface(
                 last_factory_refresh = Instant::now();
                 session.spawn_factory_refresh();
                 session.poll_captain_status(&mut view);
-                session.open_pending_captain_session(&mut view).await?;
+                session.open_pending_captain_session(&mut view).await;
             }
             _captain_tick = async {
                 if !captain_refresh_wanted {
@@ -1809,7 +1851,7 @@ async fn run_interactive_surface(
             } => {
                 last_captain_refresh = Instant::now();
                 session.poll_captain_status(&mut view);
-                session.open_pending_captain_session(&mut view).await?;
+                session.open_pending_captain_session(&mut view).await;
                 if captain_overlay_open {
                     session.poll_captain(&view);
                 }
@@ -1834,7 +1876,10 @@ async fn run_interactive_surface(
 
         // Spinner animation: the wall clock drives the phase, not the render rate — the frame gate
         // below caps renders, and only a phase change dirties the frame.
+        // The working loader animates from the optimistic submit's Enter frame, before the
+        // daemon's ACK sets `turn_active`.
         let animating = session.turn_active
+            || view.working.is_some()
             || view.retry.is_some()
             || view.compaction.is_some()
             || matches!(view.overlay, Some(crate::view::Overlay::ShareLoader(_)));

@@ -331,10 +331,25 @@ impl AgentView {
         }
     }
 
+    /// An open stream that has sent nothing for [`QUIET_STREAM_AFTER`] is not
+    /// writing: providers that run their own tools (Antigravity's `schedule`,
+    /// `run_command`) hold the stream open while they wait. The next delta
+    /// restores the streaming label.
+    pub(crate) fn settle_quiet_stream(&mut self, now: std::time::Instant) {
+        let (Some(working), Some(at)) = (&mut self.working, self.stream_output_at) else {
+            return;
+        };
+        if working.download && now.saturating_duration_since(at) >= QUIET_STREAM_AFTER {
+            working.activity = "Waiting";
+            working.download = false;
+        }
+    }
+
     pub(super) fn prepare_layout(&mut self, width: usize) {
         if let (Some(working), Some(since)) = (&mut self.working, self.working_since) {
             working.elapsed_secs = since.elapsed().as_secs();
         }
+        self.settle_quiet_stream(std::time::Instant::now());
         let options = (
             self.theme.clone(),
             self.code_block_indent.clone(),
@@ -547,3 +562,6 @@ impl AgentView {
         }
     }
 }
+
+/// How long an open stream may stay silent before the loader stops claiming it writes.
+pub(crate) const QUIET_STREAM_AFTER: std::time::Duration = std::time::Duration::from_secs(15);

@@ -478,12 +478,6 @@ impl Theme {
             .collect()
     }
 
-    /// Editor surface background (userMessageBg).
-    #[must_use]
-    pub fn editor_background(&self) -> Option<Style> {
-        Some(self.bg_style(ThemeBg::UserMessageBg))
-    }
-
     /// Filled effort squares (TS `getEffortSquareColor`): a pastel softer
     /// than the accent; TS lightens it on light terminals, which the
     /// Rust theme does not detect.

@@ -312,8 +312,9 @@ impl AgentView {
             }
         }
         // A paused viewport carries the follow hint over the last window row — only when
-        // following would actually scroll (operator directive 2026-09-26).
-        if !self.following && !self.window_shows_tail {
+        // following would actually scroll (operator directive 2026-09-26), and never on top
+        // of full-page overlays where the transcript window is collapsed (`window_height == 0`).
+        if window_height > 0 && !self.following && !self.window_shows_tail {
             if let Some(row) = frame.get_mut(window_height) {
                 let key = self
                     .editor

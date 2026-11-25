@@ -1371,9 +1371,9 @@ fn captain_dock() -> ActivityDock {
 
 #[test]
 fn dock_selection_steps_through_the_captain_sub_rows() {
-    let dock = captain_dock();
     use ActivityDirection::{Next, Prev};
     use DockSelection::{CaptainItem, Group};
+    let dock = captain_dock();
     let captain = Group(ActivityGroup::Captain);
     assert_eq!(dock.step_selection(captain, Next), CaptainItem(0));
     assert_eq!(dock.step_selection(CaptainItem(0), Next), CaptainItem(1));

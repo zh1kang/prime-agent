@@ -224,6 +224,7 @@ impl SessionUi {
             ),
             captain_dock: None,
             captain_db_stamp: None,
+            captain_refresh: super::captain::CaptainRefresh::Idle,
             captain_focus_query: None,
             captain_pending_key: None,
             pending_captain_open: None,
@@ -2299,6 +2300,7 @@ mod backfill_tests {
                 super::super::captain::CaptainUpdate::Acted {
                     op: "edit".into(),
                     done: "Background refresh landed.".into(),
+                    requested_root: None,
                     result: Ok(json!({})),
                 },
                 &mut view,
@@ -2575,7 +2577,10 @@ mod backfill_tests {
             assert_eq!(view.chrome.nav.dock_captain_item, Some(1));
             assert_eq!(session.dock_captain_item(1).unwrap().1.label, "ship");
             assert_eq!(
-                view.chrome.activity.as_ref().map(|dock| dock.selection()),
+                view.chrome
+                    .activity
+                    .as_ref()
+                    .map(crate::chrome::ActivityDock::selection),
                 Some(crate::chrome::DockSelection::CaptainItem(1))
             );
             session

@@ -280,13 +280,14 @@ impl TranscriptWindow {
     }
 
     /// Scroll the viewport; a scroll up at the top of the resident rows, while older history is
-    /// still to load, is owed to the older page.
-    pub(crate) fn scroll(&mut self, delta: isize, view: &mut AgentView) {
+    /// still to load, is owed to the older page. Returns `true` when state changed.
+    pub(crate) fn scroll(&mut self, delta: isize, view: &mut AgentView) -> bool {
         if delta < 0 && view.viewport_at_top() && !self.start_resident && !self.failed {
             self.pending_scroll_up += delta.unsigned_abs();
+            true
         } else {
             self.pending_scroll_up = 0;
-            view.scroll_by(delta);
+            view.scroll_by(delta)
         }
     }
 

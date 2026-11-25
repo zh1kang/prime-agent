@@ -510,7 +510,7 @@ fn pending_costs_counts_unsettled_providers() {
 
 async fn collect_events(bin: Option<PathBuf>) -> Vec<UsageEvent> {
     let mut events = Vec::new();
-    load_usage_with(bin, |event| events.push(event)).await;
+    load_usage_with(bin, None, |event| events.push(event)).await;
     events
 }
 
@@ -590,5 +590,43 @@ async fn loader_reports_a_failed_usage_call() {
         [UsageEvent::Listed(UsageReport::Failed(
             "no providers configured".to_string()
         ))]
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn loader_writes_the_router_quota_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let usage =
+        r#"[{"provider":"claude","usage":{"primary":{"usedPercent":40,"windowMinutes":300}}}]"#;
+    let bin = fake_codexbar(
+        dir.path(),
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = \"usage\" ]; then echo '{usage}'; exit 0; fi\necho '{{}}'\n"
+        ),
+    );
+    let cache = dir.path().join("harness").join("router-quota-cache.json");
+    load_usage_with(Some(bin), Some(cache.clone()), |_| {}).await;
+    let doc: Value = serde_json::from_str(&std::fs::read_to_string(&cache).unwrap()).unwrap();
+    assert_eq!(doc["raw"].as_str(), Some(usage));
+    assert!(doc["fetched_at"].as_f64().unwrap() > 1_000_000_000.0);
+    let leftovers: Vec<_> = std::fs::read_dir(cache.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(leftovers.len(), 1, "{leftovers:?}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn loader_keeps_the_quota_cache_on_a_failed_usage_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = fake_codexbar(dir.path(), "#!/bin/sh\necho 'not json'\n");
+    let cache = dir.path().join("router-quota-cache.json");
+    std::fs::write(&cache, "{\"fetched_at\": 1, \"raw\": \"[]\"}").unwrap();
+    load_usage_with(Some(bin), Some(cache.clone()), |_| {}).await;
+    assert_eq!(
+        std::fs::read_to_string(&cache).unwrap(),
+        "{\"fetched_at\": 1, \"raw\": \"[]\"}"
     );
 }

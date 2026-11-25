@@ -227,3 +227,32 @@ fn wheel_reports_are_consumed_when_tracking_is_disabled() {
         "the tail frame stayed at the bottom:\n{tail}"
     );
 }
+
+/// Buttonless motion (`?1003` hover) over the same spot changes nothing on screen, so it renders
+/// no frame: a pointer resting over the transcript never drives a repaint per report.
+#[test]
+fn repeated_hover_reports_render_no_frame() {
+    // SGR code 35: the motion bit (32) over buttonless code 3.
+    const HOVER: &str = "\x1b[<35;10;10M";
+    let (before_tx, before_rx) = std::sync::mpsc::channel();
+    let (after_tx, after_rx) = std::sync::mpsc::channel();
+    let mut steps = vec![
+        // The first report may move the hover target; the counted reports repeat it. The hold
+        // lets the attach's background updates paint before the count starts.
+        HeadlessStep::Mouse(HOVER.to_string()),
+        HeadlessStep::WaitMs(500),
+        HeadlessStep::Timestamp(before_tx),
+    ];
+    steps.extend((0..12).map(|_| HeadlessStep::Mouse(HOVER.to_string())));
+    steps.push(HeadlessStep::Timestamp(after_tx));
+    let frames = run_plan(steps, true);
+    assert!(!frames.is_empty(), "frames were captured");
+    let (_, before) = before_rx.recv().expect("the first marker");
+    let (_, after) = after_rx.recv().expect("the second marker");
+    assert_eq!(
+        after - before,
+        0,
+        "repeated hover reports over one spot rendered {} frames",
+        after - before
+    );
+}

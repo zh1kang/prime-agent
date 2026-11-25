@@ -107,8 +107,7 @@ impl SessionUi {
             }
         }
         if let Some(delta) = crate::mouse::wheel_scroll_delta(&event) {
-            if !overlay_focused {
-                self.window.scroll(delta, view);
+            if !overlay_focused && self.window.scroll(delta, view) {
                 self.dirty = true;
             }
             return;

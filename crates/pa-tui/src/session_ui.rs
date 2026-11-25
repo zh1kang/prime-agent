@@ -475,6 +475,8 @@ pub(crate) struct SessionUi {
         Option<crate::interactive::captain_hint::FileStamp>,
         Option<crate::interactive::captain_hint::FileStamp>,
     )>,
+    /// The background `pa thread captain status` run: at most one runs at a time.
+    captain_refresh: captain::CaptainRefresh,
     /// `/captain <name>`: the project to focus when the first status arrives.
     captain_focus_query: Option<String>,
     /// `/captain stop|resume|delete`: the panel key to press once the status arrives.

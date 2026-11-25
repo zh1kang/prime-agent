@@ -55,8 +55,9 @@ impl SessionUi {
         self.usage_generation += 1;
         let generation = self.usage_generation;
         let tx = self.usage_updates.clone();
+        let quota_cache = crate::router_view::quota_cache_path();
         let task = tokio::spawn(async move {
-            crate::usage_view::load_usage(|event| {
+            crate::usage_view::load_usage(Some(quota_cache), |event| {
                 // A closed receiver means the run loop is gone; nothing is left to update.
                 let _ = tx.send(UsageUpdate {
                     generation,

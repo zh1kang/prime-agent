@@ -131,14 +131,19 @@ pub const OPENAI_CODEX_PROVIDER_ID: &str = "openai-codex";
 pub const ANTHROPIC_PROVIDER_ID: &str = "anthropic";
 pub const GITHUB_COPILOT_PROVIDER_ID: &str = "github-copilot";
 pub const XAI_PROVIDER_ID: &str = "xai";
+/// The CLI-backed subscription rows' ids (`agy` and `cursor-agent` sign-ins).
+pub const ANTIGRAVITY_PROVIDER_ID: &str = "antigravity";
+pub const CURSOR_PROVIDER_ID: &str = "cursor";
 
 /// The subscription rows whose logins run on the panel; every flow checks the cooperative cancel
 /// flag.
-pub const SUBSCRIPTION_PROVIDER_IDS: [&str; 4] = [
+pub const SUBSCRIPTION_PROVIDER_IDS: [&str; 6] = [
     ANTHROPIC_PROVIDER_ID,
     GITHUB_COPILOT_PROVIDER_ID,
     OPENAI_CODEX_PROVIDER_ID,
     XAI_PROVIDER_ID,
+    ANTIGRAVITY_PROVIDER_ID,
+    CURSOR_PROVIDER_ID,
 ];
 const PREFERRED_VISIBLE_PROVIDERS: usize = 8;
 

@@ -413,21 +413,34 @@ impl UsageReport {
 }
 
 /// Load the report progressively: `emit` gets the usage list, then one event per provider
-/// cost in completion order. Every listed provider gets exactly one cost event.
-pub async fn load_usage(emit: impl FnMut(UsageEvent)) {
-    load_usage_with(find_codexbar(), emit).await;
+/// cost in completion order. Every listed provider gets exactly one cost event. A readable
+/// usage list is also written to `quota_cache` (the router's `router-quota-cache.json`), so
+/// the Captain and factory routers read the same fresh quota without their own `codexbar` run.
+pub async fn load_usage(quota_cache: Option<PathBuf>, emit: impl FnMut(UsageEvent)) {
+    load_usage_with(find_codexbar(), quota_cache, emit).await;
 }
 
-async fn load_usage_with(bin: Option<PathBuf>, mut emit: impl FnMut(UsageEvent)) {
+async fn load_usage_with(
+    bin: Option<PathBuf>,
+    quota_cache: Option<PathBuf>,
+    mut emit: impl FnMut(UsageEvent),
+) {
     let Some(bin) = bin else {
         emit(UsageEvent::Listed(UsageReport::Unavailable));
         return;
     };
     let providers = match run_codexbar(&bin, &["usage", "--json-only"], USAGE_TIMEOUT)
         .await
-        .and_then(|json| parse_usage(&json))
+        .and_then(|json| parse_usage(&json).map(|providers| (json, providers)))
     {
-        Ok(providers) => providers,
+        Ok((json, providers)) => {
+            if let Some(path) = quota_cache {
+                // The cache only saves the routers a `codexbar` run: a failed write leaves them
+                // on their own refresh, so the panel goes on without it.
+                let _ = tokio::task::spawn_blocking(move || write_quota_cache(&path, &json)).await;
+            }
+            providers
+        }
         Err(error) => {
             emit(UsageEvent::Listed(UsageReport::Failed(error)));
             return;
@@ -461,6 +474,26 @@ async fn load_usage_with(bin: Option<PathBuf>, mut emit: impl FnMut(UsageEvent))
             emit(UsageEvent::Cost { index, cost });
         }
     }
+}
+
+/// Write `{"fetched_at": <unix secs>, "raw": <codexbar stdout>}`, the document
+/// `load_quota_snapshot` in `model_router.py` reads, through a temporary file and a rename so a
+/// concurrent reader never sees a partial document.
+fn write_quota_cache(path: &Path, raw: &str) -> std::io::Result<()> {
+    let fetched_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |elapsed| elapsed.as_secs_f64());
+    let body = serde_json::json!({ "fetched_at": fetched_at, "raw": raw }).to_string();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut temporary = path.as_os_str().to_owned();
+    temporary.push(format!(".{}.tmp", std::process::id()));
+    let temporary = PathBuf::from(temporary);
+    std::fs::write(&temporary, body)?;
+    std::fs::rename(&temporary, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&temporary);
+    })
 }
 
 /// The outcome of one key press on the panel.
@@ -680,7 +713,6 @@ impl UsageView {
         if !has_today && !has_month && session.is_none() {
             return None;
         }
-        let bg = ratatui::style::Style::default();
         let muted = theme.fg_style(ThemeColor::Muted);
         let value = theme
             .fg_style(ThemeColor::Text)
@@ -708,12 +740,6 @@ impl UsageView {
             push_sep(&mut spans, &mut first);
             spans.push(Span::styled("This chat ", muted));
             spans.push(Span::styled(format_usd(cost), value));
-        }
-        let used: usize = spans.iter().map(|s| str_width(&s.content)).sum();
-        let right_margin = if width >= 4 { 2 } else { 0 };
-        let fill = width.saturating_sub(used + right_margin);
-        if fill > 0 {
-            spans.push(Span::styled(" ".repeat(fill), bg));
         }
         Some(truncate_line(&spans, width, "\u{2026}"))
     }

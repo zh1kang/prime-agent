@@ -96,6 +96,7 @@ impl SessionUi {
             elapsed_secs: 0,
         });
         view.working_since = Some(since);
+        view.stream_output_at = None;
         self.working_tokens.reset();
     }
 
@@ -108,6 +109,7 @@ impl SessionUi {
             Some("toolcall_start" | "toolcall_delta") => ("Writing code", true),
             _ => return,
         };
+        view.stream_output_at = Some(std::time::Instant::now());
         if let Some(working) = &mut view.working {
             working.activity = activity;
             working.download = download;

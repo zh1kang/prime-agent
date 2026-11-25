@@ -26,7 +26,7 @@ mod tests;
 // distances increase upwards. Never returned as global transcript metadata.
 pub(crate) const TAIL_SELECTION_ORIGIN: usize = usize::MAX / 2;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Anchor {
     Tail(usize),
     Top(usize),
@@ -58,7 +58,8 @@ impl SparseWindow {
         matches!(self.anchor, Anchor::Tail(0))
     }
 
-    pub(super) fn scroll_by(&mut self, delta: isize) {
+    pub(super) fn scroll_by(&mut self, delta: isize) -> bool {
+        let prev = self.anchor;
         self.anchor = match self.anchor {
             Anchor::Tail(distance) => {
                 let next = distance.saturating_add_signed(delta.saturating_neg());
@@ -73,6 +74,7 @@ impl SparseWindow {
                 Anchor::Top(next)
             }
         };
+        self.anchor != prev
     }
 }
 
