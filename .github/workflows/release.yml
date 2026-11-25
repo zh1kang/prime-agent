@@ -30,7 +30,7 @@ on:
     tags:
       # A plain tag publishes the stable channel (latest.json); a -beta*
       # prerelease tag publishes the nightly channel (beta.json) - the two
-      # channels pa-core::update::version::UpdateChannel reads.
+      # channels radiata-core::update::version::UpdateChannel reads.
       - "v[0-9]+.[0-9]+.[0-9]+"
       - "v[0-9]+.[0-9]+.[0-9]+-beta*"
 
@@ -70,7 +70,7 @@ jobs:
           tag_ver="${GITHUB_REF_NAME#v}"
           cargo_ver="$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -1)"
           [[ "${tag_ver}" == "${cargo_ver}" ]]             || { echo "tag v${tag_ver} does not match Cargo.toml ${cargo_ver}"; exit 1; }
-          # The channel the tag publishes (pa-core::update::version
+          # The channel the tag publishes (radiata-core::update::version
           # resolve_update_channel parity): plain = stable (latest.json),
           # -beta* = nightly (beta.json); any other prerelease would be a
           # stable-channel pre-release the update flow refuses to install.
@@ -183,10 +183,10 @@ jobs:
           # baseline changes (same protocol as the image digest below).
           key: ${{ matrix.target }}-glibc235
       # Only the shipped binary links here: the job packages `prime-agent`
-      # alone, so pa-daemon's [[bin]] would be a second thin-LTO link with
+      # alone, so radiata-daemon's [[bin]] would be a second thin-LTO link with
       # no consumer (~26% of the build step, measured).
       - name: Build (release, locked)
-        run: cargo build --release --locked --target ${{ matrix.target }} -j 4 -p pa-cli --bin prime-agent
+        run: cargo build --release --locked --target ${{ matrix.target }} -j 4 -p radiata-cli --bin prime-agent
       - name: Split the shipped binary + split-debug decoder (Option C posture)
         # Linux only: the build emits line tables and does not strip at
         # link; this step produces the SHIPPED binary (objcopy
@@ -360,10 +360,10 @@ jobs:
         with:
           key: ${{ matrix.target }}
       # Only the shipped binary links here: the job packages `prime-agent`
-      # alone, so pa-daemon's [[bin]] would be a second thin-LTO link with
+      # alone, so radiata-daemon's [[bin]] would be a second thin-LTO link with
       # no consumer (~26% of the build step, measured).
       - name: Build (release, locked)
-        run: cargo build --release --locked --target ${{ matrix.target }} -j 4 -p pa-cli --bin prime-agent
+        run: cargo build --release --locked --target ${{ matrix.target }} -j 4 -p radiata-cli --bin prime-agent
       # The aarch64 leg livechecks natively; the x86_64 leg,
       # cross-compiled on the Apple-silicon pool, livechecks under
       # Rosetta 2 — the runtime install-rust.sh gives the x64 payload on
@@ -486,7 +486,7 @@ jobs:
       - name: Build (release, locked)
         env:
           RUSTFLAGS: -C target-feature=+crt-static
-        run: cargo build --release --locked --target ${{ matrix.target }} -j 4 -p pa-cli --bin prime-agent
+        run: cargo build --release --locked --target ${{ matrix.target }} -j 4 -p radiata-cli --bin prime-agent
       - name: "Livecheck gate: --version prints the tag version"
         shell: bash
         run: |
@@ -833,7 +833,7 @@ jobs:
 
           # The producer half of the update flow's channel contract (TS
           # getLatestPiRelease parity; the reader is
-          # pa-core::update::release::latest_release): <download-base>/
+          # radiata-core::update::release::latest_release): <download-base>/
           # latest.json (stable) or beta.json (nightly), carrying the
           # version plus artifact rows the reader keeps only when the
           # platform is known, `file` is exactly

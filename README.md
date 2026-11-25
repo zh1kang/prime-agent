@@ -31,7 +31,7 @@ Requires Rust (stable) and Python 3 (`uv` for `prime-agent-runtime` tests):
 ```bash
 git clone https://github.com/zh1kang/prime-agent.git
 cd prime-agent
-cargo build --locked -p pa-cli
+cargo build --locked -p radiata-cli
 
 # Install locally (retains `pa` / `prime-agent` compatibility alongside `radiata`)
 mkdir -p ~/.local/share/pa-harness ~/.local/bin

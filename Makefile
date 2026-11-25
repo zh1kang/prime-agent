@@ -165,15 +165,15 @@ package:
 catalog-assets-gates:
 	python3 scripts/release/test_catalog_assets.py
 
-# Local one-command perf run (crates/pa-perf/README.md documents the
+# Local one-command perf run (crates/radiata-perf/README.md documents the
 # scenario set): build the release binaries, generate the small corpus,
 # bench every scenario 10x, print the table. Run it on a quiet machine —
 # the numbers are wall-clock latencies of the interactive surfaces.
 perf:
-	cargo build --release --locked -p pa-cli --bin prime-agent -p pa-perf --bin pa-perf
-	./target/release/pa-perf run --binary target/release/prime-agent \
+	cargo build --release --locked -p radiata-cli --bin prime-agent -p radiata-perf --bin radiata-perf
+	./target/release/radiata-perf run --binary target/release/prime-agent \
 		--profile small --out target/perf --runs 10
-	./target/release/pa-perf report --baseline crates/pa-perf/baseline.json \
+	./target/release/radiata-perf report --baseline crates/radiata-perf/baseline.json \
 		--results target/perf/results/*.json
 
 

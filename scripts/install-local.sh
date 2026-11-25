@@ -14,9 +14,9 @@ if [ -n "${PA_LOCAL_BIN:-}" ]; then
 else
     BIN_SRC=""
     for candidate in \
-        "$REPO/target/local/prime-agent" \
-        "$REPO/target/release/prime-agent" \
-        "$REPO/target/debug/prime-agent"; do
+        "$REPO/target/local/radiata" \
+        "$REPO/target/release/radiata" \
+        "$REPO/target/debug/radiata"; do
         if [ -f "$candidate" ]; then
             if [ -z "$BIN_SRC" ] || [ "$candidate" -nt "$BIN_SRC" ]; then
                 BIN_SRC="$candidate"
@@ -24,7 +24,7 @@ else
         fi
     done
     if [ -z "$BIN_SRC" ]; then
-        echo "install-local: no built binary under $REPO/target/{local,release,debug}; run: cargo build --profile local -p pa-cli" >&2
+        echo "install-local: no built binary under $REPO/target/{local,release,debug}; run: cargo build --profile local -p radiata-cli" >&2
         exit 1
     fi
 fi

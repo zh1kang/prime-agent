@@ -2,7 +2,7 @@
 """Report Prime Inference models whose public /models entry lacks specs.
 
 prime-agent drops every Prime Inference model whose `specs` object is null
-(crates/pa-models/src/prime_inference.rs), so such a model never appears in
+(crates/radiata-models/src/prime_inference.rs), so such a model never appears in
 the model selector. This check lists those models, and models whose specs
 miss or null a field the client reads, so the list can go to the inference team.
 

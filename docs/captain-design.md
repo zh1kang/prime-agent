@@ -24,9 +24,9 @@ They do not establish how Capy stores events internally or how reliably its serv
 ## Where pa already has the pieces
 
 - The factory can fan out, join results, enforce budgets, and retry or escalate a failed state. Its run registry lives in the Python kernel. A kernel restart loses the registry while supervisor-owned children can continue. A saved run ID alone cannot resume that machine. [Factory executor](../prime-agent-runtime/src/rlm/factory.py)
-- The durable thread store already records a thread ID, parent, checkout, provider, transcript, pending request, and job status. Its child tools clone the parent's context and restrict reads to direct children. A Captain adopting an existing root thread needs an explicit membership check. [Thread store](../crates/pa-core/src/thread.rs) and [child tools](../crates/pa-cli/src/thread_tools.rs)
-- Prime's daemon already journals session inbox messages and replays unread messages on open. This includes factory progress and child lifecycle notices. The Captain needs a bridge from participating sessions and provider threads to its project record. [Session inbox](../crates/pa-core/src/session_engine/inbox.rs)
-- The workspace binding distinguishes the main checkout, linked worktree, branch, and base revision. The Captain should keep a stable project ID across worktree moves and support a new folder before its first commit. [Workspace binding](../crates/pa-core/src/workspace/binding.rs)
+- The durable thread store already records a thread ID, parent, checkout, provider, transcript, pending request, and job status. Its child tools clone the parent's context and restrict reads to direct children. A Captain adopting an existing root thread needs an explicit membership check. [Thread store](../crates/radiata-core/src/thread.rs) and [child tools](../crates/radiata-cli/src/thread_tools.rs)
+- Prime's daemon already journals session inbox messages and replays unread messages on open. This includes factory progress and child lifecycle notices. The Captain needs a bridge from participating sessions and provider threads to its project record. [Session inbox](../crates/radiata-core/src/session_engine/inbox.rs)
+- The workspace binding distinguishes the main checkout, linked worktree, branch, and base revision. The Captain should keep a stable project ID across worktree moves and support a new folder before its first commit. [Workspace binding](../crates/radiata-core/src/workspace/binding.rs)
 - The personal dual-consensus machine already gives Opus and Astra distinct proposal, challenge, reconciliation, and voting steps. Its Python tally requires both votes to accept the same candidate. A Captain can use that machine for a disputed plan and present unresolved disagreement to the user.
 
 ## First release
@@ -163,7 +163,7 @@ Onboarding offers "Design a factory for this project" first in the factory step;
 
 ## The Captain in pa's interface
 
-F6 and `/captain` open the Captain panel inside pa, drawn by pa-tui like the factory page.
+F6 and `/captain` open the Captain panel inside pa, drawn by radiata-tui like the factory page.
 The panel reads `pa thread captain status` and runs every action through `pa thread captain act OP`; the Python backend stays the source of truth.
 Text steps (a brief, a message, an answer, a field edit, a run parameter) use pa's own prompt editor with a header line above it.
 Lists (models, thinking levels, machines, worker limit, threads to add) use the panel's picker.

@@ -41,9 +41,9 @@ REPO_ROOT = SCRIPTS_DIR.parent
 
 # Deliberate conservative edges with no Cargo.toml link (over-selecting is safe).
 INTENDED_OVER_SELECTION = {
-    "pa-agent": {"pa-ai", "pa-types"},
-    "pa-tui": {"pa-core"},
-    "pa-cli": {"pa-models"},
+    "radiata-agent": {"radiata-ai", "radiata-types"},
+    "radiata-tui": {"radiata-core"},
+    "radiata-cli": {"radiata-models"},
 }
 
 
@@ -95,17 +95,17 @@ class TheMappingTestCase(unittest.TestCase):
 
     def test_a_crate_only_pr_narrows_to_those_crates(self):
         rc, out, outputs = run_mapper([
-            "crates/pa-daemon/src/main.rs",
-            "crates/pa-daemon/src/roster.rs",
-            "crates/pa-tui/src/view/runs.rs",
+            "crates/radiata-daemon/src/main.rs",
+            "crates/radiata-daemon/src/roster.rs",
+            "crates/radiata-tui/src/view/runs.rs",
         ])
         self.assertEqual(rc, 0, out)
-        self.assertEqual(outputs["crates"], "pa-cli,pa-daemon,pa-perf,pa-tui")
-        self.assertIn("crates (4: pa-cli, pa-daemon, pa-perf, pa-tui)", outputs["scope"])
+        self.assertEqual(outputs["crates"], "radiata-cli,radiata-daemon,radiata-perf,radiata-tui")
+        self.assertIn("crates (4: radiata-cli, radiata-daemon, radiata-perf, radiata-tui)", outputs["scope"])
 
     def test_any_non_crate_path_fails_safe_to_the_full_selection(self):
         rc, out, outputs = run_mapper([
-            "crates/pa-core/src/lib.rs",
+            "crates/radiata-core/src/lib.rs",
             ".github/workflows/ci.yml",
         ])
         self.assertEqual(rc, 0, out)
@@ -120,20 +120,20 @@ class TheMappingTestCase(unittest.TestCase):
         # so the crate's own wave - units + reverse deps, NOT the union -
         # still runs.
         rc, out, outputs = run_mapper([
-            "crates/pa-daemon/src/main.rs",
+            "crates/radiata-daemon/src/main.rs",
             ".changes/daemon-fix.md",
         ])
         self.assertEqual(rc, 0, out)
-        self.assertEqual(outputs["crates"], "pa-cli,pa-daemon,pa-perf")
+        self.assertEqual(outputs["crates"], "radiata-cli,radiata-daemon,radiata-perf")
         self.assertIn("guaranteed-metadata path .changes/daemon-fix.md", out)
 
     def test_documentation_changes_do_not_defeat_crate_narrowing(self):
         rc, out, outputs = run_mapper([
-            "crates/pa-core/src/lib.rs",
+            "crates/radiata-core/src/lib.rs",
             "docs/architecture.md",
         ])
         self.assertEqual(rc, 0, out)
-        self.assertEqual(outputs["crates"], "pa-cli,pa-core,pa-daemon,pa-perf,pa-tui")
+        self.assertEqual(outputs["crates"], "radiata-cli,radiata-core,radiata-daemon,radiata-perf,radiata-tui")
         self.assertIn("guaranteed-metadata path docs/architecture.md", out)
 
     def test_documentation_only_pr_keeps_the_full_selection(self):
@@ -157,7 +157,7 @@ class TheMappingTestCase(unittest.TestCase):
         # slash), not any name that starts with `.changes`: a sibling
         # path still fails safe to the full selection.
         rc, out, outputs = run_mapper([
-            "crates/pa-core/src/lib.rs",
+            "crates/radiata-core/src/lib.rs",
             ".changes-archive/old.md",
         ])
         self.assertEqual(rc, 0, out)
@@ -168,10 +168,10 @@ class TheMappingTestCase(unittest.TestCase):
         # A rename between the metadata class and a crate: the crate side
         # selects, the fragment side is skipped (it can add nothing).
         rc, out, outputs = run_mapper([
-            "crates/pa-tui/src/moved.rs\t.changes/old-fragment.md",
+            "crates/radiata-tui/src/moved.rs\t.changes/old-fragment.md",
         ])
         self.assertEqual(rc, 0, out)
-        self.assertEqual(outputs["crates"], "pa-cli,pa-tui")
+        self.assertEqual(outputs["crates"], "radiata-cli,radiata-tui")
 
     def test_the_infrastructural_classes_still_fail_safe(self):
         # The fail-safe classes the metadata skip must never absorb: the
@@ -188,7 +188,7 @@ class TheMappingTestCase(unittest.TestCase):
         ]:
             with self.subTest(path=path):
                 rc, out, outputs = run_mapper([
-                    "crates/pa-core/src/lib.rs",
+                    "crates/radiata-core/src/lib.rs",
                     path,
                 ])
                 self.assertEqual(rc, 0, out)
@@ -199,7 +199,7 @@ class TheMappingTestCase(unittest.TestCase):
         # A rename from a non-crate path INTO a crate: the PR removed the
         # old path, so the full selection runs.
         rc, out, outputs = run_mapper([
-            "crates/pa-cli/src/new.rs\tREADME.md",
+            "crates/radiata-cli/src/new.rs\tREADME.md",
         ])
         self.assertEqual(rc, 0, out)
         self.assertEqual(outputs["crates"], "")
@@ -207,26 +207,26 @@ class TheMappingTestCase(unittest.TestCase):
 
     def test_a_rename_within_crates_narrows_to_both_crates(self):
         rc, out, outputs = run_mapper([
-            "crates/pa-tui/src/editor/selection.rs\tcrates/pa-tui/src/selection.rs",
+            "crates/radiata-tui/src/editor/selection.rs\tcrates/radiata-tui/src/selection.rs",
         ])
         self.assertEqual(rc, 0, out)
-        self.assertEqual(outputs["crates"], "pa-cli,pa-tui")
+        self.assertEqual(outputs["crates"], "radiata-cli,radiata-tui")
 
     def test_pa_types_only_runs_every_crate(self):
-        rc, out, outputs = run_mapper(["crates/pa-types/src/lib.rs"])
+        rc, out, outputs = run_mapper(["crates/radiata-types/src/lib.rs"])
         self.assertEqual(rc, 0, out)
         self.assertEqual(outputs["crates"], ",".join(sorted(ci_pr_crates.WORKSPACE_DEPS)))
 
     def test_pa_tui_only_runs_pa_cli_too(self):
-        rc, out, outputs = run_mapper(["crates/pa-tui/src/lib.rs"])
+        rc, out, outputs = run_mapper(["crates/radiata-tui/src/lib.rs"])
         self.assertEqual(rc, 0, out)
-        self.assertEqual(outputs["crates"], "pa-cli,pa-tui")
+        self.assertEqual(outputs["crates"], "radiata-cli,radiata-tui")
 
     def test_pa_telemetry_only_runs_all_dependents(self):
-        rc, out, outputs = run_mapper(["crates/pa-telemetry/src/lib.rs"])
+        rc, out, outputs = run_mapper(["crates/radiata-telemetry/src/lib.rs"])
         self.assertEqual(rc, 0, out)
         self.assertEqual(outputs["crates"],
-                         "pa-cli,pa-core,pa-daemon,pa-perf,pa-telemetry,pa-tui")
+                         "radiata-cli,radiata-core,radiata-daemon,radiata-perf,radiata-telemetry,radiata-tui")
 
     def test_an_unknown_crate_fails_safe(self):
         rc, out, outputs = run_mapper(["crates/pa-future/src/lib.rs"])
@@ -240,8 +240,8 @@ class TheMappingTestCase(unittest.TestCase):
         # whose field is `filename`) must never narrow the wave to nothing -
         # the run fails safe to the full selection instead.
         rc, out, outputs = run_mapper([
-            "\tcrates/pa-core/src/lib.rs",
-            "crates/pa-daemon/src/lib.rs",
+            "\tcrates/radiata-core/src/lib.rs",
+            "crates/radiata-daemon/src/lib.rs",
         ])
         self.assertEqual(rc, 0, out)
         self.assertEqual(outputs["crates"], "")
@@ -253,7 +253,7 @@ class TheMappingTestCase(unittest.TestCase):
         # so the full selection runs (nothing narrows on a broken column).
         rc, out, outputs = run_mapper([
             "null\tdocs/removed.md",
-            "crates/pa-core/src/lib.rs",
+            "crates/radiata-core/src/lib.rs",
         ])
         self.assertEqual(rc, 0, out)
         self.assertEqual(outputs["crates"], "")
@@ -268,15 +268,15 @@ class TheMappingTestCase(unittest.TestCase):
         # The fields are read raw: a path with a leading space (or any
         # non-crate prefix) must never be stripped into a crate mapping.
         rc, out, outputs = run_mapper([
-            " crates/pa-core/src/lib.rs",
-            "crates/pa-tui/src/lib.rs",
+            " crates/radiata-core/src/lib.rs",
+            "crates/radiata-tui/src/lib.rs",
         ])
         self.assertEqual(rc, 0, out)
         self.assertEqual(outputs["crates"], "")
-        self.assertIn("non-crate path  crates/pa-core/src/lib.rs", out)
+        self.assertIn("non-crate path  crates/radiata-core/src/lib.rs", out)
 
     def test_the_files_api_ceiling_fails_safe(self):
-        rows = ["crates/pa-core/src/lib.rs"] * ci_pr_crates.FILES_API_CEILING
+        rows = ["crates/radiata-core/src/lib.rs"] * ci_pr_crates.FILES_API_CEILING
         rc, out, outputs = run_mapper(rows)
         self.assertEqual(rc, 0, out)
         self.assertEqual(outputs["crates"], "")

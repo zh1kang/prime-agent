@@ -375,7 +375,7 @@ trap '[ -z "${launcher_tmp:-}" ] || rm -f "$launcher_tmp"' EXIT
     def test_real_launcher_pin_respects_the_sun_path_limit(self):
         # The launcher pins the daemon socket env; a TMPDIR whose pin cannot
         # fit the non-Linux 103-byte sun_path limit must pin /tmp instead
-        # (the same fallback pa-daemon socket_dir() gives the binary default).
+        # (the same fallback radiata-daemon socket_dir() gives the binary default).
         command = self.npm_prefix / "bin/prime-agent"
         result = self.install_real_launcher()
         self.assertEqual(result.returncode, 0, result.stderr)

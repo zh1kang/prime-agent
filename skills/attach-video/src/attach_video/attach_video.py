@@ -6,10 +6,10 @@ import base64
 from collections.abc import Iterator
 from pathlib import Path
 
-# Keep in sync with ATTACHMENT_DISPLAY_MIME in crates/pa-core/src/kernel/shared.rs.
+# Keep in sync with ATTACHMENT_DISPLAY_MIME in crates/radiata-core/src/kernel/shared.rs.
 _ATTACHMENT_DISPLAY_MIME = "application/vnd.prime-agent.attachment+json"
 
-# Keep in sync with MAX_ATTACHMENT_DATA_CHARS in crates/pa-core/src/kernel/shared.rs: the kernel drops a
+# Keep in sync with MAX_ATTACHMENT_DATA_CHARS in crates/radiata-core/src/kernel/shared.rs: the kernel drops a
 # larger attachment. Videos are attached as-is (no transcoding), so the largest file is what fits in it.
 _MAX_ATTACHMENT_DATA_CHARS = 10_000_000
 _MAX_VIDEO_BYTES = _MAX_ATTACHMENT_DATA_CHARS // 4 * 3  # base64 turns 3 bytes into 4 chars
@@ -21,7 +21,7 @@ _MP4_BRANDS = frozenset(
 )
 _EBML_MAGIC = b"\x1a\x45\xdf\xa3"
 
-# Matches VIDEO_MIME_TYPES in crates/pa-core/src/tools/ipython.rs.
+# Matches VIDEO_MIME_TYPES in crates/radiata-core/src/tools/ipython.rs.
 _SUPPORTED_FORMATS = "MP4, WebM"
 
 

@@ -1518,258 +1518,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7e036b411754132fd6b74e94b74e9a13c5cf606fa93d1885c35860d3060820b1"
 
 [[package]]
-name = "pa-agent"
-version = "0.10.5"
-dependencies = [
- "anyhow",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
-]
-
-[[package]]
-name = "pa-ai"
-version = "0.10.5"
-dependencies = [
- "anyhow",
- "base64",
- "bytes",
- "futures",
- "h2",
- "hex",
- "hmac",
- "http",
- "pa-types",
- "rand",
- "rcgen",
- "regex",
- "reqwest",
- "rustls",
- "rustls-native-certs",
- "serde",
- "serde_json",
- "sha1",
- "sha2",
- "tempfile",
- "thiserror",
- "tokio",
- "tokio-rustls",
- "tokio-tungstenite",
- "tokio-util",
- "tracing",
- "url",
- "webpki-roots",
-]
-
-[[package]]
-name = "pa-cli"
-version = "0.10.5"
-dependencies = [
- "anyhow",
- "base64",
- "crossterm",
- "diffy-diff",
- "flate2",
- "futures",
- "hex",
- "libc",
- "nix",
- "pa-agent",
- "pa-ai",
- "pa-core",
- "pa-daemon",
- "pa-factory",
- "pa-telemetry",
- "pa-tui",
- "pa-types",
- "rsa",
- "serde",
- "serde_json",
- "sha2",
- "tar",
- "tempfile",
- "tokio",
- "url",
- "uuid",
- "yaml_serde",
-]
-
-[[package]]
-name = "pa-core"
-version = "0.10.5"
-dependencies = [
- "anyhow",
- "base64",
- "fancy-regex",
- "flate2",
- "futures",
- "getrandom 0.4.3",
- "globset",
- "hex",
- "ignore",
- "libc",
- "nix",
- "pa-agent",
- "pa-ai",
- "pa-factory",
- "pa-models",
- "pa-telemetry",
- "pa-types",
- "proptest",
- "reqwest",
- "rsa",
- "serde",
- "serde_json",
- "sha2",
- "tar",
- "tempfile",
- "thiserror",
- "tokio",
- "tokio-util",
- "toml",
- "tracing",
- "unicode-normalization",
- "url",
- "uuid",
- "yaml_serde",
-]
-
-[[package]]
-name = "pa-daemon"
-version = "0.10.5"
-dependencies = [
- "anyhow",
- "filetime",
- "futures",
- "globset",
- "nix",
- "pa-agent",
- "pa-ai",
- "pa-core",
- "pa-models",
- "pa-telemetry",
- "pa-types",
- "proptest",
- "serde",
- "serde_json",
- "sha2",
- "socket2",
- "tempfile",
- "thiserror",
- "tokio",
- "tokio-util",
- "url",
- "uuid",
-]
-
-[[package]]
-name = "pa-factory"
-version = "0.10.5"
-dependencies = [
- "serde",
- "serde_json",
- "tempfile",
- "toml",
-]
-
-[[package]]
-name = "pa-models"
-version = "0.10.5"
-dependencies = [
- "hex",
- "hmac",
- "pa-ai",
- "pa-types",
- "rcgen",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror",
- "tokio",
- "tokio-rustls",
- "tracing",
-]
-
-[[package]]
-name = "pa-perf"
-version = "0.10.5"
-dependencies = [
- "anyhow",
- "clap",
- "nix",
- "pa-core",
- "pa-daemon",
- "pa-types",
- "serde",
- "serde_json",
- "tempfile",
- "vt100",
-]
-
-[[package]]
-name = "pa-telemetry"
-version = "0.10.5"
-dependencies = [
- "anyhow",
- "reqwest",
- "rustix 1.1.6",
- "rustls",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "pa-tui"
-version = "0.10.5"
-dependencies = [
- "anyhow",
- "base64",
- "clap",
- "crossterm",
- "emojis",
- "fancy-regex",
- "ignore",
- "notify",
- "pa-types",
- "proptest",
- "ratatui",
- "regex",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-util",
- "unicode-properties",
- "unicode-segmentation",
- "unicode-width 0.2.0",
- "url",
- "uuid",
- "vt100",
-]
-
-[[package]]
-name = "pa-types"
-version = "0.10.5"
-dependencies = [
- "anyhow",
- "libc",
- "regex",
- "serde",
- "serde_json",
- "socket2",
- "tempfile",
- "thiserror",
- "tokio",
-]
-
-[[package]]
 name = "parking_lot"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1921,6 +1669,258 @@ name = "r-efi"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
+
+[[package]]
+name = "radiata-agent"
+version = "0.10.5"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "radiata-ai"
+version = "0.10.5"
+dependencies = [
+ "anyhow",
+ "base64",
+ "bytes",
+ "futures",
+ "h2",
+ "hex",
+ "hmac",
+ "http",
+ "radiata-types",
+ "rand",
+ "rcgen",
+ "regex",
+ "reqwest",
+ "rustls",
+ "rustls-native-certs",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
+ "tokio-util",
+ "tracing",
+ "url",
+ "webpki-roots",
+]
+
+[[package]]
+name = "radiata-cli"
+version = "0.10.5"
+dependencies = [
+ "anyhow",
+ "base64",
+ "crossterm",
+ "diffy-diff",
+ "flate2",
+ "futures",
+ "hex",
+ "libc",
+ "nix",
+ "radiata-agent",
+ "radiata-ai",
+ "radiata-core",
+ "radiata-daemon",
+ "radiata-factory",
+ "radiata-telemetry",
+ "radiata-tui",
+ "radiata-types",
+ "rsa",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tar",
+ "tempfile",
+ "tokio",
+ "url",
+ "uuid",
+ "yaml_serde",
+]
+
+[[package]]
+name = "radiata-core"
+version = "0.10.5"
+dependencies = [
+ "anyhow",
+ "base64",
+ "fancy-regex",
+ "flate2",
+ "futures",
+ "getrandom 0.4.3",
+ "globset",
+ "hex",
+ "ignore",
+ "libc",
+ "nix",
+ "proptest",
+ "radiata-agent",
+ "radiata-ai",
+ "radiata-factory",
+ "radiata-models",
+ "radiata-telemetry",
+ "radiata-types",
+ "reqwest",
+ "rsa",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tar",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "unicode-normalization",
+ "url",
+ "uuid",
+ "yaml_serde",
+]
+
+[[package]]
+name = "radiata-daemon"
+version = "0.10.5"
+dependencies = [
+ "anyhow",
+ "filetime",
+ "futures",
+ "globset",
+ "nix",
+ "proptest",
+ "radiata-agent",
+ "radiata-ai",
+ "radiata-core",
+ "radiata-models",
+ "radiata-telemetry",
+ "radiata-types",
+ "serde",
+ "serde_json",
+ "sha2",
+ "socket2",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "radiata-factory"
+version = "0.10.5"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
+name = "radiata-models"
+version = "0.10.5"
+dependencies = [
+ "hex",
+ "hmac",
+ "radiata-ai",
+ "radiata-types",
+ "rcgen",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+]
+
+[[package]]
+name = "radiata-perf"
+version = "0.10.5"
+dependencies = [
+ "anyhow",
+ "clap",
+ "nix",
+ "radiata-core",
+ "radiata-daemon",
+ "radiata-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "vt100",
+]
+
+[[package]]
+name = "radiata-telemetry"
+version = "0.10.5"
+dependencies = [
+ "anyhow",
+ "reqwest",
+ "rustix 1.1.6",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "radiata-tui"
+version = "0.10.5"
+dependencies = [
+ "anyhow",
+ "base64",
+ "clap",
+ "crossterm",
+ "emojis",
+ "fancy-regex",
+ "ignore",
+ "notify",
+ "proptest",
+ "radiata-types",
+ "ratatui",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "unicode-properties",
+ "unicode-segmentation",
+ "unicode-width 0.2.0",
+ "url",
+ "uuid",
+ "vt100",
+]
+
+[[package]]
+name = "radiata-types"
+version = "0.10.5"
+dependencies = [
+ "anyhow",
+ "libc",
+ "regex",
+ "serde",
+ "serde_json",
+ "socket2",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
 
 [[package]]
 name = "rand"

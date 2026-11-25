@@ -156,7 +156,7 @@ def main():
         'TUI', 'factory execution and recovery']}
     try:
         assert sys.platform == 'linux', 'hosted Linux only'
-        with tempfile.TemporaryDirectory(prefix='pa-factory-', dir='/tmp') as folder:
+        with tempfile.TemporaryDirectory(prefix='radiata-factory-', dir='/tmp') as folder:
             binary = Path(os.environ['PA_RUST_BINARY']).resolve()
             observed = result['run'] = {'binary_sha256': digest(binary)}
             try:

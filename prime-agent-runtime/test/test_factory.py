@@ -4094,7 +4094,7 @@ class FactoryExecutorTest(_ExecutorTestCase):
         # The binding lane stores a settled child's answer capped at
         # ANSWER_BINDING_CAP, which sits at parity with the host's collect
         # bound: the daemon's ANSWER_TEXT_MAX_CHARS
-        # (crates/pa-daemon/src/rlm_child_model.rs), 65,536 characters —
+        # (crates/radiata-daemon/src/rlm_child_model.rs), 65,536 characters —
         # the hard-coded literal below, not the factory constant, so a cap
         # below the host bound fails the test. The old 8192 cap sat below
         # that bound, so a valid fenced JSON between the two (a design

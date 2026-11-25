@@ -356,8 +356,8 @@ def main(argv=None):
         if not binary.is_file():
             raise SystemExit(f"error: no prebuilt binary at {binary}; drop --skip-build")
     else:
-        print("building the release binary (cargo build --release -p pa-cli)…")
-        subprocess.run(["cargo", "build", "--release", "-p", "pa-cli"], cwd=ROOT, check=True)
+        print("building the release binary (cargo build --release -p radiata-cli)…")
+        subprocess.run(["cargo", "build", "--release", "-p", "radiata-cli"], cwd=ROOT, check=True)
         binary = root / "target" / "release" / binary_name
 
     if tag.startswith("linux-"):

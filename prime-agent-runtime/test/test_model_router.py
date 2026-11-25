@@ -734,6 +734,54 @@ class RouterFactoryTest(_ExecutorTestCase):
         self.assertIn("antigravity/gemini-4-neon", rerouted[0]["detail"])
 
     @async_test
+    async def test_a_router_step_spawns_on_the_model_the_router_picks(self) -> None:
+        home = TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        self._isolate(
+            {
+                "PA_ROUTER_HOME": home.name,
+                "PA_ROUTER_PROVIDERS": "antigravity,codex",
+                "PA_ROUTER_QUOTA_JSON": self._quota(gemini=10, claude_gpt=10, codex=5),
+                "PA_CODEXBAR_BIN": "none",
+            },
+            remove=("PA_MODEL_ROUTER",),
+        )
+        self._machine("router")
+        self.host.outcomes["design"] = {"status": "done", "answer": "architecture is sound"}
+        started = await self.start()
+        await self.executor._runs[started["run_id"]].task
+        status = await rlm_module.rlm.factory.status(started["run_id"])
+
+        self.assertEqual(status["state"], "done", status.get("pause_reason") or status.get("last_error"))
+        models = [call["kwargs"].get("model") for call in self.host.spawn_calls("design")]
+        self.assertEqual(len(models), 1)
+        self.assertIn("/", models[0])
+        self.assertNotEqual(models[0], "router")
+        routed = [event for event in status["events"] if event["kind"] == "model_routed"]
+        self.assertEqual(len(routed), 1)
+        self.assertEqual(routed[0]["model"], models[0])
+        self.assertTrue(routed[0]["tier"])
+        node = next(node for node in status["nodes"] if node["id"] == "design")
+        self.assertEqual(node["instances"][0]["routed_model"], models[0])
+        self.assertEqual(node["instances"][0]["routed_tier"], routed[0]["tier"])
+
+    @async_test
+    async def test_a_router_step_runs_on_the_host_model_when_the_router_is_off(self) -> None:
+        home = TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        self._isolate({"PA_ROUTER_HOME": home.name, "PA_MODEL_ROUTER": "off", "PA_CODEXBAR_BIN": "none"})
+        self._machine("router")
+        self.host.outcomes["design"] = {"status": "done", "answer": "architecture is sound"}
+        started = await self.start()
+        await self.executor._runs[started["run_id"]].task
+        status = await rlm_module.rlm.factory.status(started["run_id"])
+
+        self.assertEqual(status["state"], "done", status.get("pause_reason") or status.get("last_error"))
+        models = [call["kwargs"].get("model") for call in self.host.spawn_calls("design")]
+        self.assertEqual(models, [None])
+        self.assertNotIn("model_routed", [event["kind"] for event in status["events"]])
+
+    @async_test
     async def test_auto_mode_proactively_reroutes_hard_exhausted_pool_before_spawn(self) -> None:
         home = TemporaryDirectory()
         self.addCleanup(home.cleanup)
@@ -812,7 +860,7 @@ class RouterFactoryTest(_ExecutorTestCase):
             }
         )
         # First child settles with partial prose (no factory-outputs) while its session
-        # JSONL records a provider_retry_outcome quota banner from pa-daemon.
+        # JSONL records a provider_retry_outcome quota banner from radiata-daemon.
         first_answer = "I'll start by checking the existing files."
         self.host.outcomes["design"] = {"status": "done", "answer": first_answer}
         gate = self.host.gate("rlm.collect", 1)
@@ -1087,7 +1135,7 @@ class RampRouterV2Tests(unittest.TestCase):
 
     def test_captain_router_pre_routes_and_records_fallback(self) -> None:
         captain_router_path = (
-            Path(__file__).resolve().parents[2] / "crates" / "pa-cli" / "src" / "captain_router.py"
+            Path(__file__).resolve().parents[2] / "crates" / "radiata-cli" / "src" / "captain_router.py"
         )
         ns: dict[str, object] = {"os": os, "json": json, "Path": Path}
         exec(compile(captain_router_path.read_text(encoding="utf-8"), str(captain_router_path), "exec"), ns)

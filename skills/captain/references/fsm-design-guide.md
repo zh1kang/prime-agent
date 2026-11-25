@@ -4,7 +4,7 @@ A project factory is a finite-state machine of agent and Python states in
 `<project>/.prime/machines/<name>/`. This guide is complete on its own: a
 Captain with no Python REPL (antigravity, cursor, claude-cli) can author from
 it. `rlm.factory.help()` and `prime-agent factory validate <dir>` remain the
-source of truth; the loader is `crates/pa-factory/src/load.rs`.
+source of truth; the loader is `crates/radiata-factory/src/load.rs`.
 
 ## 1. FSM or crew thread?
 

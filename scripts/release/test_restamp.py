@@ -11,7 +11,7 @@ uploads), with the security case first: the restamp must refuse anything
 that is not the named commit's continuous build.
 
 The fixture binary mirrors the shipped runtime contract the restamp
-relies on (pa-cli config::version): it prints the version from the
+relies on (radiata-cli config::version): it prints the version from the
 exe-adjacent `package.json` at runtime, falling back to a compiled-in
 version when the manifest is unreadable — so the livecheck proves the
 version restamp through the same mechanism the update flow reads.
@@ -53,7 +53,7 @@ DARWIN_TARGET = "x86_64-apple-darwin"
 DARWIN_ALIAS = TARGET_ALIASES[DARWIN_TARGET]
 
 # The runtime version resolver the shipped binary implements
-# (pa-cli config::version parity: the exe-adjacent package.json wins at
+# (radiata-cli config::version parity: the exe-adjacent package.json wins at
 # runtime; the compiled-in version is the fallback when the manifest is
 # missing or malformed).
 VERSION_RESOLVER_C = r'''#include <stdio.h>

@@ -1052,7 +1052,7 @@ def scan_session_jsonl_quota_error(
 ) -> str | None:
     """Scan newly written tail rows of a session JSONL for a provider quota/auth error.
 
-    Matches the durable row shapes emitted by ``pa-daemon``:
+    Matches the durable row shapes emitted by ``radiata-daemon``:
     - ``type == "custom_message"`` with ``customType == "provider_retry_outcome"`` and
       ``details.success is False`` (never matches recovered episodes).
     - ``type == "message"`` with a provider-error ``message.errorMessage``.
@@ -1126,7 +1126,7 @@ def _which(name: str) -> bool:
 
 
 def claude_cli_available() -> bool:
-    """Mirror ``pa_ai::claude_cli::is_available`` / factory's CLI probe."""
+    """Mirror ``radiata_ai::claude_cli::is_available`` / factory's CLI probe."""
 
     explicit = _env_flag("PA_CLAUDE_BIN")
     if explicit is not None:
@@ -2009,6 +2009,39 @@ def admission_decision(
         if (decision.thinking or "") == (pinned_thinking or ""):
             return None
     return decision
+
+
+# The role model a factory step names to let the router pick its model at spawn time.
+ROUTER_MODEL = "router"
+
+
+def routed_step_decision(
+    *,
+    prompt: str,
+    state_id: str,
+    role: str | None,
+    specialist: str | None,
+    attempt: int,
+    exclude_models: tuple[str, ...] = (),
+) -> RouteDecision | None:
+    """The model for a factory step that names ``ROUTER_MODEL``: the router picks from the
+    step's task tier and the live quota. None when the router is off, so the step runs on
+    the factory host's model."""
+
+    if router_disabled():
+        return None
+    return route_model(
+        prompt=prompt,
+        state_id=state_id,
+        role=role,
+        specialist=specialist,
+        attempt=attempt,
+        snapshot=load_quota_snapshot(allow_blocking=False),
+        health=get_router().health,
+        available=available_providers(),
+        exclude_models=exclude_models,
+        routing_profile=load_routing_profile(),
+    )
 
 
 def fallback_after_failure(

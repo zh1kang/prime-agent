@@ -332,10 +332,10 @@ jobs:
           python3 scripts/ci_test_shard.py --shard ${{ matrix.shard }} --total ${{ env.SHARD_COUNT }}             --crates "${{ needs.changes.outputs.crates }}" --print-selection
       # Sibling-binary parity: the serial `cargo test --workspace` built every
       # workspace bin into the shared profile dir as a side effect, and the
-      # e2e suites look each other's binaries up there (pa-cli's
-      # daemon_commands_e2e spawns pa-daemon this way). A shard builds its
+      # e2e suites look each other's binaries up there (radiata-cli's
+      # daemon_commands_e2e spawns radiata-daemon this way). A shard builds its
       # test subset only, so the bins are built explicitly once up front —
-      # first measured on run 36085993711, where the missing pa-daemon bin
+      # first measured on run 36085993711, where the missing radiata-daemon bin
       # failed exactly this suite. A leg with no selected units skips this
       # (and runs nothing below); the push wave always selects units, so its
       # behavior is unchanged.

@@ -39,7 +39,7 @@ archive name keeps the bare `<version>` so rolling releases overwrite assets.
 Archive naming: `prime-agent-<version>-<platform-alias>.tar.gz` (TS
 `assemble-release-archives.mjs` parity, e.g.
 `prime-agent-0.1.0-linux-x64.tar.gz`) — the name the update flow's channel
-manifest requires: `pa-core::update::release` keeps a row only when its `file`
+manifest requires: `radiata-core::update::release` keeps a row only when its `file`
 is exactly `prime-agent-<version>-<platform>.tar.gz`, and the promoted
 latest.json/beta.json reference these assets verbatim. The target triple stays
 in the manifest entry's `target` field (provenance, SBOM keying).
@@ -293,7 +293,7 @@ def deny_allowed_licenses(deny_toml: Path) -> list[str]:
 
 def write_third_party_notices(repo_root: Path, target: str, out: Path) -> None:
     """Render the licenses of every crate the shipped binary links for
-    `target` (cargo-about over pa-cli's normal dependency graph) to `out`.
+    `target` (cargo-about over radiata-cli's normal dependency graph) to `out`.
 
     cargo-about accepts exactly the licenses deny.toml allows, so a crate
     under any other license fails the release here as it fails cargo-deny.
@@ -311,7 +311,7 @@ def write_third_party_notices(repo_root: Path, target: str, out: Path) -> None:
         command = [
             "cargo-about", "generate", "--locked", "--fail",
             "--config", str(config),
-            "--manifest-path", str(repo_root / "crates" / "pa-cli" / "Cargo.toml"),
+            "--manifest-path", str(repo_root / "crates" / "radiata-cli" / "Cargo.toml"),
             "--output-file", str(out), str(template),
         ]
         try:

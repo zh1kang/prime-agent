@@ -53,7 +53,7 @@ FILES_API_CEILING = 3000
 # These paths are skipped so a real crate change can still narrow its test
 # selection when the PR also updates its changelog or documentation.
 #
-# Near misses stay fail-safe, not metadata: top-level *.md (pa-cli's
+# Near misses stay fail-safe, not metadata: top-level *.md (radiata-cli's
 # packaged-layout e2e copies README.md into its staged layout), skills/,
 # vendor/, install scripts, the runtime sidecar, workspace Cargo files,
 # scripts/, and the workflows.
@@ -69,20 +69,20 @@ def is_guaranteed_metadata(path: str) -> bool:
 # Cargo.toml link. Over-selecting is safe; missing a dependent test is not.
 # The changes job must select without installing Rust or running Cargo.
 WORKSPACE_DEPS = {
-    "pa-types": set(),
-    "pa-telemetry": set(),
-    "pa-ai": {"pa-types"},
-    "pa-models": {"pa-ai", "pa-types"},
-    "pa-agent": {"pa-ai", "pa-types"},
-    "pa-core": {"pa-agent", "pa-ai", "pa-factory", "pa-models", "pa-types",
-                "pa-telemetry"},
-    "pa-daemon": {"pa-types", "pa-core", "pa-agent", "pa-ai", "pa-telemetry",
-                  "pa-models"},
-    "pa-tui": {"pa-types", "pa-core"},
-    "pa-cli": {"pa-types", "pa-telemetry", "pa-ai", "pa-models",
-               "pa-agent", "pa-core", "pa-daemon", "pa-tui", "pa-factory"},
-    "pa-perf": {"pa-types", "pa-core", "pa-daemon"},
-    "pa-factory": set(),
+    "radiata-types": set(),
+    "radiata-telemetry": set(),
+    "radiata-ai": {"radiata-types"},
+    "radiata-models": {"radiata-ai", "radiata-types"},
+    "radiata-agent": {"radiata-ai", "radiata-types"},
+    "radiata-core": {"radiata-agent", "radiata-ai", "radiata-factory", "radiata-models", "radiata-types",
+                "radiata-telemetry"},
+    "radiata-daemon": {"radiata-types", "radiata-core", "radiata-agent", "radiata-ai", "radiata-telemetry",
+                  "radiata-models"},
+    "radiata-tui": {"radiata-types", "radiata-core"},
+    "radiata-cli": {"radiata-types", "radiata-telemetry", "radiata-ai", "radiata-models",
+               "radiata-agent", "radiata-core", "radiata-daemon", "radiata-tui", "radiata-factory"},
+    "radiata-perf": {"radiata-types", "radiata-core", "radiata-daemon"},
+    "radiata-factory": set(),
 }
 
 
@@ -144,9 +144,9 @@ def select_crates(rows: list[tuple[str, str]]) -> list[str] | None:
     if not crates:
         print("no crate paths in the change list: the full selection runs")
         return None
-    # pa-types owns the shared wire vocabulary: run every workspace test for
-    # its changes, including the independent pa-telemetry leaf crate.
-    if "pa-types" in crates:
+    # radiata-types owns the shared wire vocabulary: run every workspace test for
+    # its changes, including the independent radiata-telemetry leaf crate.
+    if "radiata-types" in crates:
         return sorted(WORKSPACE_DEPS)
     # Walk upward through the DAG until no dependent is left unselected.
     while True:

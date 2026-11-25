@@ -2,17 +2,17 @@
 exclude = ["vendor/diffy-diff"]
 resolver = "2"
 members = [
-    "crates/pa-telemetry",
-    "crates/pa-types",
-    "crates/pa-ai",
-    "crates/pa-models",
-    "crates/pa-agent",
-    "crates/pa-core",
-    "crates/pa-factory",
-    "crates/pa-daemon",
-    "crates/pa-tui",
-    "crates/pa-cli",
-    "crates/pa-perf",
+    "crates/radiata-telemetry",
+    "crates/radiata-types",
+    "crates/radiata-ai",
+    "crates/radiata-models",
+    "crates/radiata-agent",
+    "crates/radiata-core",
+    "crates/radiata-factory",
+    "crates/radiata-daemon",
+    "crates/radiata-tui",
+    "crates/radiata-cli",
+    "crates/radiata-perf",
 ]
 
 # Crossterm 0.28.1's kitty support check holds the process-wide event reader
@@ -33,18 +33,18 @@ serde = { version = "1", features = ["derive"] }
 # model the TS daemon and session files byte-emit. Without it the Map is a
 # BTreeMap and every Value-built frame re-sorts its keys alphabetically,
 # diverging from the TS byte stream (e.g. compaction `details` order).
-# raw_value: pa-daemon needs it, so release builds already have it. Listing
+# raw_value: radiata-daemon needs it, so release builds already have it. Listing
 # it here gives every crate the same serde_json features, so
-# `cargo test -p pa-core` and `cargo test -p pa-daemon` share one build.
+# `cargo test -p radiata-core` and `cargo test -p radiata-daemon` share one build.
 serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 anyhow = "1"
 tokio = { version = "1", features = ["full"] }
 tracing = { version = "0.1", features = ["attributes"] }
-pa-telemetry = { path = "crates/pa-telemetry" }
-pa-factory = { path = "crates/pa-factory" }
-pa-types = { path = "crates/pa-types" }
-pa-ai = { path = "crates/pa-ai" }
-pa-agent = { path = "crates/pa-agent" }
+radiata-telemetry = { path = "crates/radiata-telemetry" }
+radiata-factory = { path = "crates/radiata-factory" }
+radiata-types = { path = "crates/radiata-types" }
+radiata-ai = { path = "crates/radiata-ai" }
+radiata-agent = { path = "crates/radiata-agent" }
 thiserror = "2"
 futures = "0.3"
 toml = "1"
@@ -55,8 +55,8 @@ proptest = { version = "1.11", default-features = false, features = ["std"] }
 unsafe_code = "forbid"
 
 [workspace.lints.clippy]
-# The pedantic gate the five clippy campaigns earned (pa-daemon #3029,
-# pa-cli #3050, pa-core #3093, the small crates #3110, pa-tui #3134):
+# The pedantic gate the five clippy campaigns earned (radiata-daemon #3029,
+# radiata-cli #3050, radiata-core #3093, the small crates #3110, radiata-tui #3134):
 # every workspace member is pedantic-clean; CI's -D warnings bar turns
 # this warn class into errors, and the per-crate #![allow] exceptions
 # (the design-choice classes, each with its in-code justification) keep

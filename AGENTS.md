@@ -12,10 +12,10 @@ Development rules for Prime Agent (Rust) on PrimeIntellect-ai/prime-agent, branc
 
 ## Style and structure
 
-- Workspace crates are prefixed `pa-`. The hard ownership rules: one owned area per crate, pa-types is the only shared crate, cycle-free dependency direction, minimal public APIs, no god-modules. The dependency direction is pinned in the Crates table below; each crate's README.md states its scope, non-goals, and public API surface.
+- Workspace crates are prefixed `pa-`. The hard ownership rules: one owned area per crate, radiata-types is the only shared crate, cycle-free dependency direction, minimal public APIs, no god-modules. The dependency direction is pinned in the Crates table below; each crate's README.md states its scope, non-goals, and public API surface.
 - Prefer private modules with an explicitly exported public crate API. Internals are `pub(crate)`.
 - Aim for files under 2,000 lines, tests included. The 2,000-2,100 range is a soft review signal, not a merge limit: when adding to an already-large file, consider splitting by responsibility rather than growing it further. Move related tests and docs with extracted code.
-- Name modules for what they own, not `utils` or `common`. Follow existing structure: in `crates/pa-core/src/kernel/manager/`, `mod.rs` connects `execution.rs`, `requests.rs`, and `teardown.rs`; put a new kernel-manager concern beside them. In `crates/pa-core/src/cron/store/`, `mod.rs` connects `heartbeat.rs`, `jobs.rs`, and `session_artifacts.rs`; keep storage work there rather than growing the scheduler.
+- Name modules for what they own, not `utils` or `common`. Follow existing structure: in `crates/radiata-core/src/kernel/manager/`, `mod.rs` connects `execution.rs`, `requests.rs`, and `teardown.rs`; put a new kernel-manager concern beside them. In `crates/radiata-core/src/cron/store/`, `mod.rs` connects `heartbeat.rs`, `jobs.rs`, and `session_artifacts.rs`; keep storage work there rather than growing the scheduler.
 - Inline format args: always prefer `format!("{x}")` over positional.
 - Collapse if statements per clippy::collapsible_if.
 - Prefer method references over closures per clippy::redundant_closure_for_method_calls.
@@ -58,7 +58,7 @@ The UI critical path is paint-latency-critical. First paint, and every frame the
 Rules:
 
 - Nothing user-visible awaits the network. Any HTTP/socket call on a render path (telemetry, catalog fetch, update check) runs on a background worker; the paint path hands the work off and returns immediately. Delivery semantics (timeout, retry, ordering) live with the worker, not the caller.
-- Telemetry is fire-and-forget from user-facing code. `pa-telemetry`'s background worker owns delivery end to end; no startup, session create, tab open, or first-render path may hold a flush or await a sink.
+- Telemetry is fire-and-forget from user-facing code. `radiata-telemetry`'s background worker owns delivery end to end; no startup, session create, tab open, or first-render path may hold a flush or await a sink.
 - Fire-and-forget boundaries need a red-first test: a hanging sink (one that never replies) must not delay paint. The test fails if any await on the critical path reaches the worker's delivery.
 - Tests that mock a sink or run offline cannot prove the above (the benchmark's mock hides the POST). The regression test with a hanging sink is the required verifier.
 
@@ -70,11 +70,11 @@ Example (the #3288 regression this rule exists to prevent): the telemetry startu
 - `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` must pass before every merge. Run `make check` — the local mirror of the same gates; CI runs on the org's billing (`.github/workflows/continuous.yml` on `main` pushes; `release.yml` on version tags). The PR-only codebase-health check reports growth past 2,000 lines as review guidance; it never blocks a merge.
 - PRs that change shipped paths need a `.changes/<branch-slug>.md` fragment (one user-facing bullet; see `.changes/README.md`) or the `no-changelog` label; the changelog-fragment check enforces it.
 - PRs must state ownership compliance (crate README scope/non-goals/public API, dependency direction) and classify the change: internals, new `pub` surface, or a new dependency/cross-crate re-export. The latter two are architectural changes — an innocent-looking `pub use` is a very simple way to break encapsulation.
-- The compiled fallback model catalog `crates/pa-ai/src/models_generated.rs` is hand-maintained Rust — edit it by hand (there is no generator). The catalog fixture `crates/pa-models/tests/fixtures/catalog.v1.json` refreshes with `scripts/generate-catalog-fixture.py`. Bulk data files are exempt from the size guidance.
+- The compiled fallback model catalog `crates/radiata-ai/src/models_generated.rs` is hand-maintained Rust — edit it by hand (there is no generator). The catalog fixture `crates/radiata-models/tests/fixtures/catalog.v1.json` refreshes with `scripts/generate-catalog-fixture.py`. Bulk data files are exempt from the size guidance.
 
 ## Adoption telemetry
 
-Every user-visible feature ships its adoption telemetry event in the same PR as the feature: the event name + properties join the versioned schema (`pa-telemetry`), and a seam emits it from day one. Telemetry properties never carry prompt, session, or file content (primitives only; see `pa-telemetry`); delivery is fire-and-forget from user-facing code (see Performance and the critical path).
+Every user-visible feature ships its adoption telemetry event in the same PR as the feature: the event name + properties join the versioned schema (`radiata-telemetry`), and a seam emits it from day one. Telemetry properties never carry prompt, session, or file content (primitives only; see `radiata-telemetry`); delivery is fire-and-forget from user-facing code (see Performance and the critical path).
 
 ## Branding
 
@@ -93,26 +93,26 @@ EXPLICIT EXCEPTION: wire-protocol identifiers (e.g. the PI_PACKAGE_DIR env var, 
 
 ## Crates
 
-One owned area per crate; `pa-types` is the only shared vocabulary crate. Dependencies flow from the composition root toward lower crates, never back upward. The table summarizes each crate's current direct workspace dependencies:
+One owned area per crate; `radiata-types` is the only shared vocabulary crate. Dependencies flow from the composition root toward lower crates, never back upward. The table summarizes each crate's current direct workspace dependencies:
 
 | Crate | Purpose | Direct workspace dependencies |
 | --- | --- | --- |
-| `pa-types` | Shared wire and domain types | none |
-| `pa-telemetry` | Events and sinks | none |
-| `pa-agent` | Provider-independent agent loop | none |
-| `pa-ai` | Providers, model registry, streaming | `pa-types` |
-| `pa-models` | Live model catalog and transport | `pa-ai`, `pa-types` |
-| `pa-core` | Session engine, tools, skills, kernel, settings | `pa-types`, `pa-ai`, `pa-models`, `pa-agent`, `pa-telemetry` |
-| `pa-daemon` | Supervisor, workers, wire protocol | `pa-types`, `pa-core`, `pa-agent`, `pa-ai`, `pa-telemetry`, `pa-models` |
-| `pa-tui` | Terminal UI, daemon-wire client | `pa-types` |
-| `pa-cli` | `prime-agent` binary, composition root | `pa-types`, `pa-core`, `pa-ai`, `pa-agent`, `pa-daemon`, `pa-tui`, `pa-telemetry` |
-| `pa-perf` | Performance corpora + pty bench harness (dev/CI tooling, never shipped) | `pa-types`, `pa-core`, `pa-daemon` |
+| `radiata-types` | Shared wire and domain types | none |
+| `radiata-telemetry` | Events and sinks | none |
+| `radiata-agent` | Provider-independent agent loop | none |
+| `radiata-ai` | Providers, model registry, streaming | `radiata-types` |
+| `radiata-models` | Live model catalog and transport | `radiata-ai`, `radiata-types` |
+| `radiata-core` | Session engine, tools, skills, kernel, settings | `radiata-types`, `radiata-ai`, `radiata-models`, `radiata-agent`, `radiata-telemetry` |
+| `radiata-daemon` | Supervisor, workers, wire protocol | `radiata-types`, `radiata-core`, `radiata-agent`, `radiata-ai`, `radiata-telemetry`, `radiata-models` |
+| `radiata-tui` | Terminal UI, daemon-wire client | `radiata-types` |
+| `radiata-cli` | `prime-agent` binary, composition root | `radiata-types`, `radiata-core`, `radiata-ai`, `radiata-agent`, `radiata-daemon`, `radiata-tui`, `radiata-telemetry` |
+| `radiata-perf` | Performance corpora + pty bench harness (dev/CI tooling, never shipped) | `radiata-types`, `radiata-core`, `radiata-daemon` |
 
 Layering rules:
 
-- Dependencies only point from higher crates to lower crates shown above. No cycles or reverse edges. The leaf crates are peers; add only the dependencies needed for their work. Shared wire/domain vocabulary belongs in `pa-types`, not in a higher crate or a duplicate.
-- `pa-tui` renders from wire types and events; it does not link the session engine.
-- `pa-cli` is a composition root: it wires crates together and contains no business logic.
+- Dependencies only point from higher crates to lower crates shown above. No cycles or reverse edges. The leaf crates are peers; add only the dependencies needed for their work. Shared wire/domain vocabulary belongs in `radiata-types`, not in a higher crate or a duplicate.
+- `radiata-tui` renders from wire types and events; it does not link the session engine.
+- `radiata-cli` is a composition root: it wires crates together and contains no business logic.
 
 ## Reliability model
 

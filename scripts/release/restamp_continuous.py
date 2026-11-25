@@ -10,7 +10,7 @@ artifact set and a release one are version-shaped, so this script restamps
 them without touching the built bytes:
 
   - the tarball's inner `package.json` (the runtime version manifest the
-    shipped binary reports via `--version`; see pa-cli config::version)
+    shipped binary reports via `--version`; see radiata-cli config::version)
     moves from `<version>-continuous.<sha>` to the release version, keeping
     the `commit` provenance;
   - the archive, its SHA256SUMS line, and the (Linux) split-debug decoder

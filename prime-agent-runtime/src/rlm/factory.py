@@ -60,6 +60,7 @@ from typing import IO, Any, Callable
 from uuid import uuid4
 
 from .model_router import (
+    ROUTER_MODEL,
     admission_decision,
     anthropic_uses_claude_cli,
     fallback_after_failure,
@@ -69,6 +70,7 @@ from .model_router import (
     note_provider_failure,
     note_provider_success,
     pool_is_hard_exhausted,
+    routed_step_decision,
     router_disabled,
     scan_session_jsonl_quota_error,
 )
@@ -2181,13 +2183,18 @@ class _NodeInstance:
     repeat_error_count: int = 0  # consecutive failures sharing repeat_error_sig
     routed_model: str | None = None  # instance-scoped routed model (never mutates state.model)
     routed_thinking: str | None = None  # instance-scoped routed thinking
+    routed_tier: str | None = None  # the router's task tier for a router step
     provider_reroutes: int = 0  # provider-failure reroutes (excluded from tier escalation)
     excluded_models: list[str] = field(default_factory=list)  # models that failed on this instance
 
 
 def _effective_model(state: _StateRun, instance: _NodeInstance) -> str | None:
-    """The model this instance actually runs (or will run) on, preserving ``state.model`` as the pin."""
-    return instance.routed_model or state.model
+    """The model this instance actually runs (or will run) on, preserving ``state.model`` as the pin.
+
+    A router step with no routed model yet runs on the factory host's model (None)."""
+    if instance.routed_model:
+        return instance.routed_model
+    return None if state.model == ROUTER_MODEL else state.model
 
 
 def _effective_thinking(state: _StateRun, instance: _NodeInstance) -> str | None:
@@ -2488,6 +2495,7 @@ def _instance_json(instance: _NodeInstance) -> dict[str, Any]:
         "repeat_error_count": instance.repeat_error_count,
         "routed_model": instance.routed_model,
         "routed_thinking": instance.routed_thinking,
+        "routed_tier": instance.routed_tier,
         "provider_reroutes": instance.provider_reroutes,
         "excluded_models": list(instance.excluded_models),
     }
@@ -2500,7 +2508,7 @@ def _instance_from_json(data: dict[str, Any]) -> _NodeInstance:
         "rate_limit_streak", "child_id", "spawned_at", "duration_ms", "answer",
         "provisional", "error", "tool_uses", "inputs", "session_dir",
         "child_name", "factory_task_activity", "repair_sent", "awaiting_outputs_until", "deadline",
-        "resume_note", "retry_context", "repeat_error_sig", "routed_model", "routed_thinking",
+        "resume_note", "retry_context", "repeat_error_sig", "routed_model", "routed_thinking", "routed_tier",
     ):
         setattr(instance, field, data.get(field))
     instance.attempt = data.get("attempt") or 0
@@ -3910,6 +3918,11 @@ class FactoryExecutor:
                     "display_name": _instance_display_name(run_name, state, entry, instance),
                     "session_dir": instance.session_dir,
                     "spawned_at": instance.spawned_at,
+                    **(
+                        {"routed_model": instance.routed_model, "routed_tier": instance.routed_tier}
+                        if state.model == ROUTER_MODEL and instance.routed_model
+                        else {}
+                    ),
                     **(
                         {"factory_task_activity": instance.factory_task_activity}
                         if instance.factory_task_activity is not None
@@ -6305,6 +6318,8 @@ class FactoryExecutor:
     ) -> str | None:
         """Apply the model router before spawn. Returns a pause reason when
         every pool for this tier is already exhausted, else None."""
+        if state.model == ROUTER_MODEL and not instance.routed_model:
+            return self._route_router_step(run, state, entry, instance)
         active_model = _effective_model(state, instance)
         active_thinking = _effective_thinking(state, instance)
         effective_attempt = max(1, instance.attempt - instance.provider_reroutes)
@@ -6328,6 +6343,8 @@ class FactoryExecutor:
             instance.routed_model = decision.model
             if decision.thinking:
                 instance.routed_thinking = decision.thinking
+            if state.model == ROUTER_MODEL:
+                instance.routed_tier = decision.tier
             self._event(
                 run,
                 "model_rerouted",
@@ -6344,6 +6361,42 @@ class FactoryExecutor:
             )
         elif decision.thinking and decision.thinking != (active_thinking or ""):
             instance.routed_thinking = decision.thinking
+        return None
+
+    def _route_router_step(
+        self, run: FactoryRun, state: _StateRun, entry: _StateEntry, instance: _NodeInstance
+    ) -> str | None:
+        """Pick the model of a step that names the router. A later attempt keeps the routed
+        model, and a provider failure moves it through ``_prepare_provider_failure``."""
+        decision = routed_step_decision(
+            prompt=state.prompt_template or "",
+            state_id=state.state_id,
+            role=_state_role(state),
+            specialist=_state_specialist(state),
+            attempt=max(1, instance.attempt - instance.provider_reroutes),
+            exclude_models=tuple(instance.excluded_models),
+        )
+        if decision is None:
+            return None
+        if decision.exhausted and not decision.model:
+            detail = decision.reason or "every eligible pool is exhausted"
+            return f"Provider auth/quota error in state '{state.state_id}': {detail}"
+        if not decision.model:
+            return None
+        instance.routed_model = decision.model
+        instance.routed_thinking = decision.thinking or None
+        instance.routed_tier = decision.tier
+        self._event(
+            run,
+            "model_routed",
+            node=state.state_id,
+            entry=entry.index,
+            instance=instance.index,
+            detail=f"{decision.model} ({decision.tier}, {decision.thinking}): {decision.reason}",
+            model=decision.model,
+            thinking=decision.thinking or "",
+            tier=decision.tier,
+        )
         return None
 
     def _prepare_provider_failure(
@@ -6382,6 +6435,8 @@ class FactoryExecutor:
             instance.routed_model = decision.model
             if decision.thinking:
                 instance.routed_thinking = decision.thinking
+            if state.model == ROUTER_MODEL:
+                instance.routed_tier = decision.tier
             instance.provider_reroutes += 1
             instance.retry_base += 1
             instance.status = "pending"

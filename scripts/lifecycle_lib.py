@@ -376,13 +376,13 @@ class Supervisor:
                         with self.lock:
                             response["data"]["messageCount"] = len(self.messages)
                     elif name == "get_messages":
-                        # pa-daemon worker::commands::handle_get_messages returns
+                        # radiata-daemon worker::commands::handle_get_messages returns
                         # the actual transcript.
                         # Fixture turns only append; no branches/pagination are used.
                         with self.lock:
                             response["data"] = {"messages": list(self.messages)}
                     elif name == "get_session_context":
-                        # pa-daemon state_getters::handle_get_session_context's
+                        # radiata-daemon state_getters::handle_get_session_context's
                         # context envelope. This fixture has no compaction or
                         # model/thinking/tier change rows: build_session_context
                         # preserves its turns and uses off/None/None defaults.

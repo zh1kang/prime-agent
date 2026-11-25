@@ -235,7 +235,7 @@ async def _waiting_keepalive_loop() -> None:
             last_sent = time.monotonic()
 
 # bash(persistent=True): every session's persistent shells live in one home
-# under the agent dir (the cross-language contract pa-daemon reads): per shell
+# under the agent dir (the cross-language contract radiata-daemon reads): per shell
 # a <id>.json record assigned to its session (RLM_SESSION_ID, the durable
 # session id the host exports), plus <id>.out and <id>.rc.
 _PERSISTENT_DIR = "persistent-shells"

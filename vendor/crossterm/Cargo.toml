@@ -200,3 +200,8 @@ features = [
     "winerror",
 ]
 optional = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(winapi)', 'cfg(crossterm_winapi)'] }
+unused_parens = "allow"
+dead_code = "allow"

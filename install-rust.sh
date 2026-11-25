@@ -33,7 +33,7 @@
 #      non-default socket the first field install had), and this
 #      product's own pinned rust socket. The daemon that answers a
 #      candidate is classified by IDENTITY first — a hello whose
-#      runtime build id is this product's ("pa-daemon-rs-<version>",
+#      runtime build id is this product's ("radiata-daemon-rs-<version>",
 #      carried since the port) is OUR daemon of any build (the update
 #      flow: the running daemon holds the old binary and venv state, the
 #      update needs it down, the next invocation boots the new daemon —
@@ -327,7 +327,7 @@ UI_ANIM=0
 if [ "$UI_TTY" = 1 ] && [ "$VERBOSE" != 1 ]; then UI_ANIM=1; fi
 UI_COLOR=0
 if [ "$UI_TTY" = 1 ] && [ -z "${NO_COLOR:-}" ]; then UI_COLOR=1; fi
-# The prime theme's palette (crates/pa-types/themes/prime.json), 24-bit.
+# The prime theme's palette (crates/radiata-types/themes/prime.json), 24-bit.
 C_BOLD="" C_DIM="" C_ACCENT="" C_WARN="" C_RESET=""
 if [ "$UI_COLOR" = 1 ]; then
   esc="$(printf '\033')"
@@ -346,7 +346,7 @@ say() { printf '%s%s%s\n' "$SAY_DIM" "$*" "$SAY_RESET" >&3; }
 # The program text is awk, not shell: its "$PRIME_AGENT_UI_DIR" expands later.
 # shellcheck disable=SC2016
 banner_awk='# BANNER_AWK_BEGIN
-# The installer banner: the TUI first-run splash (crates/pa-tui/src/
+# The installer banner: the TUI first-run splash (crates/radiata-tui/src/
 # onboarding.rs mark_rows + draw_field), ported cell for cell so the same
 # frame at the same width draws the same canvas; the parity test in that
 # file runs this program (-v parity=1) against the Rust renderer.
@@ -780,7 +780,7 @@ OS="$(uname -s)"
 ARCH="$(uname -m)"
 WINDOWS="no"
 # CHANNEL_PLATFORM is the channel manifest's platform alias (the TS
-# NATIVE_PLATFORMS spelling pa-core::update::install::current_platform_alias
+# NATIVE_PLATFORMS spelling radiata-core::update::install::current_platform_alias
 # reads).
 case "$OS:$ARCH" in
   Darwin:arm64) CHANNEL_PLATFORM=darwin-arm64 ;;
@@ -1452,7 +1452,7 @@ if [ "$MODE" = channel ]; then
 # --- the channel manifest: this platform's artifact row ---------------------
 # The manifest carries the version plus the per-platform rows; the row's
 # file must be the exact channel naming and its sha256 the 64-hex shape —
-# the same validation pa-core::update::release::latest_release applies, so
+# the same validation radiata-core::update::release::latest_release applies, so
 # a lying manifest refuses here instead of staging a wrong tarball.
 # A PINNED version (PRIME_AGENT_VERSION) skips the channel manifest
 # entirely — the channel manifest describes the channel's CURRENT
@@ -1610,7 +1610,7 @@ windows_stop_summary=""
 ts_socket="${TMPDIR:-/tmp}/prime-agent-$(id -u)/daemon.sock"
 rust_socket="${TMPDIR:-/tmp}/prime-agent-rust-$(id -u)/daemon.sock"
 # The launcher pins /tmp when the TMPDIR path exceeds the non-Linux
-# 103-byte sun_path limit (pa-daemon socket_dir() owns the rule); the
+# 103-byte sun_path limit (radiata-daemon socket_dir() owns the rule); the
 # stop probe must look where the launcher actually pinned.
 if [ "$OS" != "Linux" ] && [ "$(printf '%s' "$rust_socket" | wc -c)" -gt 103 ]; then
   rust_socket="/tmp/prime-agent-rust-$(id -u)/daemon.sock"
@@ -1713,7 +1713,7 @@ def progress(detail, label=None):
         progress_out.write((" %s  (%s)" % (label, detail) if label is not None else "   " + detail) + "\n")
 
 # The classification ladder, identity before schema: a hello whose
-# runtime build id is this product's ("pa-daemon-rs-<version>", carried by
+# runtime build id is this product's ("radiata-daemon-rs-<version>", carried by
 # every rust build since the port) is OUR daemon of ANY build; below that,
 # the two products share the protocol-7 schema FAMILY
 # ("protocol-7-schema-<revision>-<hash>"): the TypeScript product's id
@@ -1725,7 +1725,7 @@ def progress(detail, label=None):
 # unrecognized (the loud warning).
 TS_SCHEMA_FAMILY = "protocol-7-schema-"
 RUST_SCHEMA_ID = "protocol-7-schema-30-8e4b17c2a9f5"
-RUST_BUILD_ID_PREFIX = "pa-daemon-rs-"
+RUST_BUILD_ID_PREFIX = "radiata-daemon-rs-"
 HELLO_TIMEOUT_S = 1.5
 PROBE_TIMEOUT_S = 5.0
 STOP_CONFIRM_TIMEOUT_S = 5.0
@@ -2825,7 +2825,7 @@ launcher_tmp="$(mktemp "${bin_dir}/.prime-agent.XXXXXX")"
 if [ "$WINDOWS" = "yes" ]; then
   # The Git Bash launcher: execs the payload's prime-agent.exe. NO daemon
   # socket pin — this product's Windows daemon endpoint is the fixed named
-  # pipe (pa-daemon platform/paths), which is rust-only by construction:
+  # pipe (radiata-daemon platform/paths), which is rust-only by construction:
   # the TypeScript product never shipped a Windows build, so the unix
   # cohabitation pin (a rust-only socket path that never collides with a
   # TS daemon) has no TS daemon to avoid here.
@@ -2857,7 +2857,7 @@ if [ -f "$(dirname "$0")/../share/.prime-agent-npm-bridge/legacy-daemon-socket" 
   export PRIME_AGENT_DAEMON_SOCKET="${PRIME_AGENT_DAEMON_SOCKET:-${TMPDIR:-${TMP:-${TEMP:-/tmp}}}/prime-agent-$(id -u)/daemon.sock}"
 else
   if [ -z "${PRIME_AGENT_DAEMON_SOCKET:-}" ]; then
-    # Same rule as pa-daemon socket_dir(): non-Linux sun_path caps a unix
+    # Same rule as radiata-daemon socket_dir(): non-Linux sun_path caps a unix
     # socket at 103 bytes, so a too-deep TMPDIR pins /tmp/prime-agent-rust-<uid>.
     PRIME_AGENT_DAEMON_SOCKET="${TMPDIR:-/tmp}/prime-agent-rust-$(id -u)/daemon.sock"
     if [ "$(printf '%s' "$PRIME_AGENT_DAEMON_SOCKET" | wc -c)" -gt 103 ] && [ "$(uname -s)" != "Linux" ]; then

@@ -103,7 +103,7 @@ class EnumerationTestCase(unittest.TestCase):
         self.assertLess(max(loads), max(crc32_loads))
 
     def test_crate_selection_covers_exactly_that_crates_units(self):
-        crate = sorted(p for p in self.packages if p != "pa-agent")[0]
+        crate = sorted(p for p in self.packages if p != "radiata-agent")[0]
         selection = SHARD.selected_units(self.units, [crate])
         self.assertTrue(selection, "the crate selection is never empty")
         self.assertTrue(all(u["package"] == crate for u in selection))
@@ -124,7 +124,7 @@ class AuditTestCase(unittest.TestCase):
         counts = {}
         for unit in cls.units:
             counts[unit["package"]] = counts.get(unit["package"], 0) + 1
-        cls.crate = max((p for p in counts if p != "pa-agent"),
+        cls.crate = max((p for p in counts if p != "radiata-agent"),
                         key=lambda p: counts[p])
         cls.selection = [u["id"] for u in cls.units
                           if u["package"] == cls.crate]
@@ -223,12 +223,12 @@ class SelectionReportingTestCase(unittest.TestCase):
         env["GITHUB_OUTPUT"] = str(output)
         result = subprocess.run(
             [sys.executable, str(SCRIPTS_DIR / "ci_test_shard.py"),
-             "--shard", "3", "--total", str(TOTAL), "--crates", "pa-daemon",
+             "--shard", "3", "--total", str(TOTAL), "--crates", "radiata-daemon",
              "--print-selection"],
             capture_output=True, text=True, env=env, cwd=REPO, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("SELECTED=", result.stdout)
-        self.assertIn("crate selection: pa-daemon", result.stdout)
+        self.assertIn("crate selection: radiata-daemon", result.stdout)
         count = int(next(line for line in result.stdout.splitlines()
                          if line.startswith("SELECTED=")).split("=")[1])
         self.assertGreater(count, 0)
@@ -237,28 +237,28 @@ class SelectionReportingTestCase(unittest.TestCase):
     def test_an_empty_selection_reports_zero_and_skips_nothing(self):
         """A crate whose units all land on OTHER shards leaves a leg with
         nothing to run: the bins build reads units=0 and skips. The shard
-        that owns no pa-ai unit depends on the measured timing map, so find
+        that owns no radiata-ai unit depends on the measured timing map, so find
         it from the script's own selection instead of hardcoding one."""
         empty_shard = None
         for shard in range(1, TOTAL + 1):
             probe = subprocess.run(
                 [sys.executable, str(SCRIPTS_DIR / "ci_test_shard.py"),
                  "--shard", str(shard), "--total", str(TOTAL),
-                 "--crates", "pa-ai", "--print-selection"],
+                 "--crates", "radiata-ai", "--print-selection"],
                 capture_output=True, text=True, cwd=REPO, check=False)
             self.assertEqual(probe.returncode, 0, probe.stderr)
             if "SELECTED=0" in probe.stdout:
                 empty_shard = shard
                 break
         self.assertIsNotNone(
-            empty_shard, "no shard owns zero pa-ai units; the map regressed")
+            empty_shard, "no shard owns zero radiata-ai units; the map regressed")
         env = dict(os.environ)
         output = Path(tempfile.mkdtemp()) / "github-output"
         env["GITHUB_OUTPUT"] = str(output)
         result = subprocess.run(
             [sys.executable, str(SCRIPTS_DIR / "ci_test_shard.py"),
              "--shard", str(empty_shard), "--total", str(TOTAL),
-             "--crates", "pa-ai", "--print-selection"],
+             "--crates", "radiata-ai", "--print-selection"],
             capture_output=True, text=True, env=env, cwd=REPO, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("units=0", output.read_text())
