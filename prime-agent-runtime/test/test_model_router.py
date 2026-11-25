@@ -119,6 +119,43 @@ class ParseQuotaTest(unittest.TestCase):
         self.assertAlmostEqual(pool_pressure(snapshot, "antigravity-gemini"), 4.0)
         self.assertAlmostEqual(pool_pressure(snapshot, "antigravity-claude-gpt"), 91.0)
 
+    def test_real_codexbar_nested_extra_windows_split_gemini(self) -> None:
+        # codexbar usage --json-only nests extra windows under usage, each with a title
+        # and a nested window. The unlabeled primary is the Claude/GPT quota.
+        payload = [
+            {
+                "provider": "antigravity",
+                "source": "cli",
+                "usage": {
+                    "primary": {"usedPercent": 100, "windowMinutes": 300, "resetsAt": RESET_SOON},
+                    "secondary": None,
+                    "extraRateWindows": [
+                        {
+                            "id": "gemini-5h",
+                            "title": "Gemini 5-hour",
+                            "window": {"usedPercent": 12.5, "windowMinutes": 300, "resetsAt": RESET_SOON},
+                        },
+                        {
+                            "id": "gemini-weekly",
+                            "title": "Gemini weekly",
+                            "window": {"usedPercent": 31, "windowMinutes": 10080, "resetsAt": RESET_WEEK},
+                        },
+                    ],
+                },
+                "error": None,
+            }
+        ]
+        snapshot = parse_quota_snapshot(payload, now=NOW)
+        gemini = snapshot.pools["antigravity-gemini"]
+        labels = {window.label: window for window in gemini.windows}
+        self.assertEqual(set(labels), {"Gemini 5-hour", "Gemini weekly"})
+        self.assertAlmostEqual(labels["Gemini 5-hour"].used_percent, 12.5)
+        self.assertEqual(labels["Gemini 5-hour"].window_minutes, 300)
+        self.assertGreater(labels["Gemini 5-hour"].resets_at or 0, NOW)
+        self.assertAlmostEqual(pool_pressure(snapshot, "antigravity-gemini"), 31.0)
+        # The full unlabeled window does not mark Gemini exhausted.
+        self.assertAlmostEqual(pool_pressure(snapshot, "antigravity-claude-gpt"), 100.0)
+
     def test_garbage_is_an_empty_snapshot(self) -> None:
         snapshot = parse_quota_snapshot("not json", now=NOW)
         self.assertEqual(snapshot.pools, {})
@@ -332,6 +369,182 @@ class RouteDecisionTest(unittest.TestCase):
 RATE_WAIT = model_router.RATE_LIMIT_COOLDOWN_SECONDS
 
 
+class PinnedTierAndQuotaAwareTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.available = _providers("claude", "codex", "antigravity", "cursor")
+
+    def _snapshot(self, pools: dict[str, float]) -> QuotaSnapshot:
+        return RouteDecisionTest._snapshot(self, pools)  # type: ignore[arg-type]
+
+    def test_exhausted_frontier_pin_keeps_its_tier_on_balanced_work(self) -> None:
+        snapshot = self._snapshot({"codex": 99, "claude": 10, "antigravity-gemini": 10, "cursor": 5})
+        admission = route_model(
+            prompt="Add the parser.",
+            state_id="implement",
+            pinned_model="openai-codex/gpt-5.5",
+            snapshot=snapshot,
+            available=self.available,
+            now=NOW,
+        )
+        self.assertTrue(admission.rerouted)
+        self.assertEqual(admission.tier, "frontier")
+        self.assertEqual(admission.model, "antigravity/gemini-4-neon")
+        self.assertEqual(admission.thinking, "xhigh")
+
+        healthy = self._snapshot({"codex": 10, "claude": 10, "antigravity-gemini": 10, "cursor": 5})
+        after_failure = route_model(
+            prompt="Add the parser.",
+            state_id="implement",
+            pinned_model="openai-codex/gpt-5.5",
+            snapshot=healthy,
+            available=self.available,
+            exclude_models=("openai-codex/gpt-5.5",),
+            now=NOW,
+        )
+        self.assertEqual(after_failure.tier, "frontier")
+        self.assertNotEqual(after_failure.model, "cursor/composer-2.5")
+        self.assertEqual(after_failure.model, "openai-codex/gpt-6.1-sol")
+
+    def test_soft_steering_may_still_move_a_pin_to_a_cheaper_tier(self) -> None:
+        decision = route_model(
+            prompt="Add the parser.",
+            state_id="implement",
+            pinned_model="openai-codex/gpt-5.5",
+            snapshot=self._snapshot({"codex": 93, "claude": 10, "antigravity-gemini": 10, "cursor": 5}),
+            available=self.available,
+            now=NOW,
+        )
+        self.assertTrue(decision.rerouted)
+        self.assertEqual(decision.tier, "balanced")
+
+    def test_quota_aware_prefers_headroom_before_cost(self) -> None:
+        snapshot = self._snapshot(
+            {"codex": 60, "claude": 5, "antigravity-gemini": 70, "antigravity-claude-gpt": 70, "cursor": 80}
+        )
+        decision = route_model(
+            prompt="Add the parser.",
+            state_id="implement",
+            snapshot=snapshot,
+            available=self.available,
+            now=NOW,
+            routing_profile=model_router.RoutingProfile(provider_priority="quota_aware"),
+        )
+        self.assertEqual(decision.model, "anthropic/claude-sonnet-5-5")
+        cheapest = route_model(
+            prompt="Add the parser.",
+            state_id="implement",
+            snapshot=snapshot,
+            available=self.available,
+            now=NOW,
+            routing_profile=model_router.RoutingProfile(provider_priority="favor_cost"),
+        )
+        self.assertEqual(cheapest.model, "cursor/composer-2.5")
+
+
+class ProviderHealthTest(unittest.TestCase):
+    def test_relative_reset_durations(self) -> None:
+        cases = {
+            "Resets in 4h52m9s.": 4 * 3600 + 52 * 60 + 9,
+            "Resets in 59m9s.": 59 * 60 + 9,
+            "quota reached; resets in 45m": 45 * 60,
+            "Resets in 0h59m9s": 59 * 60 + 9,
+            "Your limit resets in 4 days, 9 hours.": 4 * 86400 + 9 * 3600,
+            "resets in 4d 9h": 4 * 86400 + 9 * 3600,
+            "Rate limit reached. Please try again in 20s.": 20,
+            "Resets in 4h.": 4 * 3600,
+        }
+        for text, seconds in cases.items():
+            self.assertEqual(model_router._relative_reset(text, NOW), NOW + seconds, text)
+        for text in ("You've hit your limit · resets 2am", "resets Nov 25 at 10:59 PM", "quota exceeded"):
+            self.assertIsNone(model_router._relative_reset(text, NOW), text)
+
+    def test_error_reset_wins_over_a_far_weekly_window(self) -> None:
+        # Gemini's weekly window resets in days but is only half used; the error
+        # names the real reset, so the circuit must not stay open for days.
+        snapshot = parse_quota_snapshot(
+            [
+                {
+                    "provider": "antigravity",
+                    "extraRateWindows": [
+                        {"label": "Gemini 5-hour", "usedPercent": 100, "resetsAt": RESET_SOON},
+                        {"label": "Gemini weekly", "usedPercent": 99.5, "resetsAt": RESET_WEEK},
+                    ],
+                }
+            ],
+            now=NOW,
+        )
+        with TemporaryDirectory() as tmp:
+            router = ModelRouter(home=Path(tmp))
+            router.record_model_failure(
+                "antigravity/gemini-4-neon",
+                "Individual quota reached. Resets in 59m9s.",
+                snapshot=snapshot,
+                now=NOW,
+            )
+            self.assertEqual(router.health["antigravity-gemini"].open_until, NOW + 59 * 60 + 9)
+
+    def test_snapshot_reset_comes_only_from_an_exhausted_window(self) -> None:
+        snapshot = parse_quota_snapshot(
+            [
+                {
+                    "provider": "antigravity",
+                    "extraRateWindows": [
+                        {"label": "Gemini 5-hour", "usedPercent": 100, "resetsAt": RESET_SOON},
+                        {"label": "Gemini weekly", "usedPercent": 52, "resetsAt": RESET_WEEK},
+                    ],
+                }
+            ],
+            now=NOW,
+        )
+        soon = model_router._parse_time(RESET_SOON)
+        with TemporaryDirectory() as tmp:
+            router = ModelRouter(home=Path(tmp))
+            router.record_model_failure("antigravity/gemini-4-neon", "quota exceeded", snapshot=snapshot, now=NOW)
+            self.assertEqual(router.health["antigravity-gemini"].open_until, soon)
+
+            calm = parse_quota_snapshot(
+                [{"provider": "antigravity", "extraRateWindows": [{"label": "Gemini weekly", "usedPercent": 52, "resetsAt": RESET_WEEK}]}],
+                now=NOW,
+            )
+            router.record_model_failure("antigravity/gemini-4-neon", "quota exceeded", snapshot=calm, now=NOW)
+            self.assertEqual(
+                router.health["antigravity-gemini"].open_until, NOW + model_router.QUOTA_COOLDOWN_SECONDS
+            )
+
+    def test_two_routers_keep_each_others_pools_on_disk(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            factory_side = ModelRouter(home=home)
+            captain_side = ModelRouter(home=home)
+            # Both loaded an empty file; each writes a different pool afterwards.
+            factory_side.record_failure("claude", "quota exceeded", now=NOW, reset_at=NOW + 3600)
+            captain_side.record_failure("codex", "429 rate limit reached", now=NOW)
+            factory_side.record_success("cursor", 250, now=NOW)
+            stored = json.loads((home / "router-health.json").read_text(encoding="utf-8"))
+            self.assertEqual(set(stored["pools"]), {"claude", "codex", "cursor"})
+            self.assertEqual(stored["pools"]["claude"]["open_until"], NOW + 3600)
+            self.assertEqual(stored["pools"]["codex"]["last_kind"], "rate_limit")
+            self.assertTrue((home / "router-health.lock").exists())
+            self.assertEqual(list(home.glob("*.tmp")), [])
+
+    def test_note_provider_success_decays_the_failure_score(self) -> None:
+        with TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"PA_ROUTER_HOME": tmp, "PA_MODEL_ROUTER": "auto"}, clear=False):
+                reset_router()
+                self.addCleanup(reset_router)
+                model_router.get_router().record_failure("codex", "quota exceeded", now=NOW)
+                model_router.note_provider_success("openai-codex/gpt-5.5", 1200, now=NOW + 5)
+                model_router.note_provider_success("pi/test-model", 50, now=NOW + 5)
+                row = model_router.get_router().health["codex"]
+                self.assertAlmostEqual(row.failure_ewma, 0.8)
+                self.assertAlmostEqual(row.latency_ewma_ms, 1200.0)
+                self.assertNotIn("pi", model_router.get_router().health)
+            with patch.dict(os.environ, {"PA_ROUTER_HOME": tmp, "PA_MODEL_ROUTER": "0"}, clear=False):
+                reset_router()
+                model_router.note_provider_success("openai-codex/gpt-5.5", 1200, now=NOW + 6)
+                self.assertEqual(model_router.get_router().health["codex"].samples, 2)
+
+
 class QuotaCacheTest(unittest.TestCase):
     def setUp(self) -> None:
         reset_router()
@@ -513,6 +726,8 @@ class RouterFactoryTest(_ExecutorTestCase):
         self.assertEqual(status["state"], "done", status.get("pause_reason") or status.get("last_error"))
         models = [call["kwargs"].get("model") for call in self.host.spawn_calls("design")]
         self.assertEqual(models, ["antigravity/claude-opus-5-5", "antigravity/gemini-4-neon"])
+        # State pin stays intact across instance-scoped provider reroutes (I1).
+        self.assertEqual(self.executor._runs[started["run_id"]].states["design"].model, "antigravity/claude-opus-5-5")
         rerouted = [event for event in status["events"] if event["kind"] == "model_rerouted"]
         self.assertEqual(len(rerouted), 1)
         self.assertIn("antigravity/claude-opus-5-5", rerouted[0]["detail"])
@@ -609,13 +824,17 @@ class RouterFactoryTest(_ExecutorTestCase):
         (Path(inst.session_dir) / "session.jsonl").write_text(
             json.dumps(
                 {
-                    "type": "custom",
+                    "type": "custom_message",
                     "customType": "provider_retry_outcome",
-                    "data": {
-                        "message": (
-                            "Recovered after 8 retries: ⚠ Individual quota reached. "
+                    "content": "Retried 8 times without recovery",
+                    "display": True,
+                    "details": {
+                        "success": False,
+                        "attempts": 8,
+                        "finalError": (
+                            "⚠ Individual quota reached. "
                             "Please upgrade your subscription to increase your limits. Resets in 4h."
-                        )
+                        ),
                     },
                 }
             )
@@ -959,13 +1178,39 @@ class RampRouterV2Tests(unittest.TestCase):
             session_jsonl.write_text('{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"ok"}]}}\n', encoding="utf-8")
             offset = session_jsonl.stat().st_size
             self.assertIsNone(ns["captain_session_quota_error"](str(session_jsonl), offset))
+            # A recovered retry episode (details.success == True) must NOT trigger a quota failure.
             with session_jsonl.open("a", encoding="utf-8") as fh:
                 fh.write(
                     json.dumps(
                         {
-                            "type": "custom",
+                            "type": "custom_message",
                             "customType": "provider_retry_outcome",
-                            "data": {"message": "Recovered after 3 retries: You've hit your limit"},
+                            "content": "Recovered after 3 retries: You've hit your limit",
+                            "display": True,
+                            "details": {
+                                "success": True,
+                                "attempts": 3,
+                                "finalError": "You've hit your limit",
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+            self.assertIsNone(ns["captain_session_quota_error"](str(session_jsonl), offset))
+            # An unrecovered retry episode (details.success == False) DOES trigger detection.
+            with session_jsonl.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    json.dumps(
+                        {
+                            "type": "custom_message",
+                            "customType": "provider_retry_outcome",
+                            "content": "Failed after 3 retries",
+                            "display": True,
+                            "details": {
+                                "success": False,
+                                "attempts": 3,
+                                "finalError": "You've hit your limit",
+                            },
                         }
                     )
                     + "\n"
@@ -973,6 +1218,17 @@ class RampRouterV2Tests(unittest.TestCase):
             found = ns["captain_session_quota_error"](str(session_jsonl), offset)
             self.assertIsNotNone(found)
             self.assertIn("hit your limit", found)
+            # Short normal coding answers mentioning 429 / rate limits must not match CLI banners.
+            self.assertFalse(
+                ns["captain_is_cli_banner_error"](
+                    "Added a 429 Too Many Requests response when a client exceeds the usage limit (api/limits.py)."
+                )
+            )
+            self.assertFalse(
+                ns["captain_is_cli_banner_error"](
+                    "Implemented rate limit reached handling in retry.rs"
+                )
+            )
 
 
 if __name__ == "__main__":

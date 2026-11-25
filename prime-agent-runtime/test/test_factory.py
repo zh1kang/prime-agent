@@ -15446,6 +15446,18 @@ class ProviderErrorDetectionTest(unittest.TestCase):
         )
         self.assertGreater(len(prose), 500)
         self.assertIsNone(_detect_provider_auth_or_quota_error(prose, None))
+        self.assertIsNone(
+            _detect_provider_auth_or_quota_error(
+                "Added a 429 Too Many Requests response when a client exceeds the usage limit (api/limits.py).",
+                None,
+            )
+        )
+        self.assertIsNone(
+            _detect_provider_auth_or_quota_error(
+                "Implemented rate limit reached handling in retry.rs",
+                None,
+            )
+        )
         self.assertIsNone(_detect_provider_auth_or_quota_error("All tests pass.", None))
         self.assertIsNone(_detect_provider_auth_or_quota_error(None, "child worker unreachable"))
 

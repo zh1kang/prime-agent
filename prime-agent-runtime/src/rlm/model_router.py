@@ -9,13 +9,16 @@ factory and Captain can actually launch.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,6 +44,7 @@ AUTH_COOLDOWN_SECONDS = 30 * 60.0
 
 CACHE_NAME = "router-quota-cache.json"
 HEALTH_NAME = "router-health.json"
+HEALTH_LOCK_NAME = "router-health.lock"
 PROFILE_NAME = "router-profile.json"
 
 PROVIDER_PRIORITIES: tuple[str, ...] = (
@@ -504,7 +508,8 @@ def _read_json(path: Path) -> Any:
 
 def _atomic_write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
+    # A per-writer temporary name keeps concurrent writers from replacing a half-written file.
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     temporary.write_text(text, encoding="utf-8")
     os.replace(temporary, path)
 
@@ -551,6 +556,12 @@ def _used_percent(value: Any) -> float | None:
 def _window_from(label: str, value: Any) -> QuotaWindow | None:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return QuotaWindow(label=label or "limit", used_percent=max(0.0, min(100.0, float(value))))
+    if isinstance(value, dict) and isinstance(value.get("window"), dict):
+        # codexbar's extraRateWindows item: {"id", "title", "window": {usedPercent, ...}}.
+        if not label:
+            named = value.get("label") or value.get("title") or value.get("name") or value.get("id")
+            label = named.strip() if isinstance(named, str) else ""
+        value = value["window"]
     used = _used_percent(value)
     if used is None or not isinstance(value, dict):
         return None
@@ -562,7 +573,7 @@ def _window_from(label: str, value: Any) -> QuotaWindow | None:
     else:
         description = " ".join(description.split())
     display = label
-    named = value.get("label") or value.get("name") or value.get("id")
+    named = value.get("label") or value.get("title") or value.get("name") or value.get("id")
     if isinstance(named, str) and named.strip() and not label:
         display = named.strip()
     return QuotaWindow(
@@ -626,7 +637,7 @@ def _iter_extra(extra: Any) -> list[tuple[str, Any]]:
         rows: list[tuple[str, Any]] = []
         for item in extra:
             if isinstance(item, dict):
-                label = item.get("label") or item.get("name") or item.get("id") or ""
+                label = item.get("label") or item.get("title") or item.get("name") or item.get("id") or ""
                 rows.append((str(label), item))
         return rows
     if isinstance(extra, dict):
@@ -634,7 +645,7 @@ def _iter_extra(extra: Any) -> list[tuple[str, Any]]:
         for key, value in extra.items():
             label = str(key)
             if isinstance(value, dict):
-                nested = value.get("label") or value.get("name")
+                nested = value.get("label") or value.get("title") or value.get("name")
                 if isinstance(nested, str) and nested.strip():
                     label = nested
             rows.append((label, value))
@@ -659,7 +670,9 @@ def _provider_error_text(value: Any) -> str | None:
 def parse_quota_snapshot(payload: str | Any, *, now: float | None = None) -> QuotaSnapshot:
     """Parse ``codexbar usage --json-only`` into independent quota pools.
 
-    Antigravity's ``extraRateWindows`` split Gemini from Claude/GPT. Claude
+    Antigravity's ``extraRateWindows`` split Gemini from Claude/GPT. codexbar
+    nests them at ``usage.extraRateWindows`` as ``{title, window: {...}}``;
+    the older top-level ``extraRateWindows`` shape is also read. Claude
     keeps Session and Weekly, Codex keeps Weekly, and Cursor keeps Total,
     Cursor, and Third Party. A null window is skipped. Unknown providers are
     ignored. Malformed JSON yields an empty snapshot with ``error`` set.
@@ -698,7 +711,9 @@ def parse_quota_snapshot(payload: str | Any, *, now: float | None = None) -> Quo
         error = _provider_error_text(entry.get("error"))
         specific: list[tuple[str, QuotaWindow]] = []
         shared: list[QuotaWindow] = []
-        for label, value in _iter_extra(entry.get("extraRateWindows", entry.get("extra_rate_windows"))):
+        extras = _iter_extra(entry.get("extraRateWindows", entry.get("extra_rate_windows")))
+        extras += _iter_extra(usage.get("extraRateWindows", usage.get("extra_rate_windows")))
+        for label, value in extras:
             window = _window_from(label, value)
             if window is None:
                 continue
@@ -913,20 +928,40 @@ def _format_eta(resets_at: float | None, now: float) -> str:
     return f"resets in {minutes}m"
 
 
+_RESET_ANCHOR_RE = re.compile(r"reset|try again", re.IGNORECASE)
+_DURATION_TOKEN_RE = re.compile(
+    r"(\d+(?:\.\d+)?)\s*(days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)(?![a-z])",
+    re.IGNORECASE,
+)
+_DURATION_GAP_RE = re.compile(r"[\s,]*(?:and\s+)?", re.IGNORECASE)
+_DURATION_SECONDS = {"d": 86400, "h": 3600, "m": 60, "s": 1}
+# How far past "resets"/"try again" the first duration may start ("resets in about 45m").
+_RESET_LOOKAHEAD = 24
+
+
 def _relative_reset(detail: str, now: float) -> float | None:
-    if "reset" not in detail.lower():
-        return None
-    match = re.search(
-        r"(\d+)\s*h(?:ours?)?(?:\s*(\d+)\s*m(?:in(?:utes?)?)?)?(?:\s*(\d+)\s*s(?:ec(?:onds?)?)?)?",
-        detail,
-        re.IGNORECASE,
-    )
-    if match is None:
-        return None
-    hours = int(match.group(1))
-    minutes = int(match.group(2) or 0)
-    seconds = int(match.group(3) or 0)
-    return now + hours * 3600 + minutes * 60 + seconds
+    """``now`` plus a duration such as ``4h52m9s``, ``59m9s``, ``45m``, or
+    ``4 days, 9 hours`` that follows "reset" or "try again".
+
+    A clock time ("resets 2am") or a date is not a duration and gives None.
+    """
+
+    for anchor in _RESET_ANCHOR_RE.finditer(detail):
+        window = detail[anchor.end() : anchor.end() + _RESET_LOOKAHEAD]
+        first = _DURATION_TOKEN_RE.search(window)
+        if first is None:
+            continue
+        position = anchor.end() + first.start()
+        total = 0.0
+        while True:
+            token = _DURATION_TOKEN_RE.match(detail, position)
+            if token is None:
+                break
+            total += float(token.group(1)) * _DURATION_SECONDS[token.group(2)[0].lower()]
+            position = _DURATION_GAP_RE.match(detail, token.end()).end()
+        if total > 0:
+            return now + total
+    return None
 
 
 PROVIDER_ERROR_MARKERS: tuple[str, ...] = (
@@ -963,6 +998,107 @@ def is_provider_error_text(text: str | None) -> bool:
     if any(marker in lowered for marker in PROVIDER_ERROR_MARKERS):
         return True
     return _HTTP_429_RE.search(text) is not None
+
+
+# Narrow subset of unmistakable provider CLI auth/quota banners that a CLI
+# subprocess may print as plain stdout with exit code 0 / status "done".
+# Generic engineering phrases ("429", "too many requests", "usage limit",
+# "rate limit reached", "quota exceeded") are intentionally excluded so short
+# coding answers that discuss rate limiting never false-positive.
+CLI_BANNER_ERROR_MARKERS: tuple[str, ...] = (
+    "invalid api key",
+    "fix external api key",
+    "authentication_error",
+    "no api key found",
+    "not logged in",
+    "please run /login",
+    "individual quota reached",
+    "exceeded your current quota",
+    "please upgrade your subscription",
+    "you've hit your limit",
+    "you have hit your limit",
+    "out of extra usage",
+    "credit balance is too low",
+    "rate_limit_error",
+    "overloaded_error",
+)
+
+
+def is_cli_banner_error_text(text: str | None) -> bool:
+    """True only when ``text`` matches an unmistakable provider auth/quota banner."""
+
+    if not isinstance(text, str) or not text.strip():
+        return False
+    lowered = text.lower()
+    return any(marker in lowered for marker in CLI_BANNER_ERROR_MARKERS)
+
+
+_SESSION_ERROR_DETAIL_CAP = 220
+
+
+def _cap_error_detail(text: str, cap: int = _SESSION_ERROR_DETAIL_CAP) -> str:
+    detail = " ".join(text.split())
+    if len(detail) > cap:
+        detail = detail[: cap - 1].rstrip() + "…"
+    return detail
+
+
+def scan_session_jsonl_quota_error(
+    path: Path | str | None,
+    offset: int = 0,
+    *,
+    tail_bytes: int = 32_768,
+    tail_lines: int = 40,
+) -> str | None:
+    """Scan newly written tail rows of a session JSONL for a provider quota/auth error.
+
+    Matches the durable row shapes emitted by ``pa-daemon``:
+    - ``type == "custom_message"`` with ``customType == "provider_retry_outcome"`` and
+      ``details.success is False`` (never matches recovered episodes).
+    - ``type == "message"`` with a provider-error ``message.errorMessage``.
+    """
+
+    if not path:
+        return None
+    file_path = Path(path)
+    try:
+        size = file_path.stat().st_size
+    except OSError:
+        return None
+    start_offset = max(0, int(offset or 0))
+    if size <= start_offset:
+        return None
+    seek_pos = max(start_offset, size - tail_bytes)
+    try:
+        with file_path.open("rb") as fh:
+            fh.seek(seek_pos)
+            chunk = fh.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    lines = [line for line in chunk.splitlines() if line.strip()][-tail_lines:]
+    for raw in reversed(lines):
+        try:
+            row = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        if row.get("type") == "custom_message" and row.get("customType") == "provider_retry_outcome":
+            details = row.get("details")
+            if not isinstance(details, dict) or details.get("success") is not False:
+                continue
+            final_err = details.get("finalError")
+            msg = final_err if isinstance(final_err, str) and final_err.strip() else row.get("content")
+            if isinstance(msg, str) and is_provider_error_text(msg):
+                return _cap_error_detail(msg)
+        if row.get("type") == "message":
+            msg = row.get("message")
+            if not isinstance(msg, dict):
+                continue
+            err_msg = msg.get("errorMessage")
+            if isinstance(err_msg, str) and is_provider_error_text(err_msg):
+                return _cap_error_detail(err_msg)
+    return None
 
 
 def failure_kind(detail: str) -> str:
@@ -1019,12 +1155,31 @@ def anthropic_api_configured() -> bool:
     opt_in = (_env_flag("PA_ANTHROPIC_USE_API_KEY") or "").lower()
     if opt_in in {"1", "true"} and _real_anthropic_key(os.environ.get("ANTHROPIC_API_KEY")):
         return True
-    auth = _read_json(_agent_dir() / "auth.json")
+    agent_dir = _agent_dir()
+    auth = _read_json(agent_dir / "auth.json")
     if isinstance(auth, dict):
         cred = auth.get("anthropic")
         if isinstance(cred, dict) and cred.get("type") == "api_key" and _real_anthropic_key(cred.get("key")):
             return True
+    models_doc = _read_json(agent_dir / "models.json")
+    if isinstance(models_doc, dict):
+        providers = models_doc.get("providers")
+        if isinstance(providers, dict):
+            cfg = providers.get("anthropic")
+            if isinstance(cfg, dict) and (
+                cfg.get("headers")
+                or cfg.get("authHeader") is not None
+                or _real_anthropic_key(cfg.get("apiKey"))
+            ):
+                return True
     return False
+
+
+def anthropic_uses_claude_cli() -> bool:
+    """Mirror ``ModelRegistry::anthropic_uses_claude_cli``: ``anthropic/*`` routes through
+    the ``claude`` CLI whenever it is installed and no explicit Messages API override is set."""
+
+    return claude_cli_available() and not anthropic_api_configured()
 
 
 def antigravity_available() -> bool:
@@ -1098,6 +1253,13 @@ def available_providers() -> set[str]:
     return found
 
 
+def _catalog_tier(model: str) -> str | None:
+    """The highest tier ``model`` serves in the catalog, or None for an unlisted model."""
+
+    tiers = [row.tier for row in CATALOG if row.model == model]
+    return max(tiers, key=TIER_RANK.__getitem__) if tiers else None
+
+
 def _pin_pressure_ok(snapshot: QuotaSnapshot, pool: str, tier: str) -> bool:
     return pool_pressure(snapshot, pool) < _threshold(tier)
 
@@ -1163,7 +1325,10 @@ def route_model(
     An explicit pin is kept when its pool is under the threshold for this
     task's tier and its circuit is closed. Soft threshold (90%) applies to
     fast and balanced work; hard threshold (98%) applies to strong and
-    frontier work, including a pinned frontier model. When Ramp-style
+    frontier work, including a pinned frontier model. A pin that must leave
+    (excluded after a failure, hard-exhausted, circuit-open, or not installed)
+    or that is retried keeps at least its catalog tier; only soft steering
+    below the hard line may move it to a cheaper tier. When Ramp-style
     Switchyard is enabled on an unpinned spawn (or after a pin's pool is
     exhausted), tasks route cleanly between ``efficient_model`` and
     ``capable_model``. A closed set of eligible pools returns ``exhausted``
@@ -1201,15 +1366,14 @@ def route_model(
     task_tier = classify_task(
         prompt=prompt, state_id=state_id, role=role, specialist=specialist, attempt=1
     ).tier
-    if (
-        pin
-        and attempt <= 1
-        and pin not in excluded
-        and pin_provider in providers
-        and not _health_open(scores, pin_pool, moment)
-        and not (pin_pool.startswith("cursor") and _health_open(scores, "cursor-total", moment))
-        and _pin_pressure_ok(quota, pin_pool, task_tier)
-    ):
+    pin_hard_blocked = bool(pin) and (
+        pin in excluded
+        or pin_provider not in providers
+        or _health_open(scores, pin_pool, moment)
+        or (pin_pool.startswith("cursor") and _health_open(scores, "cursor-total", moment))
+        or pool_pressure(quota, pin_pool) >= HARD_THRESHOLD
+    )
+    if pin and attempt <= 1 and not pin_hard_blocked and _pin_pressure_ok(quota, pin_pool, task_tier):
         return RouteDecision(
             model=pin,
             thinking=pinned_thinking or "",
@@ -1217,6 +1381,19 @@ def route_model(
             tier=task_tier,
             rerouted=False,
             fallbacks_tried=(),
+        )
+
+    # A pin that leaves for a hard reason (failure, exhausted or open pool, missing
+    # provider) or on a retry keeps at least its own tier. Only soft steering (the
+    # pin's pool between the soft and hard lines) may move work to a cheaper tier.
+    soft_steer = bool(pin) and not pin_hard_blocked and not _pin_pressure_ok(quota, pin_pool, task_tier)
+    pin_tier = _catalog_tier(pin) if pin else None
+    if pin_tier is not None and not soft_steer and TIER_RANK[pin_tier] > TIER_RANK[profile.tier]:
+        profile = TaskProfile(
+            tier=pin_tier,
+            thinking=TIER_THINKING[pin_tier],
+            reasons=(*profile.reasons, f"kept pinned {pin} tier {pin_tier}"),
+            escalated_from=profile.escalated_from,
         )
 
     # Ramp Switchyard 2-tier fast path (when enabled and pair target is healthy).
@@ -1283,9 +1460,10 @@ def route_model(
                     return (row.cost, failure, latency, row.model)
                 if priority == "favor_cost":
                     return (same_pool, row.cost, failure, latency, row.model)
-                # quota_aware (default): preserve pin pool, favor low cost + healthy reliability,
-                # breaking ties by coarse 25% pressure bands to avoid thrashing healthy pools.
-                return (same_pool, row.cost, failure, latency, int(pressure // 25), row.model)
+                # quota_aware (default): preserve the pin pool, then prefer more headroom in
+                # coarse 25% pressure bands (so small differences do not thrash between
+                # healthy pools), then low cost and reliability.
+                return (same_pool, int(pressure // 25), row.cost, failure, latency, row.model)
 
             chosen = min(viable_rows, key=sort_key)
             chosen_tier = tier
@@ -1319,8 +1497,9 @@ def route_model(
         why = f"selected {chosen.model} for {chosen_tier} ({profile.reasons[-1]})"
     else:
         why = f"pinned {chosen.model} still the best healthy {chosen_tier}"
-    thinking = pinned_thinking or "" if chosen.model == pin and not rerouted else chosen.thinking
-    if chosen.model != pin:
+    if chosen.model == pin:
+        thinking = pinned_thinking or ""
+    else:
         thinking = chosen.thinking
     return RouteDecision(
         model=chosen.model,
@@ -1350,6 +1529,8 @@ def find_codexbar() -> Path | None:
 
 
 _MEMORY_QUOTA: dict[str, tuple[float, str]] = {}
+_MEMORY_QUOTA_ERRORS: dict[str, tuple[float, str]] = {}
+_QUOTA_ERROR_TTL_SECONDS = 30.0
 _BACKGROUND_REFRESH_GUARD_SECONDS = 30.0
 
 
@@ -1462,14 +1643,22 @@ def load_quota_snapshot(
         _spawn_background_quota_refresh(path, timeout)
         return QuotaSnapshot.empty(now=moment)
 
+    if runner is None:
+        failed = _MEMORY_QUOTA_ERRORS.get(key)
+        if failed is not None and moment - failed[0] <= _QUOTA_ERROR_TTL_SECONDS:
+            return QuotaSnapshot.empty(error=failed[1], now=moment)
+
     def remember(raw: str, fetched_at: float) -> None:
         _MEMORY_QUOTA[key] = (fetched_at, raw)
+        _MEMORY_QUOTA_ERRORS.pop(key, None)
         try:
             _atomic_write(path, json.dumps({"fetched_at": fetched_at, "raw": raw}))
         except OSError:
             return
 
     def fail(message: str) -> QuotaSnapshot:
+        if runner is None:
+            _MEMORY_QUOTA_ERRORS[key] = (moment, message)
         if disk_raw is not None and disk_at is not None:
             return from_raw(disk_raw, disk_at, stale=True, error=message)
         if cached is not None:
@@ -1514,7 +1703,13 @@ def _ewma(previous: float, sample: float, samples: int) -> float:
 
 
 class ModelRouter:
-    """Process-local health plus the pure routing functions."""
+    """Pool health shared through ``router-health.json`` plus the pure routing functions.
+
+    Each process keeps a copy of the file. A health update takes an exclusive
+    lock on ``router-health.lock``, re-reads the file, changes only its own
+    pool, and writes the file back, so concurrent factories and Captains never
+    drop each other's pools.
+    """
 
     def __init__(self, home: Path | None = None) -> None:
         self.home = home or harness_dir()
@@ -1563,6 +1758,32 @@ class ModelRouter:
             )
         self.health = loaded
 
+    @contextmanager
+    def _health_update(self) -> Any:
+        """Hold the cross-process health lock with ``self.health`` re-read from disk.
+
+        Health is advisory: when the lock cannot be taken, the update stays in
+        this process and ``save_health`` writes it without the merge.
+        """
+
+        lock_path = self.home / HEALTH_LOCK_NAME
+        handle = None
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            handle = lock_path.open("a+b")
+            fcntl.flock(handle, fcntl.LOCK_EX)
+        except OSError:
+            if handle is not None:
+                handle.close()
+            yield
+            return
+        with handle:
+            try:
+                self._load_health()
+                yield
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+
     def save_health(self) -> None:
         payload = {
             "pools": {
@@ -1589,15 +1810,16 @@ class ModelRouter:
 
     def record_success(self, pool: str, latency_ms: float, *, now: float | None = None) -> None:
         moment = time.time() if now is None else now
-        row = self.health.get(pool) or ProviderHealth(pool=pool)
-        row.samples += 1
-        row.latency_samples += 1
-        row.failure_ewma = _ewma(row.failure_ewma, 0.0, row.samples)
-        row.latency_ewma_ms = _ewma(row.latency_ewma_ms, max(0.0, latency_ms), row.latency_samples)
-        if row.open_until <= moment:
-            row.last_kind = None
-        self.health[pool] = row
-        self.save_health()
+        with self._health_update():
+            row = self.health.get(pool) or ProviderHealth(pool=pool)
+            row.samples += 1
+            row.latency_samples += 1
+            row.failure_ewma = _ewma(row.failure_ewma, 0.0, row.samples)
+            row.latency_ewma_ms = _ewma(row.latency_ewma_ms, max(0.0, latency_ms), row.latency_samples)
+            if row.open_until <= moment:
+                row.last_kind = None
+            self.health[pool] = row
+            self.save_health()
 
     def record_failure(
         self,
@@ -1610,11 +1832,6 @@ class ModelRouter:
     ) -> ProviderHealth:
         moment = time.time() if now is None else now
         failure = kind or failure_kind(detail)
-        row = self.health.get(pool) or ProviderHealth(pool=pool)
-        row.samples += 1
-        row.failure_ewma = _ewma(row.failure_ewma, 1.0, row.samples)
-        row.last_error = " ".join(detail.split())[:220]
-        row.last_kind = failure
         if failure == "auth":
             opens = moment + AUTH_COOLDOWN_SECONDS
         elif failure == "rate_limit":
@@ -1625,20 +1842,31 @@ class ModelRouter:
             opens = reset_at
         else:
             opens = moment + QUOTA_COOLDOWN_SECONDS
-        row.open_until = opens
-        self.health[pool] = row
-        self.save_health()
+        with self._health_update():
+            row = self.health.get(pool) or ProviderHealth(pool=pool)
+            row.samples += 1
+            row.failure_ewma = _ewma(row.failure_ewma, 1.0, row.samples)
+            row.last_error = " ".join(detail.split())[:220]
+            row.last_kind = failure
+            row.open_until = opens
+            self.health[pool] = row
+            self.save_health()
         return row
 
     def record_model_failure(self, model: str, detail: str, *, snapshot: QuotaSnapshot | None = None, now: float | None = None) -> None:
+        """Open ``model``'s pool until the reset the error names.
+
+        Without a reset in the error text, the pool stays closed until the
+        latest reset among its windows at or above HARD_THRESHOLD. A window
+        under that line did not cause the failure, so its reset (often a
+        weekly one, days away) is never used.
+        """
+
         moment = time.time() if now is None else now
         pool = pool_for_model(model)
         reset_at = _relative_reset(detail, moment)
-        if snapshot is not None:
-            row = snapshot.pools.get(pool)
-            window = row.binding_window() if row is not None else None
-            if window is not None and window.resets_at is not None:
-                reset_at = window.resets_at
+        if reset_at is None and snapshot is not None:
+            reset_at = _exhausted_reset(snapshot, pool, moment)
         self.record_failure(pool, detail, now=moment, reset_at=reset_at)
 
     def route(self, **kwargs: Any) -> RouteDecision:
@@ -1646,6 +1874,20 @@ class ModelRouter:
         kwargs.setdefault("snapshot", load_quota_snapshot())
         kwargs.setdefault("available", available_providers())
         return route_model(**kwargs)
+
+
+def _exhausted_reset(snapshot: QuotaSnapshot, pool: str, now: float) -> float | None:
+    """The latest future reset among ``pool``'s windows at or above HARD_THRESHOLD."""
+
+    pools = [pool, "cursor-total"] if pool in ("cursor", "cursor-third-party") else [pool]
+    resets = [
+        window.resets_at
+        for name in pools
+        if (row := snapshot.pools.get(name)) is not None
+        for window in row.windows
+        if window.used_percent >= HARD_THRESHOLD and window.resets_at is not None and window.resets_at > now
+    ]
+    return max(resets) if resets else None
 
 
 _ROUTER: ModelRouter | None = None
@@ -1667,13 +1909,23 @@ def reset_router() -> None:
     global _ROUTER
     _ROUTER = None
     _MEMORY_QUOTA.clear()
+    _MEMORY_QUOTA_ERRORS.clear()
 
 
 def note_provider_failure(model: str | None, detail: str, *, now: float | None = None) -> None:
     if not isinstance(model, str) or not model.strip():
         return
-    snapshot = load_quota_snapshot(now=now)
+    snapshot = load_quota_snapshot(now=now, allow_blocking=False)
     get_router().record_model_failure(model, detail, snapshot=snapshot, now=now)
+
+
+def note_provider_success(model: str | None, latency_ms: float | None, *, now: float | None = None) -> None:
+    """Record a clean turn on ``model``'s pool so its failure score decays."""
+
+    if router_disabled() or not is_recognized_model(model):
+        return
+    assert model is not None
+    get_router().record_success(pool_for_model(model.strip()), float(latency_ms or 0.0), now=now)
 
 
 def pool_is_hard_exhausted(
@@ -1699,7 +1951,7 @@ def pool_is_hard_exhausted(
         row = scores.get("cursor-total")
         reason = (row.last_error or row.last_kind or "cooldown") if row is not None else "cooldown"
         return f"cursor-total circuit is open ({reason})"
-    quota = snapshot if snapshot is not None else load_quota_snapshot(now=moment)
+    quota = snapshot if snapshot is not None else load_quota_snapshot(now=moment, allow_blocking=False)
     used = pool_pressure(quota, pool)
     if used >= HARD_THRESHOLD:
         hint = _reset_hint(quota, [pool], moment)
@@ -1716,6 +1968,7 @@ def admission_decision(
     attempt: int,
     pinned_model: str | None,
     pinned_thinking: str | None,
+    exclude_models: tuple[str, ...] = (),
 ) -> RouteDecision | None:
     """A route that should change the spawn, or None to leave the state alone.
 
@@ -1733,7 +1986,7 @@ def admission_decision(
     explicit = router_explicit()
     snapshot = load_quota_snapshot(allow_blocking=False)
     health = get_router().health
-    if not explicit and attempt <= 1:
+    if not explicit and attempt <= 1 and pinned_model not in exclude_models:
         if pool_is_hard_exhausted(pinned_model, snapshot=snapshot, health=health) is None:
             return None
     decision = route_model(
@@ -1747,6 +2000,7 @@ def admission_decision(
         snapshot=snapshot,
         health=health,
         available=available_providers(),
+        exclude_models=exclude_models,
         routing_profile=load_routing_profile(),
     )
     if decision.exhausted and not decision.model:
@@ -1770,7 +2024,7 @@ def fallback_after_failure(
 ) -> RouteDecision:
     """The next model after a provider auth or quota failure on ``model``."""
 
-    snapshot = load_quota_snapshot()
+    snapshot = load_quota_snapshot(allow_blocking=False)
     excluded = tuple(dict.fromkeys((*exclude_models, model)))
     return route_model(
         prompt=prompt,

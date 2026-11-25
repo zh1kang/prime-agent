@@ -390,3 +390,76 @@ async fn early_resume_clears_the_park_and_cancels_the_wake() {
         "the pending wake cancels on resume"
     );
 }
+
+/// A caller that moves a parked session to another model re-sends the work itself: the park
+/// ends with its wake cancelled and no resume marker queued. A switch to the parked model keeps
+/// the park.
+#[test]
+fn switching_to_another_model_ends_the_park_without_a_resume_marker() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let engine = park_engine(dir.path());
+    std::fs::write(
+        dir.path().join("agent").join("models.json"),
+        serde_json::json!({
+            "providers": {
+                "battery": {
+                    "api": "openai-completions",
+                    "baseUrl": "http://127.0.0.1:9",
+                    "apiKey": "sk-battery",
+                    "models": [
+                        { "id": "mock-1", "name": "Mock 1", "api": "openai-completions",
+                          "contextWindow": 128_000, "maxTokens": 4096 },
+                        { "id": "mock-2", "name": "Mock 2", "api": "openai-completions",
+                          "contextWindow": 128_000, "maxTokens": 4096 }
+                    ]
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let select = |model: &str| EngineModelSelection {
+        provider: Some("battery".to_string()),
+        model: Some(model.to_string()),
+        api_key: None,
+        thinking: None,
+    };
+    assert!(engine.switch_model(select("mock-1")));
+    let markers = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = std::sync::Arc::clone(&markers);
+    *engine.goal_admission_sink.lock().unwrap() = Some(std::sync::Arc::new(move |_| {
+        seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }));
+    let message = quota_failure_message(Some("rate_limit"), Some(3_600_000));
+    engine
+        .runtime
+        .block_on(engine.park_for_quota_reset(&message, "abort"))
+        .expect("the park fires");
+    let job_id = engine
+        .quota_park
+        .lock()
+        .expect("park state")
+        .clone()
+        .expect("parked")
+        .job_id
+        .expect("wake");
+
+    assert!(engine.switch_model(select("mock-1")));
+    assert!(engine.is_quota_parked(), "the same model keeps the park");
+
+    assert!(engine.switch_model(select("mock-2")));
+    assert!(!engine.is_quota_parked(), "another model ends the park");
+    let store = engine.config.cron_store.as_ref().expect("wiring").clone();
+    let job = store
+        .store
+        .list()
+        .into_iter()
+        .find(|job| job.id == job_id)
+        .expect("the wake job still exists");
+    assert_eq!(job.status, pa_core::cron::JobStatus::Cancelled);
+    assert_eq!(
+        markers.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no resume marker is queued"
+    );
+}

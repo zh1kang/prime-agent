@@ -52,7 +52,6 @@ import json
 import math
 import os
 import re
-import shutil
 import signal
 import time
 from dataclasses import dataclass, field
@@ -61,14 +60,17 @@ from typing import IO, Any, Callable
 from uuid import uuid4
 
 from .model_router import (
-    PROVIDER_ERROR_MARKERS,
     admission_decision,
+    anthropic_uses_claude_cli,
     fallback_after_failure,
+    is_cli_banner_error_text,
     is_provider_error_text,
     is_recognized_model,
     note_provider_failure,
+    note_provider_success,
     pool_is_hard_exhausted,
     router_disabled,
+    scan_session_jsonl_quota_error,
 )
 
 FAILURE_POLICIES: tuple[str, ...] = ("fail_fast", "continue", "escalate")
@@ -1287,75 +1289,6 @@ that attempt may write instead of a fenced ``factory-outputs`` block."""
 _FACTORY_OUTPUTS_BLOCK_RE = re.compile(r"```factory[-_]outputs[ \t]*\r?\n(.*?)```", re.DOTALL)
 
 
-def _claude_cli_available() -> bool:
-    """Mirror ``pa_ai::claude_cli::is_available``."""
-    explicit = os.environ.get("PA_CLAUDE_BIN")
-    if explicit is not None:
-        trimmed = explicit.strip()
-        if trimmed.lower() == "none" or trimmed == "0":
-            return False
-        if trimmed:
-            return True
-    if shutil.which("claude") is not None:
-        return True
-    home = os.environ.get("HOME")
-    if home:
-        for rel in (".local/bin/claude", ".claude/local/claude"):
-            candidate = Path(home) / rel
-            if candidate.is_file() and os.access(candidate, os.X_OK):
-                return True
-    return False
-
-
-def _is_real_anthropic_api_key(key: Any) -> bool:
-    return isinstance(key, str) and bool(key.strip()) and "sk-ant-oat" not in key
-
-
-def _anthropic_uses_claude_cli() -> bool:
-    """Mirror ``ModelRegistry::anthropic_uses_claude_cli``: ``anthropic/*``
-    routes through the ``claude`` CLI (no Python REPL) whenever ``claude`` is
-    installed and no explicit Anthropic API key override is configured."""
-    if not _claude_cli_available():
-        return False
-    opt_in = (os.environ.get("PA_ANTHROPIC_USE_API_KEY") or "").strip().lower()
-    if opt_in in ("1", "true") and _is_real_anthropic_api_key(os.environ.get("ANTHROPIC_API_KEY")):
-        return False
-    raw_dir = (
-        os.environ.get("PRIME_AGENT_CODING_AGENT_DIR")
-        or os.environ.get("PI_CODING_AGENT_DIR")
-        or str(Path.home() / ".prime" / "agent")
-    )
-    agent_dir = Path(raw_dir).expanduser()
-    try:
-        auth = json.loads((agent_dir / "auth.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        auth = None
-    if isinstance(auth, dict):
-        cred = auth.get("anthropic")
-        if (
-            isinstance(cred, dict)
-            and cred.get("type") == "api_key"
-            and _is_real_anthropic_api_key(cred.get("key"))
-        ):
-            return False
-    try:
-        models_doc = json.loads((agent_dir / "models.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        models_doc = None
-    if isinstance(models_doc, dict):
-        providers = models_doc.get("providers")
-        if isinstance(providers, dict):
-            cfg = providers.get("anthropic")
-            if isinstance(cfg, dict):
-                if (
-                    cfg.get("headers")
-                    or cfg.get("authHeader") is not None
-                    or _is_real_anthropic_api_key(cfg.get("apiKey"))
-                ):
-                    return False
-    return True
-
-
 def _is_cli_backed_model(model: str | None) -> bool:
     if not isinstance(model, str):
         return False
@@ -1363,7 +1296,7 @@ def _is_cli_backed_model(model: str | None) -> bool:
     if lowered.startswith(CLI_BACKED_MODEL_PREFIXES):
         return True
     if lowered.startswith("anthropic/"):
-        return _anthropic_uses_claude_cli()
+        return anthropic_uses_claude_cli()
     return False
 
 
@@ -1700,12 +1633,9 @@ def _is_infra_error(message: str) -> bool:
     return any(marker in lowered for marker in _INFRA_ERROR_MARKERS)
 
 
-_PROVIDER_ERROR_MARKERS = PROVIDER_ERROR_MARKERS
-
 _PROVIDER_ANSWER_SCAN_LIMIT = 500
-"""Only an answer this short (trimmed) is scanned for provider banners: a
-CLI provider reports an auth or quota failure as a short plain-text answer
-with status done, while a real answer that discusses rate limits is long."""
+"""Only an answer this short (trimmed) is scanned for unmistakable CLI provider
+banners (using the narrow banner list, never generic rate-limit prose)."""
 
 _PROVIDER_ERROR_DETAIL_CAP = 220
 _SESSION_TAIL_BYTES = 32_768
@@ -1722,26 +1652,20 @@ def _cap_provider_detail(text: str) -> str:
 def _detect_provider_auth_or_quota_error(answer: str | None, error: str | None) -> str | None:
     """A short summary of a provider auth/quota failure, or None.
 
-    Retrying or steering a child cannot fix a missing key or a spent quota,
-    so the executor reroutes to a healthy fallback pool (or pauses if none).
+    Error fields are scanned with the full provider error matcher; plain-text
+    answers are scanned only when short and only against unmistakable CLI
+    auth/quota banners so normal answers about 429/rate limits never match.
     """
-    candidates = [error.strip()] if error and error.strip() else []
+    if error and error.strip() and is_provider_error_text(error.strip()):
+        return _cap_provider_detail(error.strip())
     trimmed = (answer or "").strip()
-    if trimmed and len(trimmed) <= _PROVIDER_ANSWER_SCAN_LIMIT:
-        candidates.append(trimmed)
-    for text in candidates:
-        if is_provider_error_text(text):
-            return _cap_provider_detail(text)
+    if trimmed and len(trimmed) <= _PROVIDER_ANSWER_SCAN_LIMIT and is_cli_banner_error_text(trimmed):
+        return _cap_provider_detail(trimmed)
     return None
 
 
 def _session_quota_error(session_dir: str | None) -> str | None:
-    """Inspect the tail of a child's newest session JSONL for a masked quota/auth error.
-
-    ``pa-daemon``'s internal retry loop can absorb a provider quota banner and
-    settle the child with partial text and a ``provider_retry_outcome`` entry.
-    Scanning the last few lines catches that failure when required outputs go missing.
-    """
+    """Inspect the tail of a child's newest session JSONL for a masked quota/auth error."""
     if not session_dir:
         return None
     root = Path(session_dir)
@@ -1757,46 +1681,11 @@ def _session_quota_error(session_dir: str | None) -> str | None:
         return None
     if not candidates:
         return None
-    try:
-        with candidates[0].open("rb") as fh:
-            fh.seek(0, os.SEEK_END)
-            size = fh.tell()
-            fh.seek(max(0, size - _SESSION_TAIL_BYTES))
-            chunk = fh.read().decode("utf-8", errors="replace")
-    except OSError:
-        return None
-    lines = [line for line in chunk.splitlines() if line.strip()][-_SESSION_TAIL_LINES:]
-    for raw in reversed(lines):
-        try:
-            row = json.loads(raw)
-        except ValueError:
-            continue
-        if not isinstance(row, dict):
-            continue
-        if row.get("type") == "custom" and row.get("customType") == "provider_retry_outcome":
-            data = row.get("data")
-            msg = data.get("message") if isinstance(data, dict) else None
-            if isinstance(msg, str) and is_provider_error_text(msg):
-                return _cap_provider_detail(msg)
-        if row.get("type") == "message":
-            msg = row.get("message")
-            if not isinstance(msg, dict):
-                continue
-            err_msg = msg.get("errorMessage")
-            if isinstance(err_msg, str) and is_provider_error_text(err_msg):
-                return _cap_provider_detail(err_msg)
-            if msg.get("role") == "assistant":
-                content = msg.get("content")
-                if isinstance(content, list):
-                    text_parts = [
-                        item.get("text", "")
-                        for item in content
-                        if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str)
-                    ]
-                    joined = "\n".join(text_parts).strip()
-                    if joined and len(joined) <= _PROVIDER_ANSWER_SCAN_LIMIT and is_provider_error_text(joined):
-                        return _cap_provider_detail(joined)
-    return None
+    return scan_session_jsonl_quota_error(
+        candidates[0],
+        tail_bytes=_SESSION_TAIL_BYTES,
+        tail_lines=_SESSION_TAIL_LINES,
+    )
 
 
 def _detect_hidden_provider_quota_error(instance: _NodeInstance, model: str | None) -> str | None:
@@ -2290,6 +2179,22 @@ class _NodeInstance:
     retry_context: str | None = None  # the previous failed attempt's trimmed error
     repeat_error_sig: str | None = None  # normalized signature of the last failure
     repeat_error_count: int = 0  # consecutive failures sharing repeat_error_sig
+    routed_model: str | None = None  # instance-scoped routed model (never mutates state.model)
+    routed_thinking: str | None = None  # instance-scoped routed thinking
+    provider_reroutes: int = 0  # provider-failure reroutes (excluded from tier escalation)
+    excluded_models: list[str] = field(default_factory=list)  # models that failed on this instance
+
+
+def _effective_model(state: _StateRun, instance: _NodeInstance) -> str | None:
+    """The model this instance actually runs (or will run) on, preserving ``state.model`` as the pin."""
+    return instance.routed_model or state.model
+
+
+def _effective_thinking(state: _StateRun, instance: _NodeInstance) -> str | None:
+    """The thinking level for this instance's active model."""
+    if instance.routed_thinking is not None:
+        return instance.routed_thinking
+    return state.thinking
 
 
 @dataclass
@@ -2581,6 +2486,10 @@ def _instance_json(instance: _NodeInstance) -> dict[str, Any]:
         "retry_context": instance.retry_context,
         "repeat_error_sig": instance.repeat_error_sig,
         "repeat_error_count": instance.repeat_error_count,
+        "routed_model": instance.routed_model,
+        "routed_thinking": instance.routed_thinking,
+        "provider_reroutes": instance.provider_reroutes,
+        "excluded_models": list(instance.excluded_models),
     }
 
 
@@ -2591,11 +2500,14 @@ def _instance_from_json(data: dict[str, Any]) -> _NodeInstance:
         "rate_limit_streak", "child_id", "spawned_at", "duration_ms", "answer",
         "provisional", "error", "tool_uses", "inputs", "session_dir",
         "child_name", "factory_task_activity", "repair_sent", "awaiting_outputs_until", "deadline",
-        "resume_note", "retry_context", "repeat_error_sig",
+        "resume_note", "retry_context", "repeat_error_sig", "routed_model", "routed_thinking",
     ):
         setattr(instance, field, data.get(field))
     instance.attempt = data.get("attempt") or 0
     instance.repeat_error_count = data.get("repeat_error_count") or 0
+    instance.provider_reroutes = data.get("provider_reroutes") or 0
+    excluded = data.get("excluded_models")
+    instance.excluded_models = [m for m in excluded if isinstance(m, str)] if isinstance(excluded, list) else []
     instance.tool_uses = data.get("tool_uses") or 0
     if instance.child_id is not None and instance.status != "running" and instance.factory_task_activity is None:
         instance.factory_task_activity = "unverified"
@@ -5598,7 +5510,9 @@ class FactoryExecutor:
         try:
             contract = state.spec.get("emit")
             prompt = _attempt_prompt(instance)
-            if contract is not None and contract.get("outputs") and _is_cli_backed_model(state.model):
+            spawn_model = _effective_model(state, instance)
+            spawn_thinking = _effective_thinking(state, instance)
+            if contract is not None and contract.get("outputs") and _is_cli_backed_model(spawn_model):
                 emit_file = _emit_file_path(
                     run.run_id, state.state_id, entry.index, instance.index, instance.attempt
                 )
@@ -5613,8 +5527,8 @@ class FactoryExecutor:
             handle = await _spawn(
                 prompt,
                 name=child_name,
-                model=state.model,
-                thinking=state.thinking,
+                model=spawn_model,
+                thinking=spawn_thinking,
                 factory={"runId": run.run_id, "specId": run.spec_id, "stateId": state.state_id},
                 factory_contract=(
                     None if contract is None else {**contract, "inputs": instance.inputs or {}}
@@ -5965,6 +5879,8 @@ class FactoryExecutor:
                 )
                 return
         instance.status = "done"
+        # A clean settle decays the pool's failure score and feeds its latency.
+        note_provider_success(_effective_model(state, instance), instance.duration_ms)
         # The binding lane first: the collect envelope's full final answer
         # keeps the whole fenced JSON; the 160-character roster preview is
         # the fallback (older hosts, a capture that raced a worker
@@ -6002,7 +5918,7 @@ class FactoryExecutor:
             if entry.status != "running":
                 return  # a stop()/fail_fast pass claimed the entry mid-capture
             if capture_failure is not None:
-                hidden_quota = _detect_hidden_provider_quota_error(instance, state.model)
+                hidden_quota = _detect_hidden_provider_quota_error(instance, _effective_model(state, instance))
                 if hidden_quota is not None:
                     await self._pause_for_provider_error(run, state, entry, instance, hidden_quota)
                     return
@@ -6214,7 +6130,7 @@ class FactoryExecutor:
             missing = owed.get(instance.index)
             if missing is None:
                 continue
-            hidden_quota = _detect_hidden_provider_quota_error(instance, state.model)
+            hidden_quota = _detect_hidden_provider_quota_error(instance, _effective_model(state, instance))
             if hidden_quota is not None:
                 await self._pause_for_provider_error(run, state, entry, instance, hidden_quota)
                 return
@@ -6231,7 +6147,7 @@ class FactoryExecutor:
             reason = await self._request_repair(run, state, entry, instance, missing)
             if reason is not None:
                 repair_quota = _detect_provider_auth_or_quota_error(None, reason) or _detect_hidden_provider_quota_error(
-                    instance, state.model
+                    instance, _effective_model(state, instance)
                 )
                 if repair_quota is not None:
                     await self._pause_for_provider_error(run, state, entry, instance, repair_quota)
@@ -6255,7 +6171,7 @@ class FactoryExecutor:
             return False
         declared = state.spec["emit"].get("outputs") or []
         ports = {out["name"] for out in declared}
-        cli_backed = _is_cli_backed_model(state.model)
+        cli_backed = _is_cli_backed_model(_effective_model(state, instance))
         candidate: dict[str, Any] | None = None
         source = "answer"
         if cli_backed:
@@ -6328,7 +6244,7 @@ class FactoryExecutor:
         the message went out, else the failure reason."""
         from . import host_request
 
-        if _is_cli_backed_model(state.model):
+        if _is_cli_backed_model(_effective_model(state, instance)):
             declared = state.spec["emit"].get("outputs") or []
             emit_file = _emit_file_path(run.run_id, state.state_id, entry.index, instance.index, instance.attempt)
             rejected = (
@@ -6389,25 +6305,29 @@ class FactoryExecutor:
     ) -> str | None:
         """Apply the model router before spawn. Returns a pause reason when
         every pool for this tier is already exhausted, else None."""
+        active_model = _effective_model(state, instance)
+        active_thinking = _effective_thinking(state, instance)
+        effective_attempt = max(1, instance.attempt - instance.provider_reroutes)
         decision = admission_decision(
             prompt=state.prompt_template or "",
             state_id=state.state_id,
             role=_state_role(state),
             specialist=_state_specialist(state),
-            attempt=instance.attempt,
-            pinned_model=state.model,
-            pinned_thinking=state.thinking,
+            attempt=effective_attempt,
+            pinned_model=active_model,
+            pinned_thinking=active_thinking,
+            exclude_models=tuple(instance.excluded_models),
         )
         if decision is None:
             return None
         if decision.exhausted and not decision.model:
             detail = decision.reason or "every eligible pool is exhausted"
             return f"Provider auth/quota error in state '{state.state_id}': {detail}"
-        previous = state.model
-        if decision.model and decision.model != state.model:
-            state.model = decision.model
+        previous = active_model
+        if decision.model and decision.model != active_model:
+            instance.routed_model = decision.model
             if decision.thinking:
-                state.thinking = decision.thinking
+                instance.routed_thinking = decision.thinking
             self._event(
                 run,
                 "model_rerouted",
@@ -6422,8 +6342,8 @@ class FactoryExecutor:
                 thinking=decision.thinking or "",
                 tier=decision.tier,
             )
-        elif decision.thinking and decision.thinking != (state.thinking or ""):
-            state.thinking = decision.thinking
+        elif decision.thinking and decision.thinking != (active_thinking or ""):
+            instance.routed_thinking = decision.thinking
         return None
 
     def _prepare_provider_failure(
@@ -6433,29 +6353,37 @@ class FactoryExecutor:
         instance was re-queued. Otherwise the pause reason, enriched when
         every remaining pool is exhausted or open."""
         reason = f"Provider auth/quota error in state '{state.state_id}': {detail}"
+        active_model = _effective_model(state, instance)
+        active_thinking = _effective_thinking(state, instance)
         if (
             router_disabled()
-            or not is_recognized_model(state.model)
+            or not is_recognized_model(active_model)
             or instance.status not in ("running", "done")
             or entry.status != "running"
             or run.state != "running"
         ):
             return reason
-        note_provider_failure(state.model or "", detail)
+        note_provider_failure(active_model or "", detail)
+        if active_model and active_model not in instance.excluded_models:
+            instance.excluded_models.append(active_model)
+        effective_attempt = max(1, instance.attempt - instance.provider_reroutes)
         decision = fallback_after_failure(
             prompt=state.prompt_template or "",
             state_id=state.state_id,
             role=_state_role(state),
             specialist=_state_specialist(state),
-            attempt=instance.attempt,
-            model=state.model or "",
-            thinking=state.thinking,
+            attempt=effective_attempt,
+            model=active_model or "",
+            thinking=active_thinking,
+            exclude_models=tuple(instance.excluded_models),
         )
-        if decision.model and not decision.exhausted and decision.model != state.model:
-            previous = state.model
-            state.model = decision.model
+        if decision.model and not decision.exhausted and decision.model != active_model:
+            previous = active_model
+            instance.routed_model = decision.model
             if decision.thinking:
-                state.thinking = decision.thinking
+                instance.routed_thinking = decision.thinking
+            instance.provider_reroutes += 1
+            instance.retry_base += 1
             instance.status = "pending"
             instance.error = None
             instance.awaiting_outputs_until = None
@@ -6612,7 +6540,7 @@ class FactoryExecutor:
         )
         if not task_busy and (repair_finished or self._now_fn() >= instance.awaiting_outputs_until):
             instance.awaiting_outputs_until = None
-            hidden_quota = _detect_hidden_provider_quota_error(instance, state.model)
+            hidden_quota = _detect_hidden_provider_quota_error(instance, _effective_model(state, instance))
             if hidden_quota is not None:
                 await self._pause_for_provider_error(run, state, entry, instance, hidden_quota)
                 return

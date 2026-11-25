@@ -435,10 +435,21 @@ impl SessionEngine for AgentSessionEngine {
                 return false;
             }
         }
+        let previous = self
+            .resolve_model()
+            .ok()
+            .map(|model| (model.provider, model.id));
         self.configure_model(selection);
         let Ok(model) = self.resolve_model() else {
             return false;
         };
+        // A switch to another model ends a quota park: the wait was for the old model's reset.
+        // A switch to the same model keeps the park and its wake.
+        if self.is_quota_parked()
+            && previous.as_ref() != Some(&(model.provider.clone(), model.id.clone()))
+        {
+            self.runtime.block_on(self.end_quota_park_for_reroute());
+        }
         self.rebuild_request_auth_registry();
         {
             // The switch's slot install serializes with the other slot

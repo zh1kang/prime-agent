@@ -376,6 +376,25 @@ impl AgentSessionEngine {
             .map(|engine| engine.session.shared_persistence())
     }
 
+    /// The caller moved a parked session to another model: the park's wait no longer applies,
+    /// and the caller re-sends the interrupted work on the new model itself. Clear the park and
+    /// cancel its wake without queuing the resume marker, so the fallback model's first success
+    /// cannot start a second "continue" turn.
+    pub(in crate::agent_engine) async fn end_quota_park_for_reroute(&self) {
+        let park = self
+            .quota_park
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let Some(park) = park else {
+            return;
+        };
+        if let Some(job_id) = &park.job_id {
+            self.cancel_quota_resume_job(job_id);
+        }
+        self.append_quota_resume_entry("rerouted").await;
+    }
+
     /// A parked session completed a model call: the quota is back. Clear
     /// the park, record the resume, and — unless this success WAS the wake
     /// probe — queue the marker.

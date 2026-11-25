@@ -18,24 +18,15 @@ def _router_source():
     explicit = os.environ.get("PA_MODEL_ROUTER_PY")
     if explicit and Path(explicit).is_file():
         return Path(explicit)
-    # Check installed pa-harness runtime and kernel-venv site-packages first.
-    direct_candidates = [
-        Path.home()
-        / ".local"
-        / "share"
-        / "pa-harness"
-        / "prime-agent-runtime"
-        / "src"
-        / "rlm"
-        / "model_router.py",
-        Path.home() / ".local" / "share" / "pa-harness" / "rlm" / "model_router.py",
-    ]
+    direct_candidates = []
     try:
         pa_dir = Path(PA).resolve().parent
-        direct_candidates.insert(
-            0, pa_dir / "prime-agent-runtime" / "src" / "rlm" / "model_router.py"
+        direct_candidates.extend(
+            [
+                pa_dir / "prime-agent-runtime" / "src" / "rlm" / "model_router.py",
+                pa_dir / "rlm" / "model_router.py",
+            ]
         )
-        direct_candidates.insert(1, pa_dir / "rlm" / "model_router.py")
     except (NameError, OSError):
         pass
     for candidate in direct_candidates:
@@ -123,19 +114,19 @@ def captain_router_brief(db, project_id):
     """Quota headroom, project spend, and the model to prefer at each tier."""
     usage = None
     try:
-        usage = job_usage(db, "project", project_id)
-    except Exception:
-        usage = None
-    # Prefer true project-wide cost across all sessions + subagents when available.
-    try:
         row = db.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
         if row is not None and "project_usage_detail" in globals():
-            detail = project_usage_detail(row)
-            if isinstance(detail, dict) and detail.get("cost_usd") is not None:
-                usage = dict(usage or {})
-                usage["cost_usd"] = max(float(usage.get("cost_usd") or 0.0), float(detail["cost_usd"]))
+            detail = project_usage_detail(db, dict(row))
+            totals = detail.get("usage") if isinstance(detail, dict) else None
+            if isinstance(totals, dict):
+                usage = totals
     except Exception:
-        pass
+        usage = None
+    if usage is None:
+        try:
+            usage = job_usage(db, "project", project_id)
+        except Exception:
+            usage = None
     module = None
     try:
         module = _router_module()
@@ -164,25 +155,21 @@ def captain_router_brief(db, project_id):
     return "Live model routing:\n" + body + "\n"
 
 
-_FALLBACK_PROVIDER_ERROR_MARKERS = (
+_FALLBACK_CLI_BANNER_MARKERS = (
     "invalid api key",
     "fix external api key",
     "authentication_error",
     "no api key found",
     "not logged in",
+    "please run /login",
     "individual quota reached",
-    "quota exceeded",
     "exceeded your current quota",
-    "rate limit reached",
-    "rate_limit_error",
-    "too many requests",
     "please upgrade your subscription",
     "you've hit your limit",
     "you have hit your limit",
-    "hit your limit",
-    "usage limit",
     "out of extra usage",
     "credit balance is too low",
+    "rate_limit_error",
     "overloaded_error",
 )
 
@@ -198,7 +185,21 @@ def captain_is_provider_error(text):
     except Exception:
         pass
     lowered = text.lower()
-    return any(marker in lowered for marker in _FALLBACK_PROVIDER_ERROR_MARKERS)
+    return any(marker in lowered for marker in _FALLBACK_CLI_BANNER_MARKERS)
+
+
+def captain_is_cli_banner_error(text):
+    """True only when ``text`` matches an unmistakable provider CLI auth/quota banner."""
+    if not isinstance(text, str) or not text.strip():
+        return False
+    try:
+        module = _router_module()
+        if module is not None and hasattr(module, "is_cli_banner_error_text"):
+            return bool(module.is_cli_banner_error_text(text))
+    except Exception:
+        pass
+    lowered = text.lower()
+    return any(marker in lowered for marker in _FALLBACK_CLI_BANNER_MARKERS)
 
 
 def captain_default_agent_model():
@@ -232,14 +233,21 @@ def captain_session_quota_error(session_file, offset=0):
     """Scan newly written bytes of a native session JSONL for a quota/auth error."""
     if not session_file:
         return None
+    try:
+        module = _router_module()
+        if module is not None and hasattr(module, "scan_session_jsonl_quota_error"):
+            return module.scan_session_jsonl_quota_error(session_file, offset)
+    except Exception:
+        pass
     path = Path(session_file)
     try:
         size = path.stat().st_size
     except OSError:
         return None
-    if size <= offset:
+    start_offset = max(0, int(offset or 0))
+    if size <= start_offset:
         return None
-    start = max(int(offset or 0), size - 32768)
+    start = max(start_offset, size - 32768)
     try:
         with path.open("rb") as fh:
             fh.seek(start)
@@ -254,9 +262,12 @@ def captain_session_quota_error(session_file, offset=0):
             continue
         if not isinstance(row, dict):
             continue
-        if row.get("type") == "custom" and row.get("customType") == "provider_retry_outcome":
-            data = row.get("data")
-            msg = data.get("message") if isinstance(data, dict) else None
+        if row.get("type") == "custom_message" and row.get("customType") == "provider_retry_outcome":
+            details = row.get("details")
+            if not isinstance(details, dict) or details.get("success") is not False:
+                continue
+            final_err = details.get("finalError")
+            msg = final_err if isinstance(final_err, str) and final_err.strip() else row.get("content")
             if isinstance(msg, str) and captain_is_provider_error(msg):
                 return " ".join(msg.split())[:220]
         if row.get("type") == "message":
@@ -266,19 +277,6 @@ def captain_session_quota_error(session_file, offset=0):
             err_msg = msg.get("errorMessage")
             if isinstance(err_msg, str) and captain_is_provider_error(err_msg):
                 return " ".join(err_msg.split())[:220]
-            if msg.get("role") == "assistant":
-                content = msg.get("content")
-                if isinstance(content, list):
-                    parts = [
-                        item.get("text", "")
-                        for item in content
-                        if isinstance(item, dict)
-                        and item.get("type") == "text"
-                        and isinstance(item.get("text"), str)
-                    ]
-                    joined = "\n".join(parts).strip()
-                    if joined and len(joined) <= 500 and captain_is_provider_error(joined):
-                        return " ".join(joined.split())[:220]
     return None
 
 
@@ -314,6 +312,18 @@ def captain_route_model(model, thinking="", *, prompt="", role=None, state_id=""
         note = f"{model} -> {decision.model} ({decision.reason})"
         return decision.model, chosen_thinking, note
     return model, chosen_thinking, None
+
+
+def captain_note_success(model, latency_ms):
+    """Record a clean Captain or crew turn on ``model``'s pool. Never blocks the turn."""
+    if not isinstance(model, str) or not model.strip():
+        return
+    try:
+        module = _router_module()
+        if module is not None:
+            module.note_provider_success(model, latency_ms)
+    except Exception:
+        pass
 
 
 def captain_record_and_fallback(
