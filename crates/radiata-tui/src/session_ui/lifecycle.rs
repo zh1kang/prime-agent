@@ -156,6 +156,7 @@ impl SessionUi {
             bash_updates: activity_updates.bash,
             factory_graph: serde_json::json!({"runs": []}),
             factory_view_session: None,
+            factory_target_session_id: None,
             factory_refresh_in_flight: false,
             factory_refresh_queued: false,
             factory_list_epoch: 0,
@@ -664,6 +665,7 @@ impl SessionUi {
                 view.close_overlay_if(|overlay| matches!(overlay, Overlay::Factory(_)));
                 self.factory_selected_run = None;
                 self.factory_view_session = None;
+                self.factory_target_session_id = None;
                 self.factory_graph = serde_json::json!({"runs": []});
             }
             // An agents-view panel the rebind tore down takes its return-to-agents-view flag
@@ -2528,6 +2530,72 @@ mod backfill_tests {
         })
         .await
         .expect("captain origin flow completes within ten seconds");
+    }
+
+    #[tokio::test]
+    async fn opening_factory_page_in_captain_chat_targets_live_host_session() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut session, server, _requests) = mock_session(
+                &dir.path().join("captain-host-route.sock"),
+                mpsc::unbounded_channel().0,
+            )
+            .await;
+            let mut view = test_view();
+            session.captain_snapshot = Some(
+                serde_json::from_value(json!({
+                    "current_root": "/repo",
+                    "projects": [{
+                        "id": "p1",
+                        "root": "/repo",
+                        "name": "MOSAIC",
+                        "lead": "lead-1",
+                        "lead_session": "/s/lead.jsonl",
+                        "crew": [{
+                            "id": "run-member-1",
+                            "kind": "factory",
+                            "display_name": "mosaic-research",
+                            "state": "running",
+                            "run_state": "running",
+                            "run_id": "run-42",
+                            "session": "/s/factory-host.jsonl"
+                        }]
+                    }]
+                }))
+                .unwrap(),
+            );
+            session.roster = vec![json!({
+                "summary": {
+                    "activeSessionId": "host-active-99",
+                    "sessionId": "host-durable-99",
+                    "sessionFile": "/s/factory-host.jsonl"
+                }
+            })];
+            session.captain_context = session.context_for(
+                session.captain_snapshot.as_ref().unwrap(),
+                "/s/lead.jsonl",
+            );
+            session.open_factory_page(&mut view);
+            assert_eq!(
+                session.factory_activity_session_id(),
+                "host-active-99",
+                "Factory page must target the Captain run's live host session instead of the Captain's lead chat"
+            );
+            assert!(matches!(view.overlay, Some(Overlay::Factory(_))));
+            session
+                .handle_factory_view_key(key(crossterm::event::KeyCode::Esc), &mut view)
+                .await
+                .unwrap();
+            assert_eq!(
+                session.factory_activity_session_id(),
+                session.active_session_id,
+                "closing Factory page restores target session to the main chat"
+            );
+            drop(session);
+            server.abort();
+        })
+        .await
+        .expect("captain host route test completes within ten seconds");
     }
 
     #[tokio::test]

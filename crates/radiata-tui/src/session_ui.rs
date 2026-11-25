@@ -338,6 +338,9 @@ pub(crate) struct SessionUi {
     /// active session` recovery) and closes it only when a different
     /// session actually takes the view's place.
     factory_view_session: Option<String>,
+    /// Active daemon session id that the open Factory page is inspecting when viewing
+    /// a Captain-started factory run hosted in a separate session (`None` = current chat).
+    factory_target_session_id: Option<String>,
     /// Whether one factory refresh is still in flight (the heartbeat
     /// refresh's serialization: the tick is only a cadence floor, so it
     /// queues behind the in-flight cycle instead of minting a newer epoch

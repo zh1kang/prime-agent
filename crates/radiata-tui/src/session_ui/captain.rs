@@ -80,6 +80,19 @@ pub(crate) struct CaptainOpen {
     pub retry: bool,
 }
 
+/// Host-session address of a Captain-started factory run, resolved from `captain_snapshot`
+/// and the daemon roster so the Factory page inspects the run's real host session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedCaptainRun {
+    pub project: String,
+    pub member: String,
+    pub label: String,
+    pub run_id: Option<String>,
+    pub session_file: Option<String>,
+    pub active_session_id: Option<String>,
+    pub starting: bool,
+}
+
 /// A message for the Captain waiting for the `lead` call before it to answer, so messages
 /// reach the Captain in the order they were typed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -417,7 +430,7 @@ pub(crate) fn session_ancestors(roster: &[Value], session_file: &str) -> Vec<(St
 
 impl super::SessionUi {
     /// The Captain context of `file`, through its roster ancestors for a subagent.
-    fn context_for(&self, snapshot: &CaptainSnapshot, file: &str) -> Option<CaptainContext> {
+    pub(super) fn context_for(&self, snapshot: &CaptainSnapshot, file: &str) -> Option<CaptainContext> {
         captain_context(snapshot, file, &session_ancestors(&self.roster, file))
     }
 
@@ -1669,7 +1682,7 @@ impl super::SessionUi {
         self.dirty = true;
     }
 
-    fn open_captain_target(&mut self, target: OpenTarget, view: &mut AgentView) {
+    pub(super) fn open_captain_target(&mut self, target: OpenTarget, view: &mut AgentView) {
         match target {
             OpenTarget::Session {
                 path,
@@ -2001,6 +2014,77 @@ impl super::SessionUi {
         self.dirty = true;
     }
 
+    /// Resolve a Captain-started factory run's host session (`sessionFile` -> live daemon
+    /// `activeSessionId` in `self.roster`) so the Factory page inspects the run's actual
+    /// host session instead of showing "No live factory runs." on the Captain's lead chat.
+    pub(crate) fn resolve_captain_factory_run(
+        &self,
+        project: &str,
+        member: Option<&str>,
+    ) -> Option<ResolvedCaptainRun> {
+        let proj = self
+            .captain_snapshot
+            .as_ref()?
+            .projects
+            .iter()
+            .find(|p| p.id == project)?;
+        let chosen = match member {
+            Some(id) => proj.crew.iter().find(|m| m.id == id && m.is_run())?,
+            None => proj
+                .crew
+                .iter()
+                .filter(|m| m.is_run() && !m.archived)
+                .find(|m| {
+                    matches!(
+                        m.run_state.as_deref(),
+                        Some("running" | "paused" | "starting" | "queued")
+                    ) || matches!(m.state.as_str(), "running" | "needs_you")
+                })?,
+        };
+        let session_file = chosen
+            .session
+            .clone()
+            .filter(|s| !s.trim().is_empty());
+        let active_session_id = session_file.as_deref().and_then(|file| {
+            self.roster
+                .iter()
+                .filter_map(|entry| entry.get("summary"))
+                .find(|s| {
+                    s.get("sessionFile")
+                        .and_then(Value::as_str)
+                        .is_some_and(|p| same_file(p, file))
+                })
+                .and_then(|s| s.get("activeSessionId").and_then(Value::as_str))
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned)
+        });
+        let starting = matches!(chosen.run_state.as_deref(), Some("queued" | "starting"));
+        Some(ResolvedCaptainRun {
+            project: proj.id.clone(),
+            member: chosen.id.clone(),
+            label: chosen.label(),
+            run_id: chosen.run_id.clone(),
+            session_file,
+            active_session_id,
+            starting,
+        })
+    }
+
+    /// The active Captain project's live or paused factory run, when viewing a Captain project.
+    pub(crate) fn resolve_active_captain_factory_run(&self) -> Option<ResolvedCaptainRun> {
+        let project = self
+            .captain_context
+            .as_ref()
+            .map(|c| c.project.as_str())
+            .or_else(|| {
+                self.captain_dock
+                    .as_ref()
+                    .map(|d| d.project_id.as_str())
+                    .filter(|s| !s.is_empty())
+            })?;
+        self.resolve_captain_factory_run(project, None)
+    }
+
     /// Open the live factory page on a Captain-started run. From the panel, the page's
     /// close returns to it; from a chat or the dock, to where it was opened.
     pub(crate) fn open_captain_run(
@@ -2016,15 +2100,25 @@ impl super::SessionUi {
             // The page's close returns to a parked panel; with none it returns to its origin.
             self.captain_parked = None;
         }
-        let run_id = run_id.or_else(|| {
-            self.captain_snapshot
-                .iter()
-                .flat_map(|s| &s.projects)
-                .filter(|p| p.id == project)
-                .flat_map(|p| &p.crew)
-                .find(|m| m.id == member)
-                .and_then(|m| m.run_id.clone())
-        });
+        let resolved = self.resolve_captain_factory_run(&project, Some(&member));
+        let run_id = run_id.or_else(|| resolved.as_ref().and_then(|r| r.run_id.clone()));
+        if let Some(found) = &resolved {
+            if let Some(active_id) = &found.active_session_id {
+                self.factory_target_session_id = Some(active_id.clone());
+            } else if !found.starting {
+                if let Some(path) = &found.session_file {
+                    self.open_captain_target(
+                        OpenTarget::Session {
+                            path: path.clone(),
+                            factory: true,
+                            draft: None,
+                        },
+                        view,
+                    );
+                    return;
+                }
+            }
+        }
         if let Some(Overlay::Captain(panel)) = view.overlay.as_mut() {
             panel.park();
         }
@@ -2035,12 +2129,22 @@ impl super::SessionUi {
                 member: Some(member),
             }),
         );
-        if let (Some(run_id), Some(Overlay::Factory(page))) = (run_id, view.overlay.as_mut()) {
-            page.select(crate::factory_view::FactoryRow {
-                run_id,
-                state_id: None,
-            });
-            self.sync_factory_selection(view);
+        if let Some(Overlay::Factory(page)) = view.overlay.as_mut() {
+            if let Some(found) = &resolved {
+                if found.active_session_id.is_none() && found.starting {
+                    page.set_error(Some(format!(
+                        "Factory {} is starting — waiting for host kernel…",
+                        found.label
+                    )));
+                }
+            }
+            if let Some(run_id) = run_id {
+                page.select(crate::factory_view::FactoryRow {
+                    run_id,
+                    state_id: None,
+                });
+                self.sync_factory_selection(view);
+            }
         }
         self.dirty = true;
     }

@@ -66,6 +66,42 @@ fn hot_enabled_lanes() -> std::sync::MutexGuard<'static, Vec<String>> {
 }
 
 impl super::SessionUi {
+    /// The daemon active session id the Factory page queries (`factory_activity`):
+    /// when viewing a Captain-started factory run in-place, this points at the run's
+    /// dedicated host session rather than the Captain's lead chat.
+    pub(crate) fn factory_activity_session_id(&self) -> String {
+        self.factory_target_session_id
+            .clone()
+            .unwrap_or_else(|| self.active_session_id.clone())
+    }
+
+    /// Session identity of the host session currently displayed in the Factory page,
+    /// used to locate direct child step sessions in `self.roster`.
+    fn factory_session_identity(&self) -> SessionIdentity {
+        if let Some(target_id) = &self.factory_target_session_id {
+            if let Some(summary) = self
+                .roster
+                .iter()
+                .filter_map(|entry| entry.get("summary"))
+                .find(|s| s.get("activeSessionId").and_then(Value::as_str) == Some(target_id.as_str()))
+            {
+                return SessionIdentity::new(
+                    Some(target_id.clone()),
+                    summary
+                        .get("sessionId")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    summary
+                        .get("sessionFile")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                );
+            }
+            return SessionIdentity::new(Some(target_id.clone()), None, None);
+        }
+        self.session_identity()
+    }
+
     /// Whether the daemon advertises the factory lane (older daemons never
     /// see the command), or `/fsm` turned it on for this daemon since the
     /// hello: the open and every refresh tick key on the same gate, so an
@@ -168,6 +204,7 @@ impl super::SessionUi {
         );
         self.factory_selected_run = None;
         self.factory_view_session = None;
+        self.factory_target_session_id = None;
         if returns_to_captain {
             if let Some(panel) = self.captain_parked.take() {
                 view.overlay = Some(Overlay::Captain(panel));
@@ -250,17 +287,67 @@ impl super::SessionUi {
             self.dirty = true;
             return;
         }
+        // When opened from a Captain chat whose own session has no local runs, route
+        // directly to the active Captain project's live/paused factory run instead of
+        // showing a misleading "No live factory runs." on the Captain's lead chat.
+        let mut auto_origin: Option<CaptainRunOrigin> = None;
+        let mut auto_select_run: Option<String> = None;
+        let mut starting_notice: Option<String> = None;
+        if self.factory_target_session_id.is_none() && live_run_count(&self.factory_graph) == 0 {
+            if let Some(found) = self.resolve_active_captain_factory_run() {
+                if let Some(active_id) = found.active_session_id {
+                    self.factory_target_session_id = Some(active_id);
+                    auto_origin = Some(CaptainRunOrigin {
+                        project: found.project,
+                        member: Some(found.member),
+                    });
+                    auto_select_run = found.run_id;
+                } else if found.starting {
+                    auto_origin = Some(CaptainRunOrigin {
+                        project: found.project,
+                        member: Some(found.member),
+                    });
+                    starting_notice = Some(format!(
+                        "Factory {} is starting — waiting for host kernel…",
+                        found.label
+                    ));
+                } else if let Some(path) = found.session_file {
+                    self.open_captain_target(
+                        crate::captain_view::OpenTarget::Session {
+                            path,
+                            factory: true,
+                            draft: None,
+                        },
+                        view,
+                    );
+                    return;
+                }
+            }
+        }
         // The mounted view belongs to this durable session: a later
         // rebind fold keeps it only across the SAME session's reattach.
         self.factory_view_session = Some(self.session_id.clone());
         self.library_view_session = None;
-        // The mount holds the fold's malformed-reply contract: a cached
-        // malformed lane mounts with its error line, never as a silent
-        // fake empty state waiting for the first fold.
-        view.overlay = Some(Overlay::Factory(FactoryView::from_reply(
-            &self.factory_graph,
-            picker_viewport_rows(view.terminal_rows()),
-        )));
+        let initial_graph = if self.factory_target_session_id.is_some() {
+            serde_json::json!({"runs": []})
+        } else {
+            self.factory_graph.clone()
+        };
+        let mut page =
+            FactoryView::from_reply(&initial_graph, picker_viewport_rows(view.terminal_rows()));
+        if auto_origin.is_some() {
+            page.set_captain_origin(auto_origin);
+        }
+        if let Some(run_id) = auto_select_run {
+            page.select(crate::factory_view::FactoryRow {
+                run_id,
+                state_id: None,
+            });
+        }
+        if let Some(notice) = starting_notice {
+            page.set_error(Some(notice));
+        }
+        view.overlay = Some(Overlay::Factory(page));
         self.sync_factory_selection(view);
         self.dirty = true;
         self.spawn_factory_refresh();
@@ -304,7 +391,7 @@ impl super::SessionUi {
             node.set_request_epoch(request_epoch, selector);
         }
         let client = self.client.clone();
-        let active_session_id = self.active_session_id.clone();
+        let active_session_id = self.factory_activity_session_id();
         let run_id = run_id.to_string();
         let state_id = state_id.to_string();
         let tx = self.factory_updates.clone();
@@ -410,7 +497,7 @@ impl super::SessionUi {
     /// page's error line.
     fn open_factory_child(&mut self, view: &mut AgentView, child_id: &str) {
         if let Some((selection, rlm_depth)) =
-            factory_child_selection(&self.roster, &self.session_identity(), child_id)
+            factory_child_selection(&self.roster, &self.factory_session_identity(), child_id)
         {
             self.pending_selection = Some(selection);
             self.pending_selection_rlm_depth = rlm_depth;
@@ -447,14 +534,14 @@ impl super::SessionUi {
     /// and failure policy. Success toasts; a no-effect or failed stop
     /// lands on the page's error line.
     fn stop_factory_child(&mut self, child_id: String, label: String) {
+        let session = self.factory_activity_session_id();
         let action = crate::agents_view::DeleteAction::StopSubagent {
-            active_session_id: self.active_session_id.clone(),
+            active_session_id: session.clone(),
             child_id,
             name: label,
         };
         let client = self.client.clone();
         let tx = self.factory_updates.clone();
-        let session = self.active_session_id.clone();
         tokio::spawn(async move {
             let (message, tone) = match tokio::time::timeout(
                 Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
@@ -496,12 +583,13 @@ impl super::SessionUi {
         run_id: String,
         rest: Map<String, Value>,
     ) -> Result<()> {
+        let target_session_id = self.factory_activity_session_id();
         match self
             .bounded_request(
                 Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
                 DaemonCommand::FactoryActivity {
                     id: None,
-                    active_session_id: self.active_session_id.clone(),
+                    active_session_id: target_session_id,
                     action: action.to_string(),
                     run_id: Some(run_id.clone()),
                     spec_id: None,
@@ -609,7 +697,7 @@ impl super::SessionUi {
         self.factory_list_epoch += 1;
         let epoch = self.factory_list_epoch;
         let client = self.client.clone();
-        let active_session_id = self.active_session_id.clone();
+        let active_session_id = self.factory_activity_session_id();
         let selected_run = self.factory_selected_run.clone();
         let tx = self.factory_updates.clone();
         tokio::spawn(async move {
@@ -726,9 +814,10 @@ impl super::SessionUi {
                         .filter(|node| node.run_id == run_id && node.state_id == state_id),
                     _ => None,
                 };
+                let expected = self.factory_activity_session_id();
                 let landed = fold_node_delivery(
                     node,
-                    &self.active_session_id,
+                    &expected,
                     &session,
                     request_epoch,
                     result,
@@ -754,7 +843,7 @@ impl super::SessionUi {
                 message,
                 tone,
             } => {
-                if session == self.active_session_id {
+                if session == self.factory_activity_session_id() {
                     match tone {
                         crate::agents_view::StatusTone::Muted => self.toast(&message, view),
                         crate::agents_view::StatusTone::Warning
@@ -777,44 +866,54 @@ impl super::SessionUi {
         // results are independent of any snapshot currently in flight.
         self.factory_refresh_in_flight = false;
         let queued = std::mem::take(&mut self.factory_refresh_queued);
-        if session != self.active_session_id || epoch != self.factory_list_epoch {
+        let expected_session = self.factory_activity_session_id();
+        if session != expected_session || epoch != self.factory_list_epoch {
             if queued {
                 self.spawn_factory_refresh();
             }
             return;
         }
+        let external_target = self.factory_target_session_id.is_some();
         match payload {
-            Ok(data) => match Self::fold_factory_reply(&mut self.factory_graph, data) {
-                Some(runs) => {
-                    if let Some(Overlay::Factory(factory_view)) = view.overlay.as_mut() {
-                        factory_view.set_error(None);
-                        factory_view.apply_runs(runs);
+            Ok(data) => {
+                let parsed = if external_target {
+                    crate::factory_view::factory_reply_lists_runs(&data)
+                        .then(|| parse_factory_runs(&data))
+                } else {
+                    Self::fold_factory_reply(&mut self.factory_graph, data)
+                };
+                match parsed {
+                    Some(runs) => {
+                        if let Some(Overlay::Factory(factory_view)) = view.overlay.as_mut() {
+                            factory_view.set_error(None);
+                            factory_view.apply_runs(runs);
+                        }
+                        let target = match view.overlay.as_ref() {
+                            Some(Overlay::Factory(factory_view)) => factory_view
+                                .node
+                                .as_ref()
+                                .filter(|node| !node.request_in_flight())
+                                .map(crate::factory_view::node::NodeView::target),
+                            _ => None,
+                        };
+                        if let Some(target) = target {
+                            self.open_factory_node(
+                                view,
+                                &target.run_id,
+                                &target.state_id,
+                                target.instance,
+                            );
+                        }
                     }
-                    let target = match view.overlay.as_ref() {
-                        Some(Overlay::Factory(factory_view)) => factory_view
-                            .node
-                            .as_ref()
-                            .filter(|node| !node.request_in_flight())
-                            .map(crate::factory_view::node::NodeView::target),
-                        _ => None,
-                    };
-                    if let Some(target) = target {
-                        self.open_factory_node(
-                            view,
-                            &target.run_id,
-                            &target.state_id,
-                            target.instance,
-                        );
+                    None => {
+                        if let Some(Overlay::Factory(factory_view)) = view.overlay.as_mut() {
+                            factory_view.set_error(Some(
+                                crate::factory_view::MALFORMED_REPLY_ERROR.to_string(),
+                            ));
+                        }
                     }
                 }
-                None => {
-                    if let Some(Overlay::Factory(factory_view)) = view.overlay.as_mut() {
-                        factory_view.set_error(Some(
-                            crate::factory_view::MALFORMED_REPLY_ERROR.to_string(),
-                        ));
-                    }
-                }
-            },
+            }
             Err(message) => {
                 if let Some(Overlay::Factory(factory_view)) = view.overlay.as_mut() {
                     factory_view.set_error(Some(message));
