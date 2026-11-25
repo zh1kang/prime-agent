@@ -130,10 +130,10 @@ struct CatalogEntry {
 /// Mirrors `CATALOG` in `prime-agent-runtime/src/rlm/model_router.py`: the preview must rank the
 /// same candidates the router launches.
 const CATALOG: &[CatalogEntry] = &[
-    CatalogEntry { model: "anthropic/claude-opus-5-5", tier: "frontier", pool: "claude", cost: 25.0, thinking: "xhigh" },
-    CatalogEntry { model: "openai-codex/gpt-5.5", tier: "frontier", pool: "codex", cost: 15.0, thinking: "xhigh" },
-    CatalogEntry { model: "openai-codex/gpt-6.1-sol", tier: "frontier", pool: "codex", cost: 16.0, thinking: "xhigh" },
-    CatalogEntry { model: "antigravity/gemini-4-neon", tier: "frontier", pool: "antigravity-gemini", cost: 15.0, thinking: "xhigh" },
+    CatalogEntry { model: "anthropic/claude-opus-5-5", tier: "frontier", pool: "claude", cost: 25.0, thinking: "high" },
+    CatalogEntry { model: "openai-codex/gpt-5.5", tier: "frontier", pool: "codex", cost: 15.0, thinking: "high" },
+    CatalogEntry { model: "openai-codex/gpt-6.1-sol", tier: "frontier", pool: "codex", cost: 16.0, thinking: "high" },
+    CatalogEntry { model: "antigravity/gemini-4-neon", tier: "frontier", pool: "antigravity-gemini", cost: 15.0, thinking: "high" },
     CatalogEntry { model: "antigravity/claude-opus-5-5", tier: "frontier", pool: "antigravity-claude-gpt", cost: 25.0, thinking: "high" },
     CatalogEntry { model: "cursor/claude-opus-5-5", tier: "frontier", pool: "cursor-third-party", cost: 25.0, thinking: "high" },
     CatalogEntry { model: "anthropic/claude-sonnet-5-5", tier: "strong", pool: "claude", cost: 15.0, thinking: "high" },
@@ -400,11 +400,7 @@ impl RouterView {
     }
 
     pub fn handle_key(&mut self, key: &str, kb: &KeybindingsManager) -> RouterViewAction {
-        if key == "ctrl+c"
-            || key == "q"
-            || kb.matches(key, "tui.select.cancel")
-            || kb.matches(key, "app.modal.back")
-        {
+        if key == "ctrl+c" || key == "q" || kb.matches(key, "tui.select.cancel") {
             return RouterViewAction::Close;
         }
         if key == "r" {
@@ -429,7 +425,7 @@ impl RouterView {
             self.selected = (self.selected + 1).min(ROW_COUNT - 1);
             return RouterViewAction::None;
         }
-        if key == "left" || key == "h" {
+        if key == "left" || key == "h" || key == "backspace" {
             self.step_selected(-1);
             return RouterViewAction::None;
         }
@@ -851,8 +847,7 @@ impl RouterView {
         let thinking = match tier {
             "fast" => "low",
             "balanced" => "medium",
-            "strong" => "high",
-            _ => "xhigh",
+            _ => "high",
         };
         if self.draft.switchyard_enabled && self.draft.validate_switchyard().is_none() {
             let use_capable = match self.draft.sensitivity.as_str() {
@@ -1277,5 +1272,33 @@ mod tests {
             ..RouterProfileDraft::default()
         };
         assert!(draft.validate_switchyard().is_some());
+    }
+
+    #[test]
+    fn left_key_cycles_option_back_without_closing_router_modal() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut view = RouterView::open_in(dir.path().to_path_buf(), None, false);
+        assert_eq!(view.draft.routing_mode, "auto");
+        // Pressing Left (←) must cycle backward within the selected option,
+        // NOT trigger app.modal.back and exit /router.
+        let action = view.handle_key("left", &kb());
+        assert_eq!(action, RouterViewAction::None);
+        assert_eq!(view.draft.routing_mode, "off");
+        let action = view.handle_key("backspace", &kb());
+        assert_eq!(action, RouterViewAction::None);
+        assert_eq!(view.draft.routing_mode, "on");
+        // Esc still closes /router.
+        assert_eq!(view.handle_key("escape", &kb()), RouterViewAction::Close);
+    }
+
+    #[test]
+    fn preview_tier_never_uses_xhigh() {
+        let dir = tempfile::tempdir().unwrap();
+        let view = RouterView::open_in(dir.path().to_path_buf(), None, false);
+        for tier in ["fast", "balanced", "strong", "frontier"] {
+            let (_, thinking, _) = view.preview_tier(tier);
+            assert_ne!(thinking, "xhigh", "tier {tier} must never use xhigh");
+        }
+        assert!(CATALOG.iter().all(|c| c.thinking != "xhigh"));
     }
 }

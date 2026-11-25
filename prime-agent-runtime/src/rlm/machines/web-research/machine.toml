@@ -1,0 +1,64 @@
+format = 1
+name = "web-research"
+version = 1
+description = "Exa-inspired multi-step web research: query decomposition, parallel neural/open-API highlight retrieval, dual primary+critical investigation, claim verification with bounded gap-fill, and cited synthesis."
+
+[params]
+query = { type = "text", description = "Research question, technical comparison, or literature survey prompt" }
+
+[run]
+budget = "30m"
+max_parallel = 4
+max_transitions = 24
+failure_policy = "escalate"
+
+[roles]
+planner = { model = "router", thinking = "medium" }
+researcher-primary = { model = "router", thinking = "high" }
+researcher-critical = { model = "router", thinking = "medium" }
+verifier = { model = "router", thinking = "high" }
+synthesizer = { model = "router", thinking = "high" }
+
+[states.decompose]
+entry = true
+max_entries = 2
+agent = { role = "planner", prompt = "prompts/decompose.md" }
+inputs = { prior_gaps = "verify.gaps?" }
+outputs = { plan = "text", queries = "json" }
+next = "retrieve"
+
+[states.retrieve]
+max_entries = 2
+kind = "python"
+run = "nodes/search.py:retrieve"
+inputs = { queries = "decompose.queries", prior_urls = "verify.seen_urls?" }
+outputs = { evidence = "text", urls = "json", backend = "text" }
+next = ["investigate-primary", "investigate-critical"]
+
+[states.investigate-primary]
+max_entries = 2
+agent = { role = "researcher-primary", prompt = "prompts/investigate_primary.md" }
+inputs = { plan = "decompose.plan", evidence = "retrieve.evidence", backend = "retrieve.backend", prior_gaps = "verify.gaps?" }
+outputs = { findings = "text" }
+next = "verify"
+
+[states.investigate-critical]
+max_entries = 2
+agent = { role = "researcher-critical", prompt = "prompts/investigate_critical.md" }
+inputs = { plan = "decompose.plan", evidence = "retrieve.evidence", backend = "retrieve.backend", prior_gaps = "verify.gaps?" }
+outputs = { findings = "text" }
+next = "verify"
+
+[states.verify]
+max_entries = 2
+agent = { role = "verifier", prompt = "prompts/verify.md" }
+join = ["investigate-primary", "investigate-critical"]
+inputs = { plan = "decompose.plan", primary = "investigate-primary.findings", critical = "investigate-critical.findings", retrieved_urls = "retrieve.urls" }
+outputs = { sufficient = "bool", gaps = "text", verified_dossier = "text", seen_urls = "json" }
+route = { on = "sufficient", true = "synthesize", false = "decompose" }
+
+[states.synthesize]
+max_entries = 1
+agent = { role = "synthesizer", prompt = "prompts/synthesize.md" }
+inputs = { plan = "decompose.plan", dossier = "verify.verified_dossier", gaps = "verify.gaps" }
+outputs = { report = "text", sources = "json" }

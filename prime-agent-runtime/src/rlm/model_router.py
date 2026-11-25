@@ -30,7 +30,7 @@ TIER_THINKING: dict[str, str] = {
     "fast": "low",
     "balanced": "medium",
     "strong": "high",
-    "frontier": "xhigh",
+    "frontier": "high",
 }
 
 SOFT_THRESHOLD = 90.0
@@ -153,10 +153,10 @@ class ModelCandidate:
 # Relative output prices keep the ladder frugal inside a tier. The same model
 # can sit at more than one tier when only the thinking effort changes.
 CATALOG: tuple[ModelCandidate, ...] = (
-    ModelCandidate("anthropic/claude-opus-5-5", "frontier", "claude", "claude", 25.0, "xhigh"),
-    ModelCandidate("openai-codex/gpt-5.5", "frontier", "codex", "codex", 15.0, "xhigh"),
-    ModelCandidate("openai-codex/gpt-6.1-sol", "frontier", "codex", "codex", 16.0, "xhigh"),
-    ModelCandidate("antigravity/gemini-4-neon", "frontier", "antigravity-gemini", "antigravity", 15.0, "xhigh"),
+    ModelCandidate("anthropic/claude-opus-5-5", "frontier", "claude", "claude", 25.0, "high"),
+    ModelCandidate("openai-codex/gpt-5.5", "frontier", "codex", "codex", 15.0, "high"),
+    ModelCandidate("openai-codex/gpt-6.1-sol", "frontier", "codex", "codex", 16.0, "high"),
+    ModelCandidate("antigravity/gemini-4-neon", "frontier", "antigravity-gemini", "antigravity", 15.0, "high"),
     ModelCandidate("antigravity/claude-opus-5-5", "frontier", "antigravity-claude-gpt", "antigravity", 25.0, "high"),
     ModelCandidate("cursor/claude-opus-5-5", "frontier", "cursor-third-party", "cursor", 25.0, "high"),
     ModelCandidate("anthropic/claude-sonnet-5-5", "strong", "claude", "claude", 15.0, "high"),
@@ -435,6 +435,10 @@ class RouteDecision:
     fallbacks_tried: tuple[str, ...] = ()
     exhausted: bool = False
     reset_hint: str = ""
+
+    def __post_init__(self) -> None:
+        if isinstance(self.thinking, str) and self.thinking.strip().lower() == "xhigh":
+            object.__setattr__(self, "thinking", "high")
 
 
 def router_mode() -> str:

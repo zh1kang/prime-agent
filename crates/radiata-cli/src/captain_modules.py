@@ -897,5 +897,5 @@ def specialist_menu(p):
         (f"\nProject specialists:{listed}\n" if rows else " No project specialists yet. ")
         + "Write a specialist with specialist-write(id,name,description,model,thinking,prompt) when the project needs an expert role, for example a theory verifier. "
         "Give one to a crew thread with delegate(specialist=id,...); put one in a factory state with factory-use-specialist(name,specialist,states). "
-        "factory-modules lists shared parts such as review-triad, sanitize-diff, and validate; add one with factory-add-module(name,module,wire,after). "
+        "factory-modules lists shared parts such as web-research, review-triad, sanitize-diff, and validate; add one with factory-add-module(name,module,wire,after). "
     )

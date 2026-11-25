@@ -185,7 +185,20 @@ class ClassifyTaskTest(unittest.TestCase):
         for prompt, state_id, role in cases:
             profile = classify_task(prompt=prompt, state_id=state_id, role=role)
             self.assertEqual(profile.tier, "frontier", prompt)
-            self.assertEqual(profile.thinking, "xhigh")
+            self.assertEqual(profile.thinking, "high")
+            self.assertNotEqual(profile.thinking, "xhigh")
+
+    def test_router_never_emits_xhigh_even_when_pinned(self) -> None:
+        self.assertTrue(all(c.thinking != "xhigh" for c in model_router.CATALOG))
+        self.assertTrue(all(v != "xhigh" for v in model_router.TIER_THINKING.values()))
+        decision = model_router.RouteDecision(
+            model="anthropic/claude-opus-5-5",
+            thinking="xhigh",
+            reason="pinned",
+            tier="frontier",
+            rerouted=False,
+        )
+        self.assertEqual(decision.thinking, "high")
 
     def test_retry_escalates_one_tier_at_a_time(self) -> None:
         prompt = "fix the typo in the changelog"
@@ -389,7 +402,7 @@ class PinnedTierAndQuotaAwareTest(unittest.TestCase):
         self.assertTrue(admission.rerouted)
         self.assertEqual(admission.tier, "frontier")
         self.assertEqual(admission.model, "antigravity/gemini-4-neon")
-        self.assertEqual(admission.thinking, "xhigh")
+        self.assertEqual(admission.thinking, "high")
 
         healthy = self._snapshot({"codex": 10, "claude": 10, "antigravity-gemini": 10, "cursor": 5})
         after_failure = route_model(
@@ -633,7 +646,7 @@ class BriefTest(unittest.TestCase):
         self.assertIn("codex 100% used", text)
         self.assertIn("HARD", text)
         self.assertIn("cursor-third-party 100% used", text)
-        self.assertIn("frontier: antigravity/gemini-4-neon xhigh", text)
+        self.assertIn("frontier: antigravity/gemini-4-neon high", text)
         self.assertIn("fast: antigravity/gemini-3.8-flash low", text)
         self.assertIn("Project spend: $12.50 (in 1000, out 250).", text)
         self.assertIn("Reserve frontier", text)
@@ -1190,7 +1203,7 @@ class RampRouterV2Tests(unittest.TestCase):
                     "anthropic/claude-opus-5-5", "high", prompt="ok go ahead", role="captain", state_id="captain"
                 )
                 self.assertEqual(model, "antigravity/gemini-4-neon")
-                self.assertEqual(thinking, "xhigh")
+                self.assertEqual(thinking, "high")
                 self.assertIsNotNone(note)
                 self.assertIn("antigravity/gemini-4-neon", note)
 
