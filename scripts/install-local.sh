@@ -4,13 +4,36 @@ set -eu
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 REPO="${PA_LOCAL_REPO:-$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)}"
 DEST="${PA_HARNESS_DIR:-$HOME/.local/share/pa-harness}"
-BIN_SRC="$REPO/target/debug/prime-agent"
 BIN_DST="$DEST/prime-agent"
+
+# PA_LOCAL_BIN names the binary to install. Otherwise pick the newest build
+# across local, release, and debug profiles so an older profile never shadows
+# a fresh build.
+if [ -n "${PA_LOCAL_BIN:-}" ]; then
+    BIN_SRC="$PA_LOCAL_BIN"
+else
+    BIN_SRC=""
+    for candidate in \
+        "$REPO/target/local/prime-agent" \
+        "$REPO/target/release/prime-agent" \
+        "$REPO/target/debug/prime-agent"; do
+        if [ -f "$candidate" ]; then
+            if [ -z "$BIN_SRC" ] || [ "$candidate" -nt "$BIN_SRC" ]; then
+                BIN_SRC="$candidate"
+            fi
+        fi
+    done
+    if [ -z "$BIN_SRC" ]; then
+        echo "install-local: no built binary under $REPO/target/{local,release,debug}; run: cargo build --profile local -p pa-cli" >&2
+        exit 1
+    fi
+fi
 
 if [ ! -f "$BIN_SRC" ]; then
     echo "install-local: missing built binary at $BIN_SRC" >&2
     exit 1
 fi
+echo "install-local: installing $BIN_SRC"
 
 mkdir -p "$DEST"
 
@@ -21,7 +44,7 @@ trap 'rm -f "$TMP_BIN"' EXIT INT TERM
 cp "$BIN_SRC" "$TMP_BIN"
 chmod 755 "$TMP_BIN"
 if command -v codesign >/dev/null 2>&1; then
-    codesign -s - --force "$TMP_BIN" >/dev/null 2>&1
+    codesign -s - --force "$TMP_BIN" >/dev/null
 fi
 mv -f "$TMP_BIN" "$BIN_DST"
 trap - EXIT INT TERM
@@ -38,6 +61,9 @@ if [ -d "$REPO/prime-agent-runtime/src" ]; then
 fi
 
 if [ "${1:-}" = "--restart" ]; then
-    "$HOME/.local/bin/radiata" shutdown >/dev/null 2>&1 || true
+    RADIATA_BIN="$(command -v radiata 2>/dev/null || echo "$HOME/.local/bin/radiata")"
+    if [ -x "$RADIATA_BIN" ]; then
+        "$RADIATA_BIN" shutdown >/dev/null 2>&1 || true
+    fi
     pkill -f "thread captain watch" >/dev/null 2>&1 || true
 fi

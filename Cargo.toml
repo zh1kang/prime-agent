@@ -156,3 +156,15 @@ debug = false
 lto = "thin"
 codegen-units = 4
 debug = "line-tables-only"
+
+# Local installs (`cargo build --profile local`, picked up by
+# scripts/install-local.sh): release optimization without LTO, with more
+# codegen units and incremental reuse, so a rebuild after a small change
+# stays fast while the TUI and daemon run at optimized speed. Not a
+# shipping profile: the release pipeline keeps [profile.release].
+[profile.local]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
+debug = "line-tables-only"

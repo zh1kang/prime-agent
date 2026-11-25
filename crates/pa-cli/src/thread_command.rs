@@ -362,44 +362,133 @@ fn ensure_thread(id: Uuid, provider: &str) -> Result<()> {
     Ok(())
 }
 
+/// The Captain program: its Python modules joined in load order.
+const CAPTAIN_SOURCE: &str = concat!(
+    include_str!("captain_backend.py"),
+    "\n",
+    include_str!("machine_catalog.py"),
+    "\n",
+    include_str!("captain_snapshots.py"),
+    "\n",
+    include_str!("captain_runs.py"),
+    "\n",
+    include_str!("captain_wake.py"),
+    "\n",
+    include_str!("captain_schedules.py"),
+    "\n",
+    include_str!("captain_router.py"),
+    "\n",
+    include_str!("captain_jobs.py"),
+    "\n",
+    include_str!("captain_factories.py"),
+    "\n",
+    include_str!("captain_modules.py"),
+    "\n",
+    include_str!("captain_main.py")
+);
+
+/// The environment variable that hands the Captain module folder to the import line. The
+/// import line removes it, so the Captain's own child processes do not inherit it.
+const CAPTAIN_CODE_DIR_ENV: &str = "PA_CAPTAIN_CODE_DIR";
+
+/// A cached Captain module older than this, and not the current one, is removed.
+const CAPTAIN_CODE_MAX_AGE: std::time::Duration = std::time::Duration::from_hours(7 * 24);
+
 fn run_captain(args: &[&str]) -> Result<()> {
     let python = std::env::var_os("PA_CAPTAIN_PYTHON")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from("python3"));
     let mut command = std::process::Command::new(python);
-    command
-        .args([
-            "-I",
-            "-c",
-            concat!(
-                include_str!("captain_backend.py"),
-                "\n",
-                include_str!("machine_catalog.py"),
-                "\n",
-                include_str!("captain_snapshots.py"),
-                "\n",
-                include_str!("captain_runs.py"),
-                "\n",
-                include_str!("captain_wake.py"),
-                "\n",
-                include_str!("captain_schedules.py"),
-                "\n",
-                include_str!("captain_router.py"),
-                "\n",
-                include_str!("captain_jobs.py"),
-                "\n",
-                include_str!("captain_factories.py"),
-                "\n",
-                include_str!("captain_modules.py"),
-                "\n",
-                include_str!("captain_main.py")
-            ),
-        ])
-        .arg(std::env::current_exe()?)
-        .args(args);
+    command.arg("-I");
+    // Importing the program from a file lets Python reuse its compiled bytecode from
+    // __pycache__; `-c` would compile the whole program on every Captain process.
+    if let Some((dir, module)) = captain_hub().and_then(|hub| captain_module(&hub).ok()) {
+        command
+            .env(CAPTAIN_CODE_DIR_ENV, dir)
+            .arg("-c")
+            .arg(format!(
+                "import os, sys; sys.path.insert(0, os.environ.pop({CAPTAIN_CODE_DIR_ENV:?})); import {module}"
+            ));
+    } else {
+        command.args(["-c", CAPTAIN_SOURCE]);
+    }
+    command.arg(std::env::current_exe()?).args(args);
     let status = command.status().context("Captain requires Python 3")?;
     ensure!(status.success(), "Captain exited with {status}");
     Ok(())
+}
+
+/// The Captain home, resolved as `captain_backend.py` resolves `HUB`.
+fn captain_hub() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let defaults: Vec<std::path::PathBuf> = home
+        .iter()
+        .flat_map(|home| [home.join(".prime/harness"), home.join(".prime/agent")])
+        .map(|dir| dir.canonicalize().unwrap_or(dir))
+        .collect();
+    let custom = std::env::var_os("PRIME_AGENT_CODING_AGENT_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(std::path::PathBuf::from)
+        .filter(|dir| !defaults.contains(&dir.canonicalize().unwrap_or_else(|_| dir.clone())));
+    std::env::var_os("PA_CAPTAIN_HOME")
+        .filter(|dir| !dir.is_empty())
+        .map(std::path::PathBuf::from)
+        .or(custom)
+        .or_else(|| home.map(|home| home.join(".prime/harness")))
+}
+
+/// Write the Captain program once per content hash to `<hub>/captains/.code/captain_<hash>.py`
+/// and return (folder, module name). The file is written atomically and never rewritten, so
+/// Python's bytecode cache for it stays valid.
+fn captain_module(hub: &Path) -> io::Result<(std::path::PathBuf, String)> {
+    // FNV-1a: a stable content hash without a hashing dependency; it names the file only.
+    let hash = CAPTAIN_SOURCE
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+        });
+    let module = format!("captain_{hash:016x}");
+    let dir = hub.join("captains").join(".code");
+    let file = dir.join(format!("{module}.py"));
+    let current =
+        std::fs::metadata(&file).is_ok_and(|meta| meta.len() == CAPTAIN_SOURCE.len() as u64);
+    if !current {
+        std::fs::create_dir_all(&dir)?;
+        let staged = dir.join(format!(".{module}.{}.tmp", std::process::id()));
+        std::fs::write(&staged, CAPTAIN_SOURCE)?;
+        if let Err(error) = std::fs::rename(&staged, &file) {
+            let _ = std::fs::remove_file(&staged);
+            return Err(error);
+        }
+        prune_captain_modules(&dir, &module);
+    }
+    Ok((dir, module))
+}
+
+/// Remove Captain modules and their bytecode that an older pa wrote and has not used for
+/// `CAPTAIN_CODE_MAX_AGE`. A failure leaves the files; they are only disk space.
+fn prune_captain_modules(dir: &Path, current: &str) {
+    for folder in [dir.to_path_buf(), dir.join("__pycache__")] {
+        let Ok(entries) = std::fs::read_dir(&folder) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with("captain_") || name.starts_with(current) {
+                continue;
+            }
+            let old = entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age > CAPTAIN_CODE_MAX_AGE);
+            if old {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
 }
 
 fn import_thread(store: &Store, provider: &str, path: &str, context_only: bool) -> Result<Uuid> {

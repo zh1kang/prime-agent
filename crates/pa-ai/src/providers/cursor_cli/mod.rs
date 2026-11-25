@@ -22,6 +22,7 @@ use crate::event_stream::{
     create_assistant_message_event_stream, AssistantMessageEventStream, AssistantMessageEventWriter,
 };
 use crate::providers::antigravity::tool_progress_line;
+use crate::providers::cli_model_probe as probe;
 use crate::registry::Provider;
 use crate::types::{
     zero_model_cost, AssistantContent, AssistantMessage, AssistantMessageEvent, Context,
@@ -39,6 +40,8 @@ pub const CURSOR_PROVIDER: &str = "cursor";
 pub const CURSOR_BASE_URL: &str = "cursor://local";
 
 const MODEL_CACHE_TTL: Duration = Duration::from_secs(300);
+/// The cross-process copy of the last `--list-models` listing, under `<agent dir>/cache/`.
+const MODEL_DISK_CACHE: &str = "cursor-models.json";
 
 const ALL_LEVELS: [ModelThinkingLevel; 7] = [
     ModelThinkingLevel::Off,
@@ -185,33 +188,8 @@ pub fn parse_auth_status(raw: &str) -> Option<CursorCliAuthStatus> {
 #[must_use]
 pub fn auth_status() -> Option<CursorCliAuthStatus> {
     let bin = cursor_bin()?;
-    let mut child = std::process::Command::new(bin)
-        .arg("status")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?;
-    let deadline = Instant::now() + Duration::from_secs(4);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
-    }
-    let output = child.wait_with_output().ok()?;
-    let combined = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let output = probe::run_bounded(&bin, &["status"], Duration::from_secs(4))?;
+    let combined = format!("{}\n{}", output.stdout, output.stderr);
     parse_auth_status(&combined)
 }
 
@@ -515,16 +493,37 @@ pub fn refresh_models(force: bool) -> Vec<Model> {
             }
         }
     }
-    let output = std::process::Command::new(bin)
-        .arg("--list-models")
-        .stdin(Stdio::null())
-        .output();
-    if let Ok(output) = output {
-        if output.status.success() {
-            let parsed = parse_models_output(&String::from_utf8_lossy(&output.stdout));
+    let disk_cache = probe::cache_path(MODEL_DISK_CACHE);
+    if !force {
+        if let Some((stdout, age)) = disk_cache
+            .as_deref()
+            .and_then(|path| probe::read_cached(path, &bin, MODEL_CACHE_TTL))
+        {
+            let parsed = parse_models_output(&stdout);
+            if !parsed.is_empty() {
+                if let Ok(mut guard) = model_cache().lock() {
+                    *guard = Some((probe::fetched_instant(age), parsed.clone()));
+                }
+                return parsed;
+            }
+        }
+    }
+    let timeout = if force {
+        probe::FORCE_PROBE_TIMEOUT
+    } else {
+        probe::PROBE_TIMEOUT
+    };
+    if let Some(output) = probe::run_bounded(&bin, &["--list-models"], timeout) {
+        if output.success {
+            let parsed = parse_models_output(&output.stdout);
             if !parsed.is_empty() {
                 if let Ok(mut guard) = model_cache().lock() {
                     *guard = Some((Instant::now(), parsed.clone()));
+                }
+                if let Some(path) = disk_cache {
+                    // The disk copy only spares the next process a probe; the live listing
+                    // stands without it.
+                    let _ = probe::write_cached(&path, &bin, &output.stdout);
                 }
                 return parsed;
             }

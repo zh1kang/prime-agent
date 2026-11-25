@@ -151,18 +151,19 @@ pub fn parse_auth_status(raw: &str) -> Option<ClaudeCliAuthStatus> {
     })
 }
 
-/// Runs `claude auth status` without API-key overrides. Returns `None` when the CLI is
-/// missing, fails to run, or prints output that is not a status object.
+/// Runs `claude auth status` without API-key overrides (bounded by `PROBE_TIMEOUT`).
+/// Returns `None` when the CLI is missing, times out, fails to run, or prints output
+/// that is not a status object.
 #[must_use]
 pub fn auth_status() -> Option<ClaudeCliAuthStatus> {
     let bin = claude_bin()?;
     let mut cmd = std::process::Command::new(bin);
-    remove_api_key_env(&mut cmd)
-        .args(["auth", "status"])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null());
-    let output = cmd.output().ok()?;
-    parse_auth_status(&String::from_utf8_lossy(&output.stdout))
+    remove_api_key_env(&mut cmd).args(["auth", "status"]);
+    let output = super::cli_model_probe::run_command_bounded(
+        cmd,
+        super::cli_model_probe::PROBE_TIMEOUT,
+    )?;
+    parse_auth_status(&output.stdout)
 }
 
 fn effort_for_level(model: &Model, level: Option<ModelThinkingLevel>) -> Option<&'static str> {

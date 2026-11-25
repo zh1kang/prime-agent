@@ -108,9 +108,6 @@ struct LocalCliProviders {
     cursor: bool,
 }
 
-/// Under a stored xAI subscription the provider's models switch onto the
-/// openai-responses API with the subscription thinking maps and
-/// `supportsLongCacheRetention: false` compat.
 /// A non-empty Anthropic key that is not a Claude subscription OAuth token.
 fn is_real_anthropic_api_key(key: &str) -> bool {
     !key.trim().is_empty() && !key.contains("sk-ant-oat")
@@ -126,6 +123,9 @@ fn ambient_anthropic_api_key_opted_in(opt_in: Option<&str>, key: Option<&str>) -
     opted_in && key.is_some_and(is_real_anthropic_api_key)
 }
 
+/// Under a stored xAI subscription the provider's models switch onto the
+/// openai-responses API with the subscription thinking maps and
+/// `supportsLongCacheRetention: false` compat.
 fn xai_subscription_model(model: &Model) -> Model {
     let mut adapted = model.clone();
     adapted.api = "openai-responses".to_string();
@@ -701,13 +701,19 @@ impl ModelRegistry {
         self.catalog
             .refresh_with_credentials(force, credentials.as_ref())
             .await;
-        if self.local_cli.antigravity {
-            let _ = tokio::task::spawn_blocking(move || pa_ai::antigravity::refresh_models(force))
-                .await;
+        // The two CLI probes are independent processes: run them side by side.
+        let antigravity = self.local_cli.antigravity.then(|| {
+            tokio::task::spawn_blocking(move || pa_ai::antigravity::refresh_models(force))
+        });
+        let cursor = self
+            .local_cli
+            .cursor
+            .then(|| tokio::task::spawn_blocking(move || pa_ai::cursor_cli::refresh_models(force)));
+        if let Some(task) = antigravity {
+            let _ = task.await;
         }
-        if self.local_cli.cursor {
-            let _ =
-                tokio::task::spawn_blocking(move || pa_ai::cursor_cli::refresh_models(force)).await;
+        if let Some(task) = cursor {
+            let _ = task.await;
         }
         self.load_models();
         self.get_available().into_iter().cloned().collect()

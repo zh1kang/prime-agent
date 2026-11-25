@@ -20,6 +20,7 @@ use crate::cli_pricing::{apply_estimated_cost, list_price_for_model, reported_co
 use crate::event_stream::{
     create_assistant_message_event_stream, AssistantMessageEventStream, AssistantMessageEventWriter,
 };
+use crate::providers::cli_model_probe as probe;
 use crate::registry::Provider;
 use crate::types::{
     zero_model_cost, AssistantContent, AssistantMessage, AssistantMessageEvent, Context,
@@ -276,6 +277,8 @@ pub const ANTIGRAVITY_API: &str = "antigravity-cli";
 pub const ANTIGRAVITY_PROVIDER: &str = "antigravity";
 
 const MODEL_CACHE_TTL: Duration = Duration::from_secs(300);
+/// The cross-process copy of the last `agy models` listing, under `<agent dir>/cache/`.
+const MODEL_DISK_CACHE: &str = "antigravity-models.json";
 
 #[derive(Clone)]
 struct CachedConversation {
@@ -674,6 +677,7 @@ pub fn parse_auth_models_status(
 /// Check whether the installed `agy` / `antigravity` CLI has an active Google session.
 ///
 /// Reuses the warm process model cache unless `force` is true so `/login` stays fast.
+/// `None` when no CLI is installed or the check did not finish, so the state is unknown.
 #[must_use]
 pub fn auth_status(force: bool) -> Option<AntigravityCliAuthStatus> {
     let bin = antigravity_bin()?;
@@ -690,40 +694,22 @@ pub fn auth_status(force: bool) -> Option<AntigravityCliAuthStatus> {
             }
         }
     }
-    let mut child = std::process::Command::new(bin)
-        .arg("models")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Some(AntigravityCliAuthStatus {
-                    logged_in: false,
-                    model_count: 0,
-                    detail: Some("agy models timed out".to_string()),
-                });
-            }
-        }
-    }
-    let output = child.wait_with_output().ok()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let status = parse_auth_models_status(&stdout, &stderr, output.status.success());
+    // A timeout leaves the session state unknown, not signed out.
+    let timeout = if force {
+        probe::FORCE_PROBE_TIMEOUT
+    } else {
+        probe::PROBE_TIMEOUT
+    };
+    let output = probe::run_bounded(&bin, &["models"], timeout)?;
+    let status = parse_auth_models_status(&output.stdout, &output.stderr, output.success);
     if status.logged_in {
-        let parsed = parse_models_output(&stdout);
+        let parsed = parse_models_output(&output.stdout);
         if !parsed.is_empty() {
             if let Ok(mut guard) = model_cache().lock() {
                 *guard = Some((Instant::now(), parsed));
+            }
+            if let Some(path) = probe::cache_path(MODEL_DISK_CACHE) {
+                let _ = probe::write_cached(&path, &bin, &output.stdout);
             }
         }
     }
@@ -745,16 +731,37 @@ pub fn refresh_models(force: bool) -> Vec<Model> {
             }
         }
     }
-    let output = std::process::Command::new(bin)
-        .arg("models")
-        .stdin(Stdio::null())
-        .output();
-    if let Ok(output) = output {
-        if output.status.success() {
-            let parsed = parse_models_output(&String::from_utf8_lossy(&output.stdout));
+    let disk_cache = probe::cache_path(MODEL_DISK_CACHE);
+    if !force {
+        if let Some((stdout, age)) = disk_cache
+            .as_deref()
+            .and_then(|path| probe::read_cached(path, &bin, MODEL_CACHE_TTL))
+        {
+            let parsed = parse_models_output(&stdout);
+            if !parsed.is_empty() {
+                if let Ok(mut guard) = model_cache().lock() {
+                    *guard = Some((probe::fetched_instant(age), parsed.clone()));
+                }
+                return parsed;
+            }
+        }
+    }
+    let timeout = if force {
+        probe::FORCE_PROBE_TIMEOUT
+    } else {
+        probe::PROBE_TIMEOUT
+    };
+    if let Some(output) = probe::run_bounded(&bin, &["models"], timeout) {
+        if output.success {
+            let parsed = parse_models_output(&output.stdout);
             if !parsed.is_empty() {
                 if let Ok(mut guard) = model_cache().lock() {
                     *guard = Some((Instant::now(), parsed.clone()));
+                }
+                if let Some(path) = disk_cache {
+                    // The disk copy only spares the next process a probe; the live listing
+                    // stands without it.
+                    let _ = probe::write_cached(&path, &bin, &output.stdout);
                 }
                 return parsed;
             }

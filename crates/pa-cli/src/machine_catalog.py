@@ -10,10 +10,86 @@ def personal_machines(agent=None):
     return (Path(agent).expanduser() if agent else Path.home() / ".prime/agent") / "machines"
 
 
+FACTORY_LISTING_CACHE = "factory-listing-cache.json"
+MACHINE_FILES = ("*/machine.toml", "*/captain.toml", "*/MACHINE.md")
+
+
+def _mtime_ns(path):
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+def _listing_stamp(pa, agent, levels):
+    """What a factory listing depends on: pa (and its mtime), the agent home, and the mtimes
+    of every machine directory and machine file it read. Upgrading pa or adding, removing, or
+    editing a machine changes it."""
+    roots = {*levels, str(personal_machines(agent))}
+    if os.getenv("PRIME_AGENT_MACHINES_DIR"):
+        roots.add(os.environ["PRIME_AGENT_MACHINES_DIR"])
+    files = []
+    for root in sorted(roots):
+        folder = Path(root)
+        files.append([root, _mtime_ns(folder)])
+        for pattern in MACHINE_FILES:
+            files.extend([str(path), _mtime_ns(path)] for path in folder.glob(pattern))
+    return [str(pa), _mtime_ns(Path(pa)), os.getenv("PRIME_AGENT_MACHINES_DIR") or "", sorted(files)]
+
+
+def _listing_levels(listing):
+    rows = listing.get("levels") if isinstance(listing, dict) else None
+    return sorted(row["path"] for row in rows or () if isinstance(row, dict) and isinstance(row.get("path"), str))
+
+
+_LISTING_MEM = {}  # (pa, agent) -> (stamp, levels, listing_text)
+
+
+def _factory_listing_text(pa, agent):
+    """The raw `pa factory list --json` reply, cached on disk in the agent home under
+    captains/ and reused while _listing_stamp is unchanged."""
+    mem_key = (str(pa), str(agent) if agent is not None else None)
+    mem = _LISTING_MEM.get(mem_key)
+    if mem is not None:
+        m_stamp, m_levels, m_text = mem
+        if m_stamp == _listing_stamp(pa, agent, m_levels):
+            return m_text
+    cache = personal_machines(agent).parent / "captains" / FACTORY_LISTING_CACHE
+    try:
+        cached = json.loads(cache.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        cached = None
+    levels = []
+    if isinstance(cached, dict) and isinstance(cached.get("listing"), str):
+        try:
+            levels = _listing_levels(json.loads(cached["listing"]))
+        except ValueError:
+            levels = []
+        current_stamp = _listing_stamp(pa, agent, levels)
+        if cached.get("stamp") == current_stamp:
+            _LISTING_MEM[mem_key] = (current_stamp, levels, cached["listing"])
+            return cached["listing"]
+    # The stamp is taken before the listing, so a machine edited meanwhile changes it again.
+    stamp = _listing_stamp(pa, agent, levels)
+    env = {**os.environ, "PRIME_AGENT_CODING_AGENT_DIR": str(agent)} if agent else None
+    text = subprocess.check_output([pa, "factory", "list", "--json"], text=True, env=env)
+    listed = _listing_levels(json.loads(text))
+    if listed != levels:
+        stamp = _listing_stamp(pa, agent, listed)
+    _LISTING_MEM[mem_key] = (stamp, listed, text)
+    try:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        temporary = cache.with_name(f".{cache.name}.{os.getpid()}.tmp")
+        temporary.write_text(json.dumps({"stamp": stamp, "listing": text}), encoding="utf-8")
+        os.replace(temporary, cache)
+    except OSError:
+        pass
+    return text
+
+
 def factory_listing(pa, agent=None):
     """The `pa factory list --json` reply. `agent` selects the agent home."""
-    env = {**os.environ, "PRIME_AGENT_CODING_AGENT_DIR": str(agent)} if agent else None
-    return json.loads(subprocess.check_output([pa, "factory", "list", "--json"], text=True, env=env))
+    return json.loads(_factory_listing_text(pa, agent))
 
 
 @functools.lru_cache(maxsize=1)

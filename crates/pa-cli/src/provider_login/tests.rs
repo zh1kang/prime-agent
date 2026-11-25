@@ -467,3 +467,207 @@ async fn a_stored_web_search_key_pairs_with_the_logout_row() {
         );
     assert!(auth.logout_options().await.is_empty());
 }
+
+#[cfg(unix)]
+/// A fake `agy` for the Antigravity sign-in: `acp` speaks the two ACP calls the flow sends,
+/// writing the CLI's sign-in instructions and link to stderr; each run logs its arguments.
+fn fake_agy(dir: &Path, acp_body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let bin = dir.join("agy");
+    let log = dir.join("agy.log");
+    std::fs::write(
+        &bin,
+        format!(
+            "#!/bin/sh\necho \"$@\" >> '{log}'\nif [ \"$1\" = acp ]; then\n{acp_body}\nfi\nexit 3\n",
+            log = log.display()
+        ),
+    )
+    .expect("write fake agy");
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    bin
+}
+
+const FAKE_ACP_SIGN_IN: &str = r#"read init
+echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"authMethods":[{"id":"oauth-personal","name":"Log in with Google"}]}}'
+read auth
+case "$auth" in *'"methodId":"oauth-personal"'*) ;; *) exit 9 ;; esac
+echo 'Open the following URL in your local browser to authenticate:' >&2
+echo 'https://accounts.google.com/o/oauth2/auth?client_id=test' >&2
+sleep 0.2
+echo '{"jsonrpc":"2.0","id":2,"result":{}}'
+cat >/dev/null"#;
+
+fn panel_requests(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<pa_tui::auth_panel::AuthPanelRequest>,
+) -> (Vec<String>, Vec<String>) {
+    let mut progress = Vec::new();
+    let mut urls = Vec::new();
+    while let Ok(request) = rx.try_recv() {
+        match request {
+            pa_tui::auth_panel::AuthPanelRequest::Progress { message, .. } => {
+                progress.push(message)
+            }
+            pa_tui::auth_panel::AuthPanelRequest::AuthUrl { url, .. } => urls.push(url),
+            _ => {}
+        }
+    }
+    (progress, urls)
+}
+
+fn agy_status(logged_in: bool) -> pa_ai::antigravity::AntigravityCliAuthStatus {
+    pa_ai::antigravity::AntigravityCliAuthStatus {
+        logged_in,
+        model_count: if logged_in { 4 } else { 0 },
+        detail: (!logged_in).then(|| "not signed in".to_string()),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn the_antigravity_sign_in_shows_the_link_and_verifies_the_session() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let bin = fake_agy(dir.path(), FAKE_ACP_SIGN_IN);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let panel = pa_tui::auth_panel::AuthPanelHandle::new(tx);
+    let checks = std::sync::atomic::AtomicUsize::new(0);
+    let outcome = antigravity_login_with(
+        &bin,
+        &panel,
+        || {
+            let first = checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+            Some(agy_status(!first))
+        },
+        std::time::Duration::from_secs(10),
+    );
+    let (progress, urls) = panel_requests(&mut rx);
+    assert!(
+        matches!(&outcome, ProviderAuthOutcome::Status(message) if message.starts_with("Signed in to Antigravity")),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        urls,
+        vec!["https://accounts.google.com/o/oauth2/auth?client_id=test".to_string()]
+    );
+    assert!(
+        progress
+            .iter()
+            .any(|line| line.contains("Open the following URL")),
+        "{progress:?}"
+    );
+    assert!(
+        progress
+            .iter()
+            .any(|line| line.contains("Finish it in your browser")),
+        "{progress:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn the_antigravity_sign_in_refuses_an_existing_or_unknown_session() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let bin = fake_agy(dir.path(), FAKE_ACP_SIGN_IN);
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let panel = pa_tui::auth_panel::AuthPanelHandle::new(tx);
+    let timeout = std::time::Duration::from_secs(10);
+
+    let signed_in = antigravity_login_with(&bin, &panel, || Some(agy_status(true)), timeout);
+    assert!(
+        matches!(&signed_in, ProviderAuthOutcome::Status(message) if message.starts_with("Already signed in to Antigravity")),
+        "{signed_in:?}"
+    );
+    let unknown = antigravity_login_with(&bin, &panel, || None, timeout);
+    assert!(
+        matches!(&unknown, ProviderAuthOutcome::Error(message) if message.contains("Sign-in did not start")),
+        "{unknown:?}"
+    );
+    assert!(
+        !dir.path().join("agy.log").exists(),
+        "no agy sign-in process started"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn the_antigravity_sign_in_reports_cli_failures() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let panel = pa_tui::auth_panel::AuthPanelHandle::new(tx);
+    let timeout = std::time::Duration::from_secs(10);
+    let not_signed_in = || Some(agy_status(false));
+
+    let crash = fake_agy(dir.path(), "echo 'agy: config is broken' >&2\nexit 2");
+    let outcome = antigravity_login_with(&crash, &panel, not_signed_in, timeout);
+    assert!(
+        matches!(&outcome, ProviderAuthOutcome::Error(message)
+            if message.contains("exited before the sign-in finished") && message.contains("agy: config is broken")),
+        "{outcome:?}"
+    );
+
+    let refused = fake_agy(
+        dir.path(),
+        r#"read init
+echo '{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"oauth-personal"}]}}'
+read auth
+echo '{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"failed to start OAuth process"}}'
+cat >/dev/null"#,
+    );
+    let outcome = antigravity_login_with(&refused, &panel, not_signed_in, timeout);
+    assert!(
+        matches!(&outcome, ProviderAuthOutcome::Error(message)
+            if message == "Antigravity sign-in failed: failed to start OAuth process"),
+        "{outcome:?}"
+    );
+
+    let old = fake_agy(
+        dir.path(),
+        r#"read init
+echo '{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"gemini-api-key"}]}}'
+cat >/dev/null"#,
+    );
+    let outcome = antigravity_login_with(&old, &panel, not_signed_in, timeout);
+    assert!(
+        matches!(&outcome, ProviderAuthOutcome::Error(message) if message.contains("does not offer Google sign-in")),
+        "{outcome:?}"
+    );
+
+    let missing = dir.path().join("missing-agy");
+    let outcome = antigravity_login_with(&missing, &panel, not_signed_in, timeout);
+    assert!(
+        matches!(&outcome, ProviderAuthOutcome::Error(message) if message.starts_with("Failed to start agy acp")),
+        "{outcome:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn the_antigravity_sign_in_cancels_with_the_panel() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    // The browser step never finishes: only the panel's cancel ends the flow.
+    let bin = fake_agy(
+        dir.path(),
+        r#"read init
+echo '{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"oauth-personal"}]}}'
+read auth
+sleep 30"#,
+    );
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let panel = pa_tui::auth_panel::AuthPanelHandle::new(tx);
+    let cancel = panel.cancel_flag();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+    let started = std::time::Instant::now();
+    let outcome = antigravity_login_with(
+        &bin,
+        &panel,
+        || Some(agy_status(false)),
+        std::time::Duration::from_secs(20),
+    );
+    assert!(
+        matches!(outcome, ProviderAuthOutcome::Cancelled),
+        "{outcome:?}"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+}

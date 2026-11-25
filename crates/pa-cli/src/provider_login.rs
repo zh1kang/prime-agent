@@ -883,35 +883,269 @@ fn claude_account_login(
     })
 }
 
-/// Verifies the `agy` / `antigravity` CLI Google session (forcing a live `models` check).
-fn antigravity_account_login(
-    panel: &pa_tui::auth_panel::AuthPanelHandle,
-) -> ProviderAuthOutcome {
-    if !pa_ai::antigravity::is_available() {
+/// The `agy acp` auth method for a Google account sign-in.
+const ANTIGRAVITY_LOGIN_METHOD: &str = "oauth-personal";
+/// The bound on one Antigravity sign-in: the user finishes the browser step inside it.
+const ANTIGRAVITY_LOGIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Signs in to Antigravity through the `agy acp` server's `authenticate` method.
+///
+/// A live `agy models` check runs first: an existing session is never replaced, and an
+/// unknown session state never starts a sign-in.
+fn antigravity_account_login(panel: &pa_tui::auth_panel::AuthPanelHandle) -> ProviderAuthOutcome {
+    let Some(bin) = pa_ai::antigravity::antigravity_bin() else {
         return ProviderAuthOutcome::Error(
-            "Antigravity CLI (agy) is not installed. Install Antigravity CLI and try again."
-                .into(),
+            "Antigravity CLI (agy) is not installed. Install Antigravity CLI and try again.".into(),
         );
-    }
+    };
+    antigravity_login_with(
+        &bin,
+        panel,
+        || pa_ai::antigravity::auth_status(true),
+        ANTIGRAVITY_LOGIN_TIMEOUT,
+    )
+}
+
+/// [`antigravity_account_login`] with the CLI path, the live status check, and the bound
+/// supplied by the caller.
+fn antigravity_login_with(
+    bin: &Path,
+    panel: &pa_tui::auth_panel::AuthPanelHandle,
+    status: impl Fn() -> Option<pa_ai::antigravity::AntigravityCliAuthStatus>,
+    timeout: std::time::Duration,
+) -> ProviderAuthOutcome {
     panel.progress_line("Checking Antigravity CLI (agy) account session...");
-    if let Some(status) = pa_ai::antigravity::auth_status(true) {
-        if status.logged_in {
+    match status() {
+        None => {
+            return ProviderAuthOutcome::Error(format!(
+                "Could not check the Antigravity session: `{} models` did not answer. Sign-in did not start.",
+                bin.display()
+            ));
+        }
+        Some(status) if status.logged_in => {
             return ProviderAuthOutcome::Status(format!(
-                "Signed in to Antigravity (agy CLI, {} models available). Antigravity models route through the agy CLI.",
+                "Already signed in to Antigravity (agy CLI, {} models available). To use a different account, sign out in agy first.",
                 status.model_count
             ));
         }
-        let extra = status
-            .detail
-            .map(|detail| format!(" ({detail})"))
-            .unwrap_or_default();
-        return ProviderAuthOutcome::Error(format!(
-            "Antigravity CLI (agy) is not signed in yet{extra}. Sign in via the Antigravity app or run `agy` in a terminal, then select this row again."
-        ));
+        Some(_) => {}
     }
-    ProviderAuthOutcome::Error(
-        "Could not query Antigravity CLI (agy). Ensure `agy` is signed in and try again.".into(),
-    )
+    if panel.cancelled() {
+        return ProviderAuthOutcome::Cancelled;
+    }
+
+    let mut cmd = std::process::Command::new(bin);
+    cmd.arg("acp")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    match run_antigravity_acp_login(cmd, panel, timeout) {
+        Ok(true) => {}
+        Ok(false) => return ProviderAuthOutcome::Cancelled,
+        Err(message) => return ProviderAuthOutcome::Error(message),
+    }
+    if panel.cancelled() {
+        return ProviderAuthOutcome::Cancelled;
+    }
+    match status() {
+        Some(status) if status.logged_in => ProviderAuthOutcome::Status(format!(
+            "Signed in to Antigravity (agy CLI, {} models available). Antigravity models route through the agy CLI.",
+            status.model_count
+        )),
+        status => {
+            let detail = status
+                .and_then(|status| status.detail)
+                .map(|detail| format!(" ({detail})"))
+                .unwrap_or_default();
+            ProviderAuthOutcome::Error(format!(
+                "Antigravity sign-in finished, but `agy models` does not report a signed-in account{detail}."
+            ))
+        }
+    }
+}
+
+/// One line from the `agy acp` child.
+enum AcpLine {
+    Stdout(String),
+    Stderr(String),
+}
+
+/// Drive `agy acp` through `initialize` and `authenticate`, forwarding sign-in links and
+/// progress into the auth panel. Returns `Ok(false)` if the user cancelled.
+fn run_antigravity_acp_login(
+    mut cmd: std::process::Command,
+    panel: &pa_tui::auth_panel::AuthPanelHandle,
+    timeout: std::time::Duration,
+) -> Result<bool, String> {
+    use std::io::Write as _;
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|error| format!("Failed to start agy acp: {error}"))?;
+    let mut stdin = child.stdin.take().expect("agy acp stdin is piped");
+    let (lines_tx, lines_rx) = std::sync::mpsc::channel::<AcpLine>();
+    let stdout = child.stdout.take().expect("agy acp stdout is piped");
+    let stderr = child.stderr.take().expect("agy acp stderr is piped");
+    for (stream, is_stdout) in [
+        (Box::new(stdout) as Box<dyn std::io::Read + Send>, true),
+        (Box::new(stderr) as Box<dyn std::io::Read + Send>, false),
+    ] {
+        let lines_tx = lines_tx.clone();
+        std::thread::spawn(move || {
+            use std::io::BufRead as _;
+            for line in std::io::BufReader::new(stream).lines() {
+                let Ok(line) = line else { break };
+                let line = if is_stdout {
+                    AcpLine::Stdout(line)
+                } else {
+                    AcpLine::Stderr(line)
+                };
+                if lines_tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    drop(lines_tx);
+
+    let stop = |child: &mut std::process::Child| {
+        let _ = child.kill();
+        let _ = child.wait();
+    };
+    let send = |stdin: &mut std::process::ChildStdin, message: serde_json::Value| {
+        writeln!(stdin, "{message}").and_then(|()| stdin.flush())
+    };
+    if let Err(error) = send(
+        &mut stdin,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "protocolVersion": 1, "clientCapabilities": {} },
+        }),
+    ) {
+        stop(&mut child);
+        return Err(format!("Failed to talk to agy acp: {error}"));
+    }
+    panel.progress_line("Starting the Antigravity sign-in...");
+
+    let deadline = std::time::Instant::now() + timeout;
+    let mut last_stderr: Option<String> = None;
+    loop {
+        if panel.cancelled() {
+            stop(&mut child);
+            return Ok(false);
+        }
+        if std::time::Instant::now() >= deadline {
+            stop(&mut child);
+            return Err(format!(
+                "Antigravity sign-in timed out after {} minutes.",
+                timeout.as_secs() / 60
+            ));
+        }
+        let line = match lines_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(line) => line,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                let exit = child
+                    .wait()
+                    .map(|exit| exit.to_string())
+                    .unwrap_or_default();
+                let detail = last_stderr
+                    .map(|line| format!(": {line}"))
+                    .unwrap_or_default();
+                return Err(format!(
+                    "agy acp exited before the sign-in finished ({exit}){detail}"
+                ));
+            }
+        };
+        let text = match &line {
+            AcpLine::Stdout(text) | AcpLine::Stderr(text) => text.trim(),
+        };
+        if text.is_empty() {
+            continue;
+        }
+        let message = match &line {
+            AcpLine::Stdout(_) => serde_json::from_str::<serde_json::Value>(text).ok(),
+            AcpLine::Stderr(_) => None,
+        };
+        let Some(message) = message else {
+            // Plain output: the CLI's sign-in instructions and link.
+            match login_url(text) {
+                Some(url) => panel.auth_url(url, Some(text)),
+                None => panel.progress_line(text),
+            }
+            if matches!(line, AcpLine::Stderr(_)) {
+                last_stderr = Some(text.to_string());
+            }
+            continue;
+        };
+        let id = message.get("id").and_then(serde_json::Value::as_i64);
+        if message.get("method").is_some() {
+            // A request from the agent: this client serves none, so answer it to keep the
+            // server from waiting. A notification may carry the sign-in link.
+            if let Some(url) = login_url(text) {
+                panel.auth_url(url, None);
+            }
+            if let Some(request_id) = message.get("id") {
+                let _ = send(
+                    &mut stdin,
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "error": { "code": -32601, "message": "method not supported by this client" },
+                    }),
+                );
+            }
+            continue;
+        }
+        if let Some(error) = message.get("error") {
+            stop(&mut child);
+            let detail = error
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown error");
+            return Err(format!("Antigravity sign-in failed: {detail}"));
+        }
+        match id {
+            Some(1) => {
+                let methods = message
+                    .pointer("/result/authMethods")
+                    .and_then(serde_json::Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let supported = methods.iter().any(|method| {
+                    method.get("id").and_then(serde_json::Value::as_str)
+                        == Some(ANTIGRAVITY_LOGIN_METHOD)
+                });
+                if !supported {
+                    stop(&mut child);
+                    return Err(
+                        "This agy version does not offer Google sign-in over ACP. Run `agy` in a terminal and sign in there, then select this row again."
+                            .into(),
+                    );
+                }
+                if let Err(error) = send(
+                    &mut stdin,
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "authenticate",
+                        "params": { "methodId": ANTIGRAVITY_LOGIN_METHOD },
+                    }),
+                ) {
+                    stop(&mut child);
+                    return Err(format!("Failed to talk to agy acp: {error}"));
+                }
+                panel.progress_line("Waiting for the Google sign-in. Finish it in your browser.");
+            }
+            Some(2) => {
+                stop(&mut child);
+                return Ok(true);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Signs in with `cursor-agent login`.
@@ -973,7 +1207,7 @@ fn run_streaming_cli_login(
     panel.progress_line(progress_banner);
 
     let (lines_tx, lines_rx) = std::sync::mpsc::channel::<String>();
-    let readers: Vec<_> = [
+    let _readers: Vec<_> = [
         child
             .stdout
             .take()
@@ -1028,11 +1262,14 @@ fn run_streaming_cli_login(
             }
         }
     };
-    for reader in readers {
-        let _ = reader.join();
-    }
-    for line in lines_rx.try_iter() {
-        forward(line);
+    // Drain any buffered lines up to a short grace window; do not block forever on reader
+    // threads in case a browser helper grandchild inherited stdout/stderr.
+    let drain_until = std::time::Instant::now() + std::time::Duration::from_millis(300);
+    while let Some(remaining) = drain_until.checked_duration_since(std::time::Instant::now()) {
+        match lines_rx.recv_timeout(remaining) {
+            Ok(line) => forward(line),
+            Err(_) => break,
+        }
     }
     Ok(Some(exit))
 }
