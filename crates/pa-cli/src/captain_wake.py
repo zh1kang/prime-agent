@@ -14,7 +14,7 @@ DEFAULT_WAKE_POLICY = {
     "interrupted": "ignore",
     "factory_done": "react",
     "factory_paused": "react",
-    "debounce_seconds": 8,
+    "debounce_seconds": 20,
 }
 
 

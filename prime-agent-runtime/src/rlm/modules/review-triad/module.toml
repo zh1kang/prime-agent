@@ -12,32 +12,32 @@ rework = { description = "The state after a rework verdict." }
 # Three model families so the reviewers don't share blind spots.
 [roles]
 reviewer-correctness = { model = "anthropic/claude-opus-5-5", thinking = "high" }
-reviewer-bugs = { model = "openai-codex/gpt-5.3-codex", thinking = "high" }
-reviewer-robustness = { model = "antigravity/gemini-4-neon", thinking = "high" }
+reviewer-bugs = { model = "openai-codex/gpt-5.3-codex", thinking = "medium" }
+reviewer-robustness = { model = "antigravity/gemini-4-neon", thinking = "medium" }
 
 [states.correctness]
-max_entries = 4
+max_entries = 2
 agent = { role = "reviewer-correctness", prompt = "prompts/correctness.md" }
-inputs = { subject = "@subject" }
+inputs = { subject = "@subject", prior_findings = "verdict.findings?" }
 outputs = { approve = "bool", findings = "text" }
 next = "verdict"
 
 [states.bugs]
-max_entries = 4
+max_entries = 2
 agent = { role = "reviewer-bugs", prompt = "prompts/bugs.md" }
-inputs = { subject = "@subject" }
+inputs = { subject = "@subject", prior_findings = "verdict.findings?" }
 outputs = { approve = "bool", findings = "text" }
 next = "verdict"
 
 [states.robustness]
-max_entries = 4
+max_entries = 2
 agent = { role = "reviewer-robustness", prompt = "prompts/robustness.md" }
-inputs = { subject = "@subject" }
+inputs = { subject = "@subject", prior_findings = "verdict.findings?" }
 outputs = { approve = "bool", findings = "text" }
 next = "verdict"
 
 [states.verdict]
-max_entries = 4
+max_entries = 2
 kind = "python"
 run = "nodes/verdict.py:merge"
 join = ["correctness", "bugs", "robustness"]

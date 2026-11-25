@@ -66,6 +66,23 @@ class VerdictMergeTest(unittest.TestCase):
         inputs = {"correctness": False, "correctness_findings": "x.py:3 crash on empty input"}
         self.assertEqual(verdict.merge(inputs), verdict.merge(dict(inputs)))
 
+    def test_low_and_nit_only_findings_converge_to_approve(self):
+        out = verdict.merge({
+            "correctness": True, "correctness_findings": "",
+            "bugs": False, "bugs_findings": "- low: `src/a.rs:10` rename local variable\n- nit: trailing comment",
+            "robustness": False, "robustness_findings": "- minor: `src/b.rs:4` could tighten docstring",
+        })
+        self.assertEqual(out["verdict"], "approve")
+        self.assertEqual(len(out["findings"].splitlines()), 3)
+
+    def test_unexplained_rejection_still_requires_rework(self):
+        out = verdict.merge({
+            "correctness": False, "correctness_findings": "",
+            "bugs": True, "bugs_findings": "",
+            "robustness": True, "robustness_findings": "",
+        })
+        self.assertEqual(out["verdict"], "rework")
+
 
 if __name__ == "__main__":
     unittest.main()

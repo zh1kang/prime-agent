@@ -59,11 +59,15 @@ def _format(finding):
 
 
 def merge(inputs):
-    approve = all(inputs.get(lens) is True for lens in LENSES)
+    all_approved = all(inputs.get(lens) is True for lens in LENSES)
     merged = {}
+    unexplained_reject = False
     for lens in LENSES:
         text = (inputs.get(lens + "_findings") or "").strip()
-        if not text or inputs.get(lens) is True:
+        if inputs.get(lens) is True:
+            continue
+        if not text:
+            unexplained_reject = True
             continue
         for item in _items(text):
             finding = _parse(item, lens)
@@ -74,5 +78,9 @@ def merge(inputs):
                 seen["lenses"].append(lens)
     rank = {"high": 0, "med": 1, "low": 2}
     ordered = sorted(merged.values(), key=lambda f: (rank[f["severity"]], f["file"], f["line"] or 0))
+    # Only high/medium defects (or an unexplained rejection) block convergence;
+    # low/minor/nit-only rejections approve while preserving the advisory notes.
+    blocking = unexplained_reject or any(f["severity"] in ("high", "med") for f in ordered)
+    approve = all_approved or not blocking
     return {"verdict": "approve" if approve else "rework",
             "findings": "\n".join(_format(f) for f in ordered)}
