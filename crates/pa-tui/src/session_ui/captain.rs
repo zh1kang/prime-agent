@@ -15,12 +15,22 @@ use crate::interactive::SessionSelection;
 use crate::session_ui::picker_viewport_rows;
 use crate::session_ui::sessions_fork::create_session;
 
+/// The background status snapshot's run state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CaptainRefresh {
+    Idle,
+    Running,
+    /// A refresh was requested while one ran: its answer may predate the change.
+    RunningStale,
+}
+
 /// One background `pa thread captain` call's result.
 pub(crate) enum CaptainUpdate {
     Snapshot(Result<Value, String>),
     Acted {
         op: String,
         done: String,
+        requested_root: Option<String>,
         result: Result<Value, String>,
     },
     Choices {
@@ -478,17 +488,32 @@ impl super::SessionUi {
 
     fn captain_act(&self, op: &str, args: Value, done: String) {
         let op_name = op.to_owned();
+        let requested_root = args
+            .get("root")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
         self.spawn_captain(vec!["act".into(), op.into()], Some(args), move |result| {
             CaptainUpdate::Acted {
                 op: op_name,
                 done,
+                requested_root,
                 result,
             }
         });
     }
 
-    pub(crate) fn refresh_captain(&self) {
-        self.spawn_captain(vec!["status".into()], None, CaptainUpdate::Snapshot);
+    /// Start a status snapshot. While one runs, a new request only marks it stale, so a slow
+    /// status under load never stacks concurrent Python processes; the landing snapshot then
+    /// starts exactly one follow-up run.
+    pub(crate) fn refresh_captain(&mut self) {
+        self.captain_refresh = match self.captain_refresh {
+            CaptainRefresh::Idle => {
+                self.spawn_captain(vec!["status".into()], None, CaptainUpdate::Snapshot);
+                CaptainRefresh::Running
+            }
+            CaptainRefresh::Running | CaptainRefresh::RunningStale => CaptainRefresh::RunningStale,
+        };
     }
 
     /// Cheap `stat`-only poll of `<hub>/captains/status/<project-id>.json`.
@@ -550,7 +575,7 @@ impl super::SessionUi {
     }
 
     /// Read the Captain records when this chat may belong to a project, for the breadcrumb.
-    pub(crate) fn refresh_captain_context(&self) {
+    pub(crate) fn refresh_captain_context(&mut self) {
         if self.session_file.is_some() && self.captain_status_watcher.has_captain() {
             self.refresh_captain();
         }
@@ -1140,6 +1165,11 @@ impl super::SessionUi {
         self.dirty = true;
         match update {
             CaptainUpdate::Snapshot(result) => {
+                let stale = self.captain_refresh == CaptainRefresh::RunningStale;
+                self.captain_refresh = CaptainRefresh::Idle;
+                if stale {
+                    self.refresh_captain();
+                }
                 self.captain_db_stamp = self.captain_status_watcher.db_stamp();
                 if let Ok(data) = &result {
                     if let Ok(snapshot) = serde_json::from_value::<CaptainSnapshot>(data.clone()) {
@@ -1169,7 +1199,14 @@ impl super::SessionUi {
                             panel.apply_snapshot(&data);
                             if let Some(query) = self.captain_focus_query.take() {
                                 if !panel.focus_project(&query) {
-                                    panel.set_notice(format!("No project matches {query}."));
+                                    if stale || self.captain_refresh != CaptainRefresh::Idle {
+                                        // A newer snapshot is already in flight (e.g. post-init
+                                        // refresh); keep the query for it instead of flashing an
+                                        // error on this older snapshot.
+                                        self.captain_focus_query = Some(query);
+                                    } else {
+                                        panel.set_notice(format!("No project matches {query}."));
+                                    }
                                 }
                             }
                             if let Some(key) = self.captain_pending_key.take() {
@@ -1202,7 +1239,12 @@ impl super::SessionUi {
                     }
                 }
             }
-            CaptainUpdate::Acted { op, done, result } => {
+            CaptainUpdate::Acted {
+                op,
+                done,
+                requested_root,
+                result,
+            } => {
                 if matches!(op.as_str(), "lead" | "steer") {
                     let error = result.as_ref().err().map(String::as_str);
                     let resent = op == "steer" && error.is_some_and(steer_unsupported);
@@ -1229,13 +1271,41 @@ impl super::SessionUi {
                             return;
                         }
                         if matches!(op.as_str(), "init" | "promote") {
-                            // The new project is this checkout's: select it, and its
-                            // unfinished setup is done.
-                            if let Some(panel) = Self::panel_mut(view) {
+                            let created_id = reply
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_owned);
+                            let created_root = reply
+                                .get("root")
+                                .and_then(Value::as_str)
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_owned);
+                            // Clear unfinished setup drafts (for cwd, requested root, and canonical created root),
+                            // even if the panel was parked or closed while `init` was running.
+                            if let Some(panel) =
+                                Self::panel_mut(view).or(self.captain_parked.as_mut())
+                            {
                                 panel.clear_draft();
+                                if let Some(root) = requested_root.as_deref() {
+                                    panel.clear_draft_for(root);
+                                }
+                                if let Some(root) = created_root.as_deref() {
+                                    panel.clear_draft_for(root);
+                                }
+                            } else {
+                                if let Some(root) = requested_root.as_deref() {
+                                    crate::captain_view::clear_saved_setup_draft(root);
+                                }
+                                if let Some(root) = created_root.as_deref() {
+                                    crate::captain_view::clear_saved_setup_draft(root);
+                                }
                             }
-                            self.captain_focus_query = Self::panel_mut(view)
-                                .map(|panel| panel.snapshot().current_root.clone());
+                            // Select the newly created project by id (falling back to root or cwd).
+                            self.captain_focus_query = created_id.or(created_root).or_else(|| {
+                                Self::panel_mut(view)
+                                    .map(|panel| panel.snapshot().current_root.clone())
+                            });
                         }
                         let mut notice = done;
                         if op == "stop" && reply["state"] == "stopping" {
@@ -1462,14 +1532,14 @@ impl super::SessionUi {
 
     /// Open a session file in this same view: the draft of the chat being left is stashed
     /// for its return, and the opened chat's own stashed draft comes back.
-    /// Open the chat a Captain action or a finished turn asked for, if any.
-    pub(crate) async fn open_pending_captain_session(
-        &mut self,
-        view: &mut AgentView,
-    ) -> anyhow::Result<()> {
-        match self.pending_captain_open.take() {
-            Some(open) => self.open_captain_session(view, open).await,
-            None => Ok(()),
+    /// Open the chat a Captain action or a finished turn asked for, if any. The open runs from a
+    /// background poll, so a failure surfaces as an error row and the current chat stays usable.
+    pub(crate) async fn open_pending_captain_session(&mut self, view: &mut AgentView) {
+        let Some(open) = self.pending_captain_open.take() else {
+            return;
+        };
+        if let Err(error) = self.open_captain_session(view, open).await {
+            self.error_row(&format!("Could not open that chat: {error:#}"), view);
         }
     }
 
@@ -1995,7 +2065,11 @@ mod tests {
         };
         let paths = save_captain_images(&dir.path().join("attachments"), &[&image]).unwrap();
         assert_eq!(paths.len(), 1);
-        assert!(paths[0].ends_with(".jpg"));
+        assert!(
+            Path::new(&paths[0])
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("jpg"))
+        );
         assert_eq!(std::fs::read(&paths[0]).unwrap(), b"\x89PNG");
     }
 
@@ -2033,7 +2107,7 @@ mod tests {
         // A chat already waiting to open is not replaced.
         let mut busy = Some(CaptainOpen {
             path: "/s/c1.jsonl".into(),
-            ..open.clone()
+            ..open
         });
         retry_busy_open(&mut pending, &mut busy);
         assert_eq!(pending.unwrap().path, PathBuf::from("/s/lead.jsonl"));

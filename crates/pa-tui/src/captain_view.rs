@@ -16,8 +16,11 @@ use crate::theme::{Theme, ThemeColor};
 use crate::width::{line_width, str_width, truncate_line, truncate_to_width};
 use crate::{Line, Span};
 
+mod folder_picker;
 #[cfg(test)]
 mod tests;
+
+use folder_picker::{display_path, is_readable_dir, FolderPickResult, FolderPicker};
 
 /// `pa thread captain status`.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1539,9 +1542,11 @@ enum PickPurpose {
         project: String,
     },
     Setup(Box<Setup>),
-    /// `n` with an unfinished setup saved for this checkout: resume it or start fresh.
+    /// `n` or folder selection with an unfinished setup saved: resume it or start fresh.
     ResumeSetup {
         reference: Option<String>,
+        root: Option<String>,
+        create_dir: bool,
     },
     Launch,
     /// `request` makes repeated design presses from one list a single request.
@@ -1633,6 +1638,10 @@ const FACTORY_MODELS_STEP: usize = 4;
 pub(crate) struct Setup {
     pub step: usize,
     pub reference: Option<String>,
+    /// Target directory picked in the folder browser (None means the backend uses cwd).
+    pub root: Option<String>,
+    /// Create `root` on disk during `init` (true only for "+ Create new folder").
+    pub create_dir: bool,
     pub brief: String,
     pub provider: String,
     pub model: String,
@@ -1660,6 +1669,8 @@ pub(crate) struct Setup {
 #[serde(default)]
 pub(crate) struct SavedSetupDraft {
     pub root: String,
+    pub custom_root: Option<String>,
+    pub create_dir: bool,
     pub reference: Option<String>,
     pub step: usize,
     pub brief: String,
@@ -1684,6 +1695,8 @@ impl SavedSetupDraft {
     fn from_setup(root: &str, setup: &Setup) -> Self {
         Self {
             root: root.to_owned(),
+            custom_root: setup.root.clone(),
+            create_dir: setup.create_dir,
             reference: setup.reference.clone(),
             step: setup.step.min(SETUP_STEPS.len() - 1),
             brief: setup.brief.clone(),
@@ -1726,6 +1739,8 @@ impl SavedSetupDraft {
         Setup {
             step: self.step.min(SETUP_STEPS.len() - 1),
             reference: self.reference,
+            root: self.custom_root,
+            create_dir: self.create_dir,
             brief: self.brief,
             provider: if self.provider.is_empty() {
                 "prime".into()
@@ -1834,6 +1849,24 @@ impl DraftStore {
         if let Some(path) = self.path(root) {
             // A missing file is already the wanted state.
             let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Remove a persisted setup draft file on disk when no `CaptainView` is open.
+pub(crate) fn clear_saved_setup_draft(root: &str) {
+    if root.is_empty() {
+        return;
+    }
+    let mut store = DraftStore {
+        dir: DraftStore::default_dir(),
+        memory: std::collections::HashMap::new(),
+    };
+    store.remove(root);
+    if let Ok(canon) = std::fs::canonicalize(root) {
+        let canon_str = canon.to_string_lossy();
+        if canon_str != root {
+            store.remove(&canon_str);
         }
     }
 }
@@ -2097,6 +2130,12 @@ impl Setup {
             "parallel": self.parallel,
             "crew": self.crew,
         });
+        if let Some(root) = &self.root {
+            args["root"] = json!(root);
+            if self.create_dir {
+                args["create_dir"] = json!(true);
+            }
+        }
         if let Some(reference) = &self.reference {
             args["ref"] = json!(reference);
         }
@@ -2279,6 +2318,7 @@ pub(crate) struct ThreadView {
 enum Mode {
     Browse,
     Pick(Picker),
+    PickFolder(FolderPicker),
     Confirm(Confirm),
     Thread(ThreadView),
     Factory(FactoryReview),
@@ -2352,6 +2392,8 @@ pub(crate) struct CaptainView {
     inbox: Option<usize>,
     /// The Overview's Wake Policies (`w`) or Schedules (`S`) drawer while open.
     drawer: Option<Drawer>,
+    /// Whether the project rail's `+ Add project…` action row is highlighted.
+    rail_add_selected: bool,
 }
 
 /// Collapse whitespace to one line.
@@ -2476,6 +2518,7 @@ impl CaptainView {
             reviewed: std::collections::HashMap::new(),
             transient: false,
             inbox: None,
+            rail_add_selected: false,
         }
     }
 
@@ -2559,6 +2602,9 @@ impl CaptainView {
                     }
                 }
                 self.clamp_member();
+                if let Mode::PickFolder(picker) = &mut self.mode {
+                    picker.sync_projects(&self.snapshot.projects);
+                }
             }
             Err(error) => {
                 self.snapshot_error = Some(format!("Captain returned invalid status: {error}"));
@@ -2582,7 +2628,9 @@ impl CaptainView {
     pub(crate) fn focus_project(&mut self, query: &str) -> bool {
         let term = query.trim().to_lowercase();
         let found = self.snapshot.projects.iter().position(|p| {
-            p.id == term || p.name.to_lowercase() == term || p.root.to_lowercase() == term
+            p.id.to_lowercase() == term
+                || p.name.to_lowercase() == term
+                || p.root.to_lowercase() == term
         });
         let found = found.or_else(|| {
             self.snapshot
@@ -2596,6 +2644,7 @@ impl CaptainView {
             }
             self.project = index;
             self.focus = Focus::Projects;
+            self.rail_add_selected = false;
             self.clamp_member();
         }
         found.is_some()
@@ -2746,7 +2795,22 @@ impl CaptainView {
     /// The unfinished setup saved for this checkout.
     pub(crate) fn saved_draft(&mut self) -> Option<SavedSetupDraft> {
         let root = self.snapshot.current_root.clone();
-        self.drafts.get(&root)
+        self.saved_draft_for(&root)
+    }
+
+    /// The unfinished setup saved for `root` (also checking canonicalized path if existing).
+    fn saved_draft_for(&mut self, root: &str) -> Option<SavedSetupDraft> {
+        if root.is_empty() {
+            return None;
+        }
+        if let Some(draft) = self.drafts.get(root) {
+            return Some(draft);
+        }
+        let canon = std::fs::canonicalize(root).ok()?;
+        let canon_str = canon.to_string_lossy();
+        (canon_str != root)
+            .then(|| self.drafts.get(&canon_str))
+            .flatten()
     }
 
     /// Keep a setup that has an answer; an untouched form is not worth a resume prompt.
@@ -2754,7 +2818,11 @@ impl CaptainView {
         if setup.step == 0 && setup.brief.trim().is_empty() {
             return;
         }
-        let draft = SavedSetupDraft::from_setup(&self.snapshot.current_root, setup);
+        let root = setup
+            .root
+            .as_deref()
+            .unwrap_or(&self.snapshot.current_root);
+        let draft = SavedSetupDraft::from_setup(root, setup);
         if let Err(error) = self.drafts.put(draft) {
             self.error = Some(error);
         }
@@ -2763,7 +2831,21 @@ impl CaptainView {
     /// Forget this checkout's unfinished setup.
     pub(crate) fn clear_draft(&mut self) {
         let root = self.snapshot.current_root.clone();
-        self.drafts.remove(&root);
+        self.clear_draft_for(&root);
+    }
+
+    /// Forget the unfinished setup saved for `root` (and its canonical path if it exists).
+    pub(crate) fn clear_draft_for(&mut self, root: &str) {
+        if root.is_empty() {
+            return;
+        }
+        self.drafts.remove(root);
+        if let Ok(canon) = std::fs::canonicalize(root) {
+            let canon_str = canon.to_string_lossy();
+            if canon_str != root {
+                self.drafts.remove(&canon_str);
+            }
+        }
     }
 
     /// The setup on screen or waiting for options or a shared picker, if any.
@@ -2823,11 +2905,72 @@ impl CaptainView {
             self.mode = Mode::Pick(Picker::new(
                 "unfinished captain setup",
                 items,
-                PickPurpose::ResumeSetup { reference },
+                PickPurpose::ResumeSetup {
+                    reference,
+                    root: None,
+                    create_dir: false,
+                },
             ));
             return CaptainAction::None;
         }
         self.begin_setup(reference, None)
+    }
+
+    /// Open the inline folder picker starting at the selected project's parent dir, `$HOME`, or cwd.
+    pub(crate) fn start_folder_picker(&mut self) {
+        let start = self
+            .selected_project()
+            .and_then(|p| std::path::Path::new(&p.root).parent())
+            .filter(|p| is_readable_dir(p))
+            .map(std::path::Path::to_path_buf)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(std::path::PathBuf::from)
+                    .filter(|p| is_readable_dir(p))
+            })
+            .or_else(|| std::env::current_dir().ok().filter(|p| is_readable_dir(p)))
+            .unwrap_or_else(|| std::path::PathBuf::from("/"));
+        self.open_folder_picker_at(start);
+    }
+
+    /// Open the inline folder picker rooted at `dir`.
+    pub(crate) fn open_folder_picker_at(&mut self, dir: std::path::PathBuf) {
+        self.help = false;
+        self.inbox = None;
+        self.drawer = None;
+        self.rail_add_selected = false;
+        self.notice = None;
+        self.error = None;
+        self.mode = Mode::PickFolder(FolderPicker::new(dir, &self.snapshot.projects));
+    }
+
+    /// Start the Captain setup flow targeting an explicit folder chosen from the folder picker.
+    fn start_setup_for_folder(&mut self, root: String, create_dir: bool) -> CaptainAction {
+        self.pending_setup = None;
+        self.pending_resume = None;
+        if let Some(draft) = self.saved_draft_for(&root) {
+            let items = vec![
+                PickItem {
+                    label: draft.summary(),
+                    value: json!("resume"),
+                },
+                PickItem {
+                    label: "Start fresh (redo from scratch)".into(),
+                    value: json!("fresh"),
+                },
+            ];
+            self.mode = Mode::Pick(Picker::new(
+                "unfinished captain setup",
+                items,
+                PickPurpose::ResumeSetup {
+                    reference: None,
+                    root: Some(root),
+                    create_dir,
+                },
+            ));
+            return CaptainAction::None;
+        }
+        self.begin_setup_for(None, Some(root), create_dir, None)
     }
 
     /// Load the options for a new form, or for `draft` to resume.
@@ -2836,10 +2979,23 @@ impl CaptainView {
         reference: Option<String>,
         draft: Option<SavedSetupDraft>,
     ) -> CaptainAction {
+        self.begin_setup_for(reference, None, false, draft)
+    }
+
+    /// Load the options for a new form targeting `root` (if any), or for `draft` to resume.
+    fn begin_setup_for(
+        &mut self,
+        reference: Option<String>,
+        root: Option<String>,
+        create_dir: bool,
+        draft: Option<SavedSetupDraft>,
+    ) -> CaptainAction {
         let reference = draft.as_ref().map_or(reference, |d| d.reference.clone());
         self.notice = Some("Loading models and machines…".into());
         self.pending_setup = Some(Setup {
             reference: reference.clone(),
+            root,
+            create_dir,
             parallel: 2,
             provider: "prime".into(),
             ..Setup::default()
@@ -3061,10 +3217,20 @@ impl CaptainView {
         match step {
             "brief" => {
                 let initial = setup.brief.clone();
+                let label = match &setup.root {
+                    Some(root) => {
+                        let suffix = if setup.create_dir { " (new)" } else { "" };
+                        format!(
+                            "captain brief · Folder: {}{suffix} · what should this project achieve",
+                            display_path(root)
+                        )
+                    }
+                    None => "captain brief · what should this project achieve".into(),
+                };
                 self.pending_setup = Some(setup);
                 CaptainAction::Compose {
                     purpose: ComposePurpose::Brief,
-                    label: "captain brief · what should this project achieve".into(),
+                    label,
                     initial,
                 }
             }
@@ -3547,6 +3713,7 @@ impl CaptainView {
         let (mode, action) = match mode {
             Mode::Browse => (Mode::Browse, self.browse_key(key, kb)),
             Mode::Pick(picker) => self.picker_key(picker, key, kb),
+            Mode::PickFolder(picker) => self.folder_picker_key(picker, key, kb),
             Mode::Confirm(confirm) => self.confirm_key(confirm, key, kb),
             Mode::Thread(thread) => self.thread_key(thread, key, kb),
             Mode::Factory(review) => self.factory_key(review, key, kb),
@@ -3561,6 +3728,40 @@ impl CaptainView {
         action
     }
 
+    fn folder_picker_key(
+        &mut self,
+        mut picker: FolderPicker,
+        key: &str,
+        kb: &KeybindingsManager,
+    ) -> (Mode, CaptainAction) {
+        match picker.handle_key(key, kb) {
+            FolderPickResult::Stay => (Mode::PickFolder(picker), CaptainAction::None),
+            FolderPickResult::Cancel => (Mode::Browse, CaptainAction::None),
+            FolderPickResult::OpenExisting { project_id, name } => {
+                if let Some(index) = self
+                    .snapshot
+                    .projects
+                    .iter()
+                    .position(|p| p.id == project_id)
+                {
+                    if self.snapshot.projects[index].is_archived() {
+                        self.show_archived = true;
+                    }
+                    self.project = index;
+                    self.focus = Focus::Projects;
+                    self.rail_add_selected = false;
+                    self.clamp_member();
+                    self.notice = Some(format!("Switched to {name}."));
+                }
+                (Mode::Browse, CaptainAction::None)
+            }
+            FolderPickResult::SelectFolder { root, create_dir } => {
+                let action = self.start_setup_for_folder(root, create_dir);
+                (Mode::Browse, action)
+            }
+        }
+    }
+
     fn browse_key(&mut self, key: &str, kb: &KeybindingsManager) -> CaptainAction {
         self.notice = None;
         self.error = None;
@@ -3573,6 +3774,7 @@ impl CaptainView {
         if let Some(drawer) = self.drawer.filter(|_| self.tab == Tab::Overview) {
             return self.drawer_key(drawer, key, kb);
         }
+        let on_rail_add = self.focus == Focus::Projects && self.rail_add_selected;
         if self.tab == Tab::Overview {
             if let Some(item) = self.selected_need().filter(|i| i.kind == "decision") {
                 if let Some(option) = item.options.iter().find(|o| o.key == key) {
@@ -3588,7 +3790,7 @@ impl CaptainView {
                     };
                 }
             }
-            if self.selected_project().is_some() {
+            if !on_rail_add && self.selected_project().is_some() {
                 if key == "w" {
                     self.drawer = Some(Drawer::Wake(0));
                     self.help = false;
@@ -3624,9 +3826,13 @@ impl CaptainView {
             self.set_tab(tab);
             return CaptainAction::None;
         }
-        if key == "i" && self.tab == Tab::Overview && self.selected_project().is_some() {
+        if !on_rail_add && key == "i" && self.tab == Tab::Overview && self.selected_project().is_some() {
             self.inbox = Some(0);
             self.help = false;
+            return CaptainAction::None;
+        }
+        if on_rail_add && (key == "enter" || key == "o" || kb.matches(key, "tui.select.confirm")) {
+            self.start_folder_picker();
             return CaptainAction::None;
         }
         if self.tab == Tab::Overview && self.focus == Focus::Crew {
@@ -3645,8 +3851,13 @@ impl CaptainView {
         }
         match key {
             "r" => return CaptainAction::Refresh,
+            "+" | "shift+=" => {
+                self.start_folder_picker();
+                return CaptainAction::None;
+            }
             "tab" | "shift+tab" if self.tab == Tab::Overview => {
                 let has_rows = !self.entries().is_empty();
+                self.rail_add_selected = false;
                 self.focus = match self.focus {
                     Focus::Projects if has_rows => Focus::Crew,
                     _ => Focus::Projects,
@@ -3690,10 +3901,18 @@ impl CaptainView {
         }
         if matches!(key, "H" | "shift+h") {
             self.show_archived = !self.show_archived;
+            self.rail_add_selected = false;
             self.clamp_project();
             return CaptainAction::None;
         }
+        if on_rail_add {
+            return CaptainAction::None;
+        }
         let Some(project) = self.selected_project().cloned() else {
+            if key == "enter" || kb.matches(key, "tui.select.confirm") {
+                self.start_folder_picker();
+                return CaptainAction::None;
+            }
             if key == "f" {
                 return CaptainAction::Act {
                     op: "factory".into(),
@@ -4135,6 +4354,7 @@ impl CaptainView {
             self.design_request = uuid::Uuid::new_v4().to_string();
         }
         self.tab = tab;
+        self.rail_add_selected = false;
         self.help = false;
     }
 
@@ -4467,9 +4687,26 @@ impl CaptainView {
                 if visible.is_empty() {
                     return;
                 }
+                if self.rail_add_selected {
+                    if delta < 0 {
+                        self.rail_add_selected = false;
+                        self.project = *visible.last().unwrap_or(&self.project);
+                        self.member = 0;
+                        self.digest_scroll = 0;
+                        self.drive = 0;
+                        self.drive_scroll = 0;
+                        self.factory = 0;
+                    }
+                    return;
+                }
                 let at = visible.iter().position(|&i| i == self.project).unwrap_or(0);
+                if delta > 0 && at + 1 >= visible.len() {
+                    self.rail_add_selected = true;
+                    return;
+                }
                 let at = (at as isize + delta).clamp(0, visible.len() as isize - 1) as usize;
                 self.project = visible[at];
+                self.rail_add_selected = false;
                 self.member = 0;
                 self.digest_scroll = 0;
                 self.drive = 0;
@@ -4806,13 +5043,23 @@ impl CaptainView {
                 self.notice = Some(format!("Loading {name}…"));
                 CaptainAction::LoadFactory { project, name }
             }
-            PickPurpose::ResumeSetup { reference } => {
+            PickPurpose::ResumeSetup {
+                reference,
+                root,
+                create_dir,
+            } => {
                 if value == "resume" {
-                    let draft = self.saved_draft();
-                    return self.begin_setup(reference, draft);
+                    let draft = match root.as_deref() {
+                        Some(r) => self.saved_draft_for(r),
+                        None => self.saved_draft(),
+                    };
+                    return self.begin_setup_for(reference, root, create_dir, draft);
                 }
-                self.clear_draft();
-                self.begin_setup(reference, None)
+                match root.as_deref() {
+                    Some(r) => self.clear_draft_for(r),
+                    None => self.clear_draft(),
+                }
+                self.begin_setup_for(reference, root, create_dir, None)
             }
             PickPurpose::Setup(setup) => {
                 let mut setup = *setup;
@@ -5824,6 +6071,7 @@ impl CaptainView {
         let body_rows = rows.saturating_sub(out.len() + 3);
         let body = match &self.mode {
             Mode::Pick(picker) => Self::render_picker(theme, width, picker, body_rows),
+            Mode::PickFolder(picker) => picker.render(theme, width, body_rows),
             Mode::Confirm(confirm) => Self::render_confirm(theme, width, confirm),
             Mode::Thread(thread) => Self::render_thread(theme, width, thread, body_rows),
             Mode::Factory(review) => Self::render_factory(theme, width, review, body_rows),
@@ -5877,6 +6125,13 @@ impl CaptainView {
                 "↑↓ select · Space mark · Enter next · Esc back".into()
             }
             Mode::Pick(_) => "↑↓ select · Enter choose · Esc back".into(),
+            Mode::PickFolder(_) if width < 80 => {
+                "↑↓ move · →/Tab open · ← up · Enter select · Esc cancel".into()
+            }
+            Mode::PickFolder(_) => {
+                "↑↓ move · →/Tab open dir · ← up · Enter select · type to filter · Esc cancel"
+                    .into()
+            }
             Mode::Confirm(_) => "y confirm · n cancel".into(),
             Mode::Thread(thread) if thread.returns_to_chat => {
                 "↑↓ scroll · r reply · Esc back to chat".into()
@@ -5946,15 +6201,17 @@ impl CaptainView {
                 "↑↓ select · Enter open · n/N new chat · a add thread · d assign · v review · ? help · {f6} close"
             );
         }
-        if width < 90 {
-            format!("↑↓ · Tab · Enter open · s stop · D delete · ? help · {f6} close")
+        if width < 76 {
+            format!("↑↓ · + add · s stop · D delete · ? help · {f6} close")
+        } else if width < 90 {
+            format!("↑↓ · Tab · Enter open · + add · s stop · D delete · ? help · {f6} close")
         } else if width < 114 {
             format!(
-                "↑↓ · Tab crew · 1-4 tab · Enter open · m message · s stop · R resume · D delete · ? help · {f6} close"
+                "↑↓ · Tab crew · 1-4 · + add project · m msg · s stop · R resume · D delete · ? help · {f6} close"
             )
         } else {
             format!(
-                "↑↓ select · Tab crew · 1-4 tab · Enter open · m message · A archive · s stop · R resume · D delete · ? help · {f6} close"
+                "↑↓ · Tab crew · 1-4 · Enter open · + add project · m msg · A archive · s stop · R resume · D delete · ? help · {f6} close"
             )
         }
     }
@@ -5992,10 +6249,17 @@ impl CaptainView {
 
     fn render_rail(&self, theme: &Theme, width: usize, rows: usize) -> Vec<Line> {
         let archived = self.archived_project_count();
-        let mut out: Vec<Line> = vec![vec![
+        let header_add = "+ add";
+        let header_gap = width.saturating_sub(3 + str_width("projects") + str_width(header_add) + 1);
+        let mut header = vec![
             Span::raw("   "),
             theme.fg_span(ThemeColor::Dim, "projects"),
-        ]];
+        ];
+        if header_gap >= 1 {
+            header.push(Span::raw(" ".repeat(header_gap)));
+            header.push(theme.fg_span(ThemeColor::Dim, header_add));
+        }
+        let mut out: Vec<Line> = vec![header];
         let projects = &self.snapshot.projects;
         let visible = self.visible_projects();
         // Hidden archived Captains leave one hint row at the bottom.
@@ -6011,9 +6275,18 @@ impl CaptainView {
             } else {
                 "No projects yet"
             };
+            out.push(vec![Span::raw("   "), theme.fg_span(ThemeColor::Dim, "")]);
+            out.push(vec![
+                Span::raw("   "),
+                theme.fg_span(ThemeColor::Dim, empty),
+            ]);
+            out.push(vec![
+                Span::raw(" "),
+                theme.bold(theme.fg_span(ThemeColor::Accent, "›")),
+                Span::raw(" "),
+                theme.bold(theme.fg_span(ThemeColor::Accent, "+ Add project…")),
+            ]);
             for text in [
-                "",
-                empty,
                 "n  set up a Captain",
                 "p  promote this chat",
                 "f  open factory",
@@ -6023,8 +6296,13 @@ impl CaptainView {
             out.extend(hint);
             return out;
         }
-        let slots = (rows.saturating_sub(1 + usize::from(hint.is_some())) / 2).max(1);
-        let at = visible.iter().position(|&i| i == self.project).unwrap_or(0);
+        let reserved = 1 + 1 + usize::from(hint.is_some());
+        let slots = (rows.saturating_sub(reserved) / 2).max(1);
+        let at = if self.rail_add_selected {
+            visible.len().saturating_sub(1)
+        } else {
+            visible.iter().position(|&i| i == self.project).unwrap_or(0)
+        };
         let top = at.saturating_sub(slots - 1);
         for &index in visible.iter().skip(top).take(slots) {
             let project = &projects[index];
@@ -6037,7 +6315,7 @@ impl CaptainView {
                 .map(|(n, g)| format!("{g}{n}"))
                 .collect::<Vec<_>>()
                 .join(" ");
-            let marker = if selected && self.focus == Focus::Projects {
+            let marker = if selected && self.focus == Focus::Projects && !self.rail_add_selected {
                 "›"
             } else if selected {
                 "·"
@@ -6073,6 +6351,26 @@ impl CaptainView {
                 theme.fg_span(summary_color(state), format!("{state}{here}")),
             ]);
         }
+        let add_selected = self.rail_add_selected && self.focus == Focus::Projects;
+        let add_row = vec![
+            Span::raw(" "),
+            theme.bold(theme.fg_span(
+                ThemeColor::Accent,
+                if add_selected { "›" } else { " " },
+            )),
+            Span::raw(" "),
+            if add_selected {
+                theme.bold(theme.fg_span(ThemeColor::Accent, "+ Add project…"))
+            } else {
+                theme.fg_span(ThemeColor::Dim, "+ Add project…")
+            },
+        ];
+        out.push(crate::menu_panel::fill_row(
+            &truncate_line(&add_row, width, "…"),
+            add_selected,
+            width,
+            theme.soft_selection_style(),
+        ));
         out.extend(hint);
         out
     }
@@ -6853,7 +7151,7 @@ impl CaptainView {
             "Tab focus crew · ↑↓ move · ←→ project · → subagents of a crew row",
             "Enter open · m message · M model · v review · A archive",
             "Needs you: a approve · g grant · x decline · r retry or recreate · s stop",
-            "n new Captain · p promote this chat · e edit",
+            "n new Captain · + add / browse project folder · p promote this chat · e edit",
             "Crew: n/N new chat · a add thread · d assign · v review",
             "a add a thread · d assign work · u release",
             "f factory · c consensus",
@@ -6897,6 +7195,21 @@ impl CaptainView {
                 steps.push(Span::raw("   "));
             }
             out.push(truncate_line(&steps, width, ""));
+            if let Some(root) = &setup.root {
+                let suffix = if setup.create_dir { " (new folder)" } else { "" };
+                out.push(truncate_line(
+                    &vec![
+                        Span::raw(" "),
+                        theme.fg_span(ThemeColor::Dim, "Folder: "),
+                        theme.fg_span(
+                            ThemeColor::Accent,
+                            format!("{}{suffix}", display_path(root)),
+                        ),
+                    ],
+                    width,
+                    "…",
+                ));
+            }
         }
         out.push(vec![
             Span::raw(" "),
@@ -7017,13 +7330,13 @@ impl CaptainView {
                 format!("release {title} from the crew?"),
                 vec!["The thread returns to the thread list. Its transcript stays.".into()],
             ),
-            Confirm::Create(setup) => (
-                if setup.reference.is_some() {
-                    "promote this chat to Captain?".into()
-                } else {
-                    "create this Captain?".into()
-                },
-                vec![
+            Confirm::Create(setup) => {
+                let mut rows = Vec::new();
+                if let Some(root) = &setup.root {
+                    let suffix = if setup.create_dir { " (new folder)" } else { "" };
+                    rows.push(format!("Folder: {}{suffix}", display_path(root)));
+                }
+                rows.extend([
                     format!("brief: {}", clean(&setup.brief)),
                     format!(
                         "model: {} · {}{}",
@@ -7047,8 +7360,16 @@ impl CaptainView {
                     },
                     format!("workers: {}", setup.parallel),
                     format!("threads: {}", setup.crew.len()),
-                ],
-            ),
+                ]);
+                (
+                    if setup.reference.is_some() {
+                        "promote this chat to Captain?".into()
+                    } else {
+                        "create this Captain?".into()
+                    },
+                    rows,
+                )
+            }
         };
         let mut out = vec![
             Vec::new(),

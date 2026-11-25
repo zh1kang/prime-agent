@@ -634,7 +634,6 @@ def snapshot():
                     member.pop(key, None)
                 member["session"] = member_session(member)
                 member["busy"] = member["id"] in busy
-                member["usage"] = member_usage(db, member)
                 member["open_findings_count"] = db.execute(
                     "SELECT count(*) FROM review_findings WHERE project=? AND member=? AND status='open'",
                     (project["id"], member["id"]),
@@ -644,9 +643,12 @@ def snapshot():
             stack_positions(project["crew"])
             project.update(project_notifications(db, project["id"]))
             usage_detail = project_usage_detail(db, project, crew_rows=project["crew"])
+            member_usages = usage_detail.get("member_usages") or {}
+            for member in project["crew"]:
+                member["usage"] = member_usages.get(member["id"]) or job_usage(db, "member", member["id"])
             project["usage"] = usage_detail["usage"]
             project["session_costs"] = usage_detail["session_costs"]
-            project["budget"] = budget_state(db, project, usage=usage_detail["usage"])
+            project["budget"] = budget_state(db, project)
             project["wake_policy"] = wake_policy(project)
             project["schedules"] = project_schedules(db, project["id"])
             project["decisions"] = open_decisions(db, project["id"])
@@ -1342,8 +1344,10 @@ def drive_files(p):
 
 
 def budget_state(db, p, usage=None):
+    """Spend cap tracked strictly against jobs dispatched by this Captain (excludes
+    pre-existing history in adopted threads and flat-rate subscription list-price estimates)."""
     if usage is None:
-        usage = project_usage_detail(db, p)["usage"]
+        usage = job_usage(db, "project", p["id"])
     spent_tokens = usage["input_tokens"] + usage["output_tokens"]
     cap_usd, cap_tokens = p.get("budget_usd"), p.get("budget_tokens")
     exceeded = (cap_usd is not None and usage["cost_usd"] >= cap_usd) or (
@@ -1496,7 +1500,7 @@ _USAGE_CACHE_DIRTY = False
 
 
 def _usage_cache_path():
-    return BASE / "usage-cache.json"
+    return BASE / "usage-cache-v2.json"
 
 
 def _load_usage_cache():
@@ -1567,7 +1571,11 @@ def _cli_list_price(model):
 
 
 def _session_file_usage(path):
-    """Return (session_id, input_tokens, output_tokens, cost_usd) for one JSONL file."""
+    """Return (session_id, input_tokens, output_tokens, cost_usd) for one JSONL file.
+
+    Incrementally scans only newly appended bytes when the file grew since the last
+    cached offset so active sessions are not re-parsed from byte 0 on every status pass.
+    """
     global _USAGE_CACHE_DIRTY
     _load_usage_cache()
     try:
@@ -1579,20 +1587,37 @@ def _session_file_usage(path):
     cached = _USAGE_FILE_CACHE.get(path_str)
     if cached is not None and cached[0] == stat.st_mtime_ns and cached[1] == stat.st_size:
         return cached[2], cached[3], cached[4], cached[5]
-    sid = None
-    inp = 0
-    out = 0
-    cost = 0.0
+    if cached is not None and 0 < cached[1] <= stat.st_size:
+        offset = int(cached[1])
+        sid, inp, out, cost = cached[2], int(cached[3]), int(cached[4]), float(cached[5])
+    else:
+        offset = 0
+        sid, inp, out, cost = None, 0, 0, 0.0
+    new_offset = offset
     try:
-        with resolved.open("r", encoding="utf-8", errors="replace") as stream:
-            for idx, line in enumerate(stream):
-                if not line.strip():
+        with resolved.open("rb") as stream:
+            if offset:
+                stream.seek(offset)
+            while True:
+                line_start = stream.tell()
+                raw_line = stream.readline()
+                if not raw_line:
+                    break
+                line_end = stream.tell()
+                stripped = raw_line.strip()
+                if not stripped:
+                    new_offset = line_end
                     continue
                 try:
-                    row = json.loads(line)
+                    row = json.loads(stripped.decode("utf-8", errors="replace"))
                 except ValueError:
+                    # A trailing partial line without newline may still be mid-write: stop before it.
+                    if not raw_line.endswith(b"\n"):
+                        break
+                    new_offset = line_end
                     continue
-                if idx == 0 and isinstance(row, dict) and row.get("type") == "session":
+                new_offset = line_end
+                if line_start == 0 and isinstance(row, dict) and row.get("type") == "session":
                     sid = str(row.get("id") or "") or None
                     continue
                 if not isinstance(row, dict):
@@ -1607,7 +1632,7 @@ def _session_file_usage(path):
                 u_out = int(usage.get("output") or 0)
                 u_cr = int(usage.get("cacheRead") or 0)
                 u_cw = int(usage.get("cacheWrite") or 0)
-                inp += u_in
+                inp += u_in + u_cr + u_cw
                 out += u_out
                 u_cost = usage.get("cost")
                 total = float(u_cost.get("total") or 0.0) if isinstance(u_cost, dict) else 0.0
@@ -1625,7 +1650,7 @@ def _session_file_usage(path):
     except OSError:
         return None, 0, 0, 0.0
     final_sid = sid or resolved.stem
-    _USAGE_FILE_CACHE[path_str] = (stat.st_mtime_ns, stat.st_size, final_sid, inp, out, cost)
+    _USAGE_FILE_CACHE[path_str] = (stat.st_mtime_ns, new_offset, final_sid, inp, out, cost)
     _USAGE_CACHE_DIRTY = True
     return final_sid, inp, out, cost
 
@@ -1715,11 +1740,13 @@ def project_usage_detail(db, project, crew_rows=None):
     tree_out += lead_usage["output_tokens"]
     tree_cost += lead_usage["cost_usd"]
 
+    member_usages = {}
     for member in crew_rows:
         m_path = member_session(member)
         m_sid, m_usage = _session_tree_usage(m_path, seen=seen)
         if m_sid:
             session_costs[m_sid] = round(session_costs.get(m_sid, 0.0) + m_usage["cost_usd"], 6)
+        member_usages[member["id"]] = _merge_usage(job_usage(db, "member", member["id"]), m_usage)
         tree_in += m_usage["input_tokens"]
         tree_out += m_usage["output_tokens"]
         tree_cost += m_usage["cost_usd"]
@@ -1734,6 +1761,7 @@ def project_usage_detail(db, project, crew_rows=None):
         "usage": _merge_usage(jobs, tree_total),
         "lead_session_id": lead_sid or "",
         "session_costs": session_costs,
+        "member_usages": member_usages,
     }
 
 
@@ -1855,33 +1883,175 @@ def checked_parallel(value):
     return int(value)
 
 
-@functools.lru_cache(maxsize=1)
+MODEL_CACHE_TTL = 3600.0
+# A listing that failed is retried sooner, in the background, so a transient failure does
+# not hide models for an hour.
+MODEL_CACHE_FAILED_TTL = 60.0
+MODEL_REFRESH_GUARD = 120.0
+MODEL_LISTINGS = ("catalog", "antigravity", "cursor")
+
+# Runs the model listing commands and writes their raw output to the cache file. One copy of
+# this code serves both a blocking fetch on a cold cache and the detached refresh of a stale
+# one. A listing that fails keeps its previous output when the stamp is unchanged.
+_MODEL_REFRESH_SCRIPT = r"""
+import json, os, pathlib, subprocess, sys, time
+path, guard = pathlib.Path(sys.argv[1]), sys.argv[2]
+spec = json.load(sys.stdin)
+try:
+    previous = json.loads(path.read_text(encoding="utf-8"))
+except (OSError, ValueError):
+    previous = None
+kept = previous.get("outputs") if isinstance(previous, dict) and previous.get("stamp") == spec["stamp"] else None
+kept = kept if isinstance(kept, dict) else {}
+outputs = {}
+try:
+    for name, argv, env, timeout in spec["commands"]:
+        try:
+            run = subprocess.run(argv, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
+            outputs[name] = run.stdout if run.returncode == 0 else None
+        except (OSError, subprocess.SubprocessError):
+            outputs[name] = None
+        if outputs[name] is None and isinstance(kept.get(name), str):
+            outputs[name] = kept[name]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps({"stamp": spec["stamp"], "fetched_at": time.time(), "outputs": outputs}), encoding="utf-8")
+    os.replace(temporary, path)
+finally:
+    if guard:
+        pathlib.Path(guard).unlink(missing_ok=True)
+"""
+
+
+def _model_cache_path():
+    return BASE / "model-catalog-cache.json"
+
+
+def _model_refresh(path, stamp, background):
+    """Run _MODEL_REFRESH_SCRIPT now, or detached when `background`; a detached refresh
+    already running (its guard file is younger than MODEL_REFRESH_GUARD) is not repeated."""
+    spec = {
+        "stamp": stamp,
+        "commands": [
+            ["catalog", [PA, "model", "list"], {**os.environ, "PRIME_AGENT_CODING_AGENT_DIR": str(NATIVE)}, 60],
+            ["antigravity", [PA, "thread", "models", "antigravity"], thread_env(), 15],
+            ["cursor", [PA, "thread", "models", "cursor"], thread_env(), 15],
+        ],
+    }
+    command = [sys.executable, "-I", "-c", _MODEL_REFRESH_SCRIPT, str(path)]
+    if not background:
+        subprocess.run([*command, ""], input=json.dumps(spec), text=True, capture_output=True, timeout=120)
+        return
+    guard = path.with_name(path.name + ".refreshing")
+    try:
+        if time.time() - guard.stat().st_mtime < MODEL_REFRESH_GUARD:
+            return
+    except OSError:
+        pass
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        guard.write_text(str(os.getpid()), encoding="utf-8")
+        child = subprocess.Popen(
+            [*command, str(guard)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            start_new_session=True,
+            close_fds=True,
+        )
+        child.stdin.write(json.dumps(spec))
+        child.stdin.close()
+    except OSError:
+        guard.unlink(missing_ok=True)
+
+
+_MODEL_OUTPUTS_MEM = None  # (stamp, cache_mtime_ns, fetched_at, outputs)
+
+
+def _model_outputs():
+    """Raw output of `pa model list` and `pa thread models antigravity|cursor` by name; None
+    for a listing that failed.
+
+    Cached on disk per _model_summary_stamp. A cached listing with that stamp is returned at
+    once, also when it is older than its TTL; it is then refreshed in a detached process, so a
+    Captain turn or action never waits seconds on the listing commands. Only a missing cache
+    or a changed stamp blocks on a fetch."""
+    global _MODEL_OUTPUTS_MEM
+    path = _model_cache_path()
+    stamp = _model_summary_stamp()
+    try:
+        disk_mtime = path.stat().st_mtime_ns
+    except OSError:
+        disk_mtime = None
+    if _MODEL_OUTPUTS_MEM is not None:
+        m_stamp, m_mtime, m_fetched, m_outputs = _MODEL_OUTPUTS_MEM
+        if m_stamp == stamp and m_mtime == disk_mtime and disk_mtime is not None:
+            ttl = MODEL_CACHE_TTL if all(m_outputs.values()) else MODEL_CACHE_FAILED_TTL
+            if time.time() - m_fetched > ttl:
+                _model_refresh(path, stamp, background=True)
+            return m_outputs
+
+    def cached():
+        document = read_json(path)
+        if not isinstance(document, dict) or document.get("stamp") != stamp:
+            return None
+        outputs = document.get("outputs")
+        fetched_at = document.get("fetched_at")
+        if not isinstance(outputs, dict) or not isinstance(fetched_at, (int, float)):
+            return None
+        return {name: outputs.get(name) if isinstance(outputs.get(name), str) else None for name in MODEL_LISTINGS}, float(fetched_at)
+
+    found = cached()
+    if found is not None:
+        outputs, fetched_at = found
+        _MODEL_OUTPUTS_MEM = (stamp, disk_mtime, fetched_at, outputs)
+        ttl = MODEL_CACHE_TTL if all(outputs.values()) else MODEL_CACHE_FAILED_TTL
+        if time.time() - fetched_at > ttl:
+            _model_refresh(path, stamp, background=True)
+        return outputs
+    try:
+        _model_refresh(path, stamp, background=False)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        disk_mtime = path.stat().st_mtime_ns
+    except OSError:
+        disk_mtime = None
+    found = cached()
+    if found is not None:
+        outputs, fetched_at = found
+        _MODEL_OUTPUTS_MEM = (stamp, disk_mtime, fetched_at, outputs)
+        return outputs
+    return dict.fromkeys(MODEL_LISTINGS)
+
+
+def _listed_ids(output):
+    """The first tab-separated column of `pa thread models` output."""
+    out = []
+    for line in (output or "").splitlines():
+        parts = line.split("\t")
+        if parts and parts[0].strip():
+            out.append(parts[0].strip())
+    return tuple(out)
+
+
 def model_catalog():
     """Rows of `pa model list` for the native home that owns model credentials."""
-    run = subprocess.run(
-        [PA, "model", "list"],
-        env={**os.environ, "PRIME_AGENT_CODING_AGENT_DIR": str(NATIVE)},
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    lines = run.stdout.splitlines() if run.returncode == 0 else []
+    lines = (_model_outputs()["catalog"] or "").splitlines()
     if not lines or lines[0].split()[:2] != ["provider", "model"]:
         return ()
     return tuple(tuple(line.split()[:2]) for line in lines[1:] if len(line.split()) >= 2)
 
 
-@functools.lru_cache(maxsize=1)
 def antigravity_models():
     """Base model IDs reported by `pa thread models antigravity`."""
-    return thread_models("antigravity")
+    return _listed_ids(_model_outputs()["antigravity"])
 
 
-@functools.lru_cache(maxsize=1)
 def cursor_models():
     """Model IDs reported by `pa thread models cursor`; none when this pa cannot list them."""
-    return thread_models("cursor")
+    return _listed_ids(_model_outputs()["cursor"])
 
 
 SUMMARY_MODELS_PER_PROVIDER = 3
@@ -1894,9 +2064,6 @@ def _ranked_models(models):
     return sorted(ranked, key=lambda m: m not in FEATURED_MODELS)
 
 
-MODEL_SUMMARY_CACHE_TTL = 3600.0
-
-
 def _file_mtime_ns(path):
     try:
         return Path(path).stat().st_mtime_ns
@@ -1905,9 +2072,11 @@ def _file_mtime_ns(path):
 
 
 def _model_summary_stamp():
+    """What the model listings depend on: the pa path and the native home's model
+    configuration. A rebuilt pa keeps the stamp; the stale-while-revalidate refresh picks up
+    its new models."""
     return [
         str(PA),
-        _file_mtime_ns(PA),
         str(NATIVE),
         _file_mtime_ns(NATIVE / "auth.json"),
         _file_mtime_ns(NATIVE / "models.json"),
@@ -1943,26 +2112,9 @@ def configured_models_summary():
     """One line naming the models this user can run, a few per provider; empty when no
     provider is configured. It sits in the cache-stable menus, so it must be deterministic.
 
-    Cached on disk per `(PA, NATIVE, auth/models/settings mtimes)` so Captain turns do not
-    block 2-5s running `pa model list` + provider CLI model probes on every prompt."""
-    cache_path = BASE / "model-summary-cache.json"
-    stamp = _model_summary_stamp()
-    now = time.time()
-    cached = read_json(cache_path)
-    if (
-        isinstance(cached, dict)
-        and cached.get("stamp") == stamp
-        and isinstance(cached.get("summary"), str)
-        and isinstance(cached.get("fetched_at"), (int, float))
-        and now - float(cached["fetched_at"]) <= MODEL_SUMMARY_CACHE_TTL
-    ):
-        return cached["summary"]
-    summary = _compute_configured_models_summary()
-    try:
-        write_json(cache_path, {"stamp": stamp, "fetched_at": now, "summary": summary})
-    except OSError:
-        pass
-    return summary
+    Built from the stale-while-revalidate model listings (_model_outputs), so a Captain turn
+    does not run `pa model list` and the provider CLI probes on every prompt."""
+    return _compute_configured_models_summary()
 
 
 @functools.lru_cache(maxsize=1)
@@ -1976,28 +2128,6 @@ def fsm_guide_path():
         if candidate.is_file():
             return str(candidate)
     return ""
-
-
-def thread_models(provider):
-    try:
-        run = subprocess.run(
-            [PA, "thread", "models", provider],
-            env=thread_env(),
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return ()
-    if run.returncode != 0:
-        return ()
-    out = []
-    for line in run.stdout.splitlines():
-        parts = line.split("\t")
-        if parts and parts[0].strip():
-            out.append(parts[0].strip())
-    return tuple(out)
 
 
 def model_choices():
@@ -2547,13 +2677,43 @@ def brief_prefill(ref):
     )
 
 
+def requested_folder(args):
+    """The folder `init` or `promote` acts on, and whether it must be created first.
+
+    Without root it is this process's folder. A given root must be an absolute path;
+    a missing folder is created only when create_dir is true."""
+    raw = args.get("root")
+    create = args.get("create_dir", False)
+    if not isinstance(create, bool):
+        raise ValueError("Pass create_dir as true or false.")
+    if raw in (None, "") and not create:
+        return Path.cwd(), False
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("Pass root as an absolute folder path.")
+    target = Path(raw).expanduser()
+    if not target.is_absolute():
+        raise ValueError(f"Pass root as an absolute folder path, not {raw}.")
+    # Collapse ".." without following symlinks; project_root resolves the rest.
+    target = Path(os.path.normpath(target))
+    if target.is_dir():
+        return target, False
+    if target.exists():
+        raise ValueError(f"Not a folder: {target}")
+    if not create:
+        raise ValueError(f"Folder does not exist: {target}")
+    return target, True
+
+
 def create_project(op, args):
-    root = project_root(args.get("root") or Path.cwd())
+    target, create = requested_folder(args)
+    if create and op == "promote":
+        raise ValueError("Promote a thread into an existing folder.")
     brief = checked_text(args.get("brief") or args.get("objective"))
     parallel = checked_parallel(args.get("parallel", 2))
     crew = args.get("crew") or []
     if not isinstance(crew, list) or not all(isinstance(r, str) for r in crew):
         raise ValueError("Pass crew as a list of thread references.")
+    root = None if create else project_root(target)
     thread = promote_source(args["ref"], root) if op == "promote" else None
     provider, model = checked_model(
         args.get("provider") or (thread["provider"] if thread else "prime"),
@@ -2561,41 +2721,61 @@ def create_project(op, args):
     )
     thinking = checked_thinking(args.get("thinking"))
     factory_models = checked_factory_models(args.get("factory_models"))
+    created_dirs = []
+    if create:
+        # Create the folder only after every other argument is valid; remember any newly
+        # created directories so an error before DB registration does not leave empty folders.
+        if actor_kind() != "user":
+            raise ValueError("Only you can create a project folder.")
+        cursor = target
+        while not cursor.exists() and cursor != cursor.parent:
+            created_dirs.append(cursor)
+            cursor = cursor.parent
+        target.mkdir(parents=True, exist_ok=True)
+        root = project_root(target)
     lead = thread["id"] if thread else str(uuid.uuid4())
-    with database(True) as db:
-        # An archived Captain keeps its root; a new Captain starts beside it.
-        existing = db.execute(
-            "SELECT * FROM projects WHERE root=? AND state!='archived'", (root,)
-        ).fetchone()
-        if existing and op == "promote" and existing["lead"] != lead:
-            raise ValueError("This project already has a Captain. Demote it first.")
-        if existing:
-            p = dict(existing)
-        else:
-            if db.execute("SELECT 1 FROM crew WHERE id=?", (lead,)).fetchone():
-                raise ValueError("Release this thread from its crew before promoting it.")
-            if db.execute("SELECT 1 FROM projects WHERE lead=?", (lead,)).fetchone():
-                raise ValueError("This thread is already a Captain.")
-            p = dict(
-                id=str(uuid.uuid4()),
-                root=root,
-                name=Path(root).name or root,
-                objective=brief,
-                lead=lead,
-                parallel=parallel,
-                provider=provider,
-                model=model,
-                thinking=thinking,
-                factory_models=factory_models,
-            )
-            db.execute(
-                "INSERT INTO projects(id,root,name,objective,lead,parallel,provider,model,thinking,factory_models) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                tuple(p.values()),
-            )
-        # A new project, or one whose creation stopped before its first turn, gets the brief.
-        first_turn = not existing or not db.execute(
-            "SELECT 1 FROM jobs WHERE member=?", (p["lead"],)
-        ).fetchone()
+    try:
+        with database(True) as db:
+            # An archived Captain keeps its root; a new Captain starts beside it.
+            existing = db.execute(
+                "SELECT * FROM projects WHERE root=? AND state!='archived'", (root,)
+            ).fetchone()
+            if existing and op == "promote" and existing["lead"] != lead:
+                raise ValueError("This project already has a Captain. Demote it first.")
+            if existing:
+                p = dict(existing)
+            else:
+                if db.execute("SELECT 1 FROM crew WHERE id=?", (lead,)).fetchone():
+                    raise ValueError("Release this thread from its crew before promoting it.")
+                if db.execute("SELECT 1 FROM projects WHERE lead=?", (lead,)).fetchone():
+                    raise ValueError("This thread is already a Captain.")
+                p = dict(
+                    id=str(uuid.uuid4()),
+                    root=root,
+                    name=Path(root).name or root,
+                    objective=brief,
+                    lead=lead,
+                    parallel=parallel,
+                    provider=provider,
+                    model=model,
+                    thinking=thinking,
+                    factory_models=factory_models,
+                )
+                db.execute(
+                    "INSERT INTO projects(id,root,name,objective,lead,parallel,provider,model,thinking,factory_models) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    tuple(p.values()),
+                )
+            # A new project, or one whose creation stopped before its first turn, gets the brief.
+            first_turn = not existing or not db.execute(
+                "SELECT 1 FROM jobs WHERE member=?", (p["lead"],)
+            ).fetchone()
+    except BaseException:
+        for created_dir in created_dirs:
+            try:
+                created_dir.rmdir()
+            except OSError:
+                break
+        raise
     write_roots()
     if not thread and not existing:
         # An existing lead may be mid-turn; its next job aligns it with ensure_lead.
@@ -2606,7 +2786,7 @@ def create_project(op, args):
             action("adopt", project=p["id"], ref=ref)
         except (ValueError, OSError, KeyError) as error:
             errors.append(f"{ref}: {error}")
-    result = {"id": p["id"], "lead": p["lead"]}
+    result = {"id": p["id"], "lead": p["lead"], "root": p["root"]}
     if errors:
         result["crew_errors"] = errors
     if first_turn:

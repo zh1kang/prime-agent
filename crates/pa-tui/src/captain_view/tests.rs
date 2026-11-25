@@ -3046,3 +3046,89 @@ fn a_deleting_project_or_unknown_root_does_not_block_setup() {
     view.apply_snapshot(&json!({"current_root": "", "projects": [{"id": "p", "root": ""}]}));
     assert!(!view.here_has_captain());
 }
+
+#[test]
+fn folder_picker_badges_git_and_existing_captains_and_navigates() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path();
+    let repo_a = root.join("alpha-repo");
+    let repo_b = root.join("beta-existing");
+    let nested = repo_a.join("sub");
+    std::fs::create_dir_all(repo_a.join(".git")).unwrap();
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::create_dir_all(&repo_b).unwrap();
+    std::fs::create_dir_all(root.join(".hidden")).unwrap();
+
+    let mut view = CaptainView::new(34);
+    view.apply_snapshot(&json!({
+        "current_root": repo_b.to_string_lossy(),
+        "current": "proj-beta",
+        "projects": [
+            {"id": "proj-other", "name": "Other", "root": "/work/other", "state": "active"},
+            {"id": "proj-beta", "name": "Beta", "root": repo_b.to_string_lossy(), "state": "active"},
+        ]
+    }));
+    view.project = 0; // start on Other
+    view.open_folder_picker_at(root.to_path_buf());
+
+    let rendered = text(&view.render(&theme(), 100, &kb())).join("\n");
+    assert!(rendered.contains("alpha-repo/"), "{rendered}");
+    assert!(rendered.contains("git"), "{rendered}");
+    assert!(rendered.contains("[Captain: Beta]"), "{rendered}");
+    assert!(!rendered.contains(".hidden/"), "dotfiles stay hidden until filtered");
+
+    // Down to alpha-repo/, Tab descends into it, Left ascends back.
+    view.handle_key("down", &kb());
+    view.handle_key("tab", &kb());
+    let inside = text(&view.render(&theme(), 100, &kb())).join("\n");
+    assert!(inside.contains("sub/"), "{inside}");
+    view.handle_key("left", &kb());
+
+    // Down twice (past UseCurrent and alpha-repo/) to beta-existing/ -> Enter opens Beta without Setup.
+    view.handle_key("down", &kb());
+    view.handle_key("down", &kb());
+    let action = view.handle_key("enter", &kb());
+    assert!(matches!(action, CaptainAction::None), "{action:?}");
+    assert!(matches!(view.mode, Mode::Browse));
+    assert_eq!(view.selected_project().map(|p| p.id.as_str()), Some("proj-beta"));
+}
+
+#[test]
+fn folder_picker_selects_existing_or_creates_new_folder_for_init_request() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path();
+    let existing = root.join("gamma");
+    std::fs::create_dir_all(&existing).unwrap();
+
+    // 1. Selecting an existing unregistered folder sends `root` without `create_dir`.
+    let mut view = CaptainView::new(34);
+    view.apply_snapshot(&json!({"current_root": "/work/other", "projects": []}));
+    view.open_folder_picker_at(root.to_path_buf());
+    view.handle_key("down", &kb()); // gamma/
+    assert!(matches!(
+        view.handle_key("enter", &kb()),
+        CaptainAction::LoadChoices { .. }
+    ));
+    let setup = view.pending_setup.as_ref().expect("pending setup");
+    let req = setup.request();
+    assert_eq!(req["root"], json!(existing.to_string_lossy()));
+    assert!(req.get("create_dir").is_none(), "{req}");
+
+    // 2. Typing a brand-new folder name offers "+ Create new folder" and sets `create_dir: true`.
+    let mut view2 = CaptainView::new(34);
+    view2.apply_snapshot(&json!({"current_root": "/work/other", "projects": []}));
+    view2.open_folder_picker_at(root.to_path_buf());
+    for ch in ["n", "e", "w", "a", "p", "p"] {
+        view2.handle_key(ch, &kb());
+    }
+    let rendered = text(&view2.render(&theme(), 100, &kb())).join("\n");
+    assert!(rendered.contains("Create new folder \"newapp\" here"), "{rendered}");
+    assert!(matches!(
+        view2.handle_key("enter", &kb()),
+        CaptainAction::LoadChoices { .. }
+    ));
+    let setup2 = view2.pending_setup.as_ref().expect("pending setup");
+    let req2 = setup2.request();
+    assert_eq!(req2["root"], json!(root.join("newapp").to_string_lossy()));
+    assert_eq!(req2["create_dir"], json!(true));
+}

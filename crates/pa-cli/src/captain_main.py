@@ -17,6 +17,8 @@ HELP = (
     "factory-update-specialist, specialist-list, specialist-show, specialist-write, specialist-delete,\n"
     "escalate, decision-resolve, budget, schedule-add, schedule-list, schedule-toggle, schedule-delete,\n"
     "pr-watch, review-findings, review-triage, checkpoint-rollback\n"
+    "  init {brief,root?,create_dir?,...}           Start a Captain in root (an absolute folder;\n"
+    "                                               default this folder); create_dir makes a missing folder\n"
     "  escalate {title,summary,recommendation?,options:[{key,label,reply_text}],member?}  A decision card\n"
     "  decision-resolve {id,key?|reply_text?}       Answer a card; the Captain acts on it at once (you only)\n"
     "  budget {budget_usd?,budget_tokens?,extend_usd?,extend_tokens?,clear?}  Read or set the spend cap\n"
